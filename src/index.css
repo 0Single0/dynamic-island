@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --color-island: rgba(0, 0, 0, 0.08);
+  --color-island-border: rgba(255, 255, 255, 0.15);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+
+/*
+ * 黑色玻璃拟态表面（纯 CSS 实现，无系统特效）。
+ * 曾尝试 Windows Acrylic：其材质自带蓝白系统渐变且混入背后网页颜色，
+ * 无法去除，故弃用。当前质感 = 深色半透明底 + 高光描边。
+ * 窗口被 SetWindowRgn 裁剪成圆角形状，四角与外部完全透明。
+ */
+.glass-island {
+  background: rgba(10, 10, 12, 0.82);
+  backdrop-filter: blur(11px) saturate(116%);
+  -webkit-backdrop-filter: blur(11px) saturate(116%);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.glass-panel {
+  background: rgba(10, 10, 12, 0.82);
+  backdrop-filter: blur(11px) saturate(116%);
+  -webkit-backdrop-filter: blur(11px) saturate(116%);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
