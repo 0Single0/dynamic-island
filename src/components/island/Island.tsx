@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { X, Settings, Pin } from "lucide-react";
+import { X } from "lucide-react";
 import { widgetRegistry, getWidget } from "@/widgets";
 import {
   COMPACT_SIZE,
@@ -175,9 +175,7 @@ export function Island() {
             <span className="text-xs font-medium text-zinc-400">
               {activeWidget?.name ?? "灵动岛"}
             </span>
-            <div className="flex items-center gap-0.5">
-              <IconButton icon={Pin} label="置顶" />
-              <IconButton icon={Settings} label="设置" />
+            <div className="flex items-center">
               <IconButton icon={X} label="收起" onClick={collapse} />
             </div>
           </div>

@@ -1,46 +1,45 @@
-import { axiosInstance, request } from "@/utils/request";
-import type { ApiResponse } from "@/types/api";
+import { invoke } from "@tauri-apps/api/core";
+import type { NeteaseControlAction, NeteaseState } from "./types";
 
 /**
- * 网易云音乐相关接口（占位）。
- * BASE_URL 指向本地 NeteaseCloudMusicApi 服务，接入时启动即可。
+ * 网易云同步命令 API：与 src-tauri/src/netease/mod.rs 命令一一对应。
+ * 浏览器环境（无 Tauri）下静默降级，便于纯前端调试 UI。
  */
-const BASE_URL = "http://localhost:3000";
 
-export interface NeteaseSong {
-  id: number;
-  name: string;
-  artists: string[];
-  album?: string;
-  duration?: number;
+export function startOrConnect() {
+  return invoke<void>("netease_start_or_connect").catch(() => {});
 }
 
-export interface NeteasePlayerState {
-  playing: boolean;
-  progress: number;
-  song: NeteaseSong | null;
+export function restartWithSync() {
+  return invoke<void>("netease_restart_with_sync").catch(() => {});
 }
 
-export function getPlayerState() {
-  return request<NeteasePlayerState>({
-    url: `${BASE_URL}/player/state`,
-    method: "GET",
-  });
+export function control(action: NeteaseControlAction) {
+  return invoke<boolean>("netease_control", { action }).catch(() => false);
 }
 
-export function searchSongs(keyword: string) {
-  return request<{ songs: NeteaseSong[]; total: number }>({
-    url: `${BASE_URL}/search`,
-    method: "GET",
-    params: { keywords: keyword },
-  });
+/** 将网易云原始播放器跳转到指定毫秒位置。 */
+export function seek(positionMs: number) {
+  return invoke<boolean>("netease_seek", { positionMs }).catch(() => false);
 }
 
-/** 原始实例调用示例：非信封结构的第三方接口可用 axiosInstance 直接请求 */
-export async function getLyricRaw(songId: number): Promise<string> {
-  const response = await axiosInstance.get<ApiResponse<{ lyric: string }>>(
-    `${BASE_URL}/lyric`,
-    { params: { id: songId } },
-  );
-  return response.data.data.lyric;
+export function setLyricOffset(offsetMs: number) {
+  return invoke<void>("netease_set_lyric_offset", { offsetMs }).catch(() => {});
+}
+
+export function disconnect() {
+  return invoke<void>("netease_disconnect").catch(() => {});
+}
+
+/** orpheus:// 封面地址 → base64 data URL（仅允许网易图片 CDN 域名）。 */
+export function coverDataUrl(rawUrl: string) {
+  return invoke<string>("netease_cover_data_url", { rawUrl });
+}
+
+export async function currentState(): Promise<NeteaseState | null> {
+  try {
+    return await invoke<NeteaseState>("netease_current_state");
+  } catch {
+    return null;
+  }
 }

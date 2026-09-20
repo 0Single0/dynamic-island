@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
+mod netease;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -9,6 +10,8 @@ use tauri::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 注意：invoke_handler 只能调用一次，后设会覆盖先设，
+    // 所有命令必须合并在同一个 generate_handler! 里。
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -54,6 +57,9 @@ pub fn run() {
             // 光标轮询线程：岛体之外的区域对鼠标穿透
             commands::window::spawn_click_through_thread(app.handle().clone());
 
+            // 网易云同步共享状态
+            netease::setup(app.handle())?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -62,6 +68,14 @@ pub fn run() {
             commands::window::set_island_rect,
             commands::window::quit_app,
             commands::window::hide_window,
+            netease::netease_start_or_connect,
+            netease::netease_restart_with_sync,
+            netease::netease_control,
+            netease::netease_seek,
+            netease::netease_set_lyric_offset,
+            netease::netease_disconnect,
+            netease::netease_current_state,
+            netease::netease_cover_data_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

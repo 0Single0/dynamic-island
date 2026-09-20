@@ -36,3 +36,98 @@ body,
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.15);
 }
+
+/* 胶囊态跳动音条 */
+@keyframes eq-bounce {
+  from {
+    height: 25%;
+  }
+  to {
+    height: 100%;
+  }
+}
+
+/* 歌词行切换渐显上移 */
+@keyframes lyric-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-lyric-in {
+  animation: lyric-in 150ms ease-out;
+}
+
+/* 黑胶唱片旋转（播放中的封面） */
+@keyframes disc-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-disc-spin {
+  animation: disc-spin 8s linear infinite;
+}
+
+/* 暂停时冻结在当前角度；恢复播放后动画从该角度继续。 */
+.animate-disc-spin-paused {
+  animation-play-state: paused;
+}
+
+/* 超长歌名：只有文字宽度超过容器时才由 React 加上该类名。 */
+@keyframes track-title-marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(calc(-1 * var(--track-title-shift)));
+  }
+}
+
+.animate-track-title-marquee {
+  animation-name: track-title-marquee;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-track-title-marquee {
+    animation: none;
+  }
+}
+
+/* 自定义 range 只负责接收拖动；可视轨道由 React 的进度层渲染。 */
+.music-progress-range::-webkit-slider-runnable-track {
+  height: 4px;
+  background: transparent;
+}
+
+.music-progress-range::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  appearance: none;
+  border: 2px solid rgba(10, 10, 12, 0.9);
+  border-radius: 999px;
+  background: rgb(74, 222, 128);
+  box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.18);
+}
+
+.music-progress-range:disabled::-webkit-slider-thumb {
+  opacity: 0;
+}
+
+.music-lyrics-mask {
+  position: relative;
+  mask-image: linear-gradient(to bottom, transparent 0%, black 12%, black 83%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 12%, black 83%, transparent 100%);
+}
