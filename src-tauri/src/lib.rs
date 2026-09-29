@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
+mod markdown;
 mod netease;
 
 use tauri::{
@@ -14,6 +15,7 @@ pub fn run() {
     // 所有命令必须合并在同一个 generate_handler! 里。
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 注：尝试过 Windows Acrylic（window-vibrancy），但 Win11 的
             // Acrylic 材质自带蓝白系统渐变膜且会混入背后网页颜色，无法去除，
@@ -68,6 +70,9 @@ pub fn run() {
             commands::window::set_island_rect,
             commands::window::quit_app,
             commands::window::hide_window,
+            markdown::read_markdown_file,
+            markdown::read_markdown_image_data,
+            markdown::markdown_to_pdf,
             netease::netease_start_or_connect,
             netease::netease_restart_with_sync,
             netease::netease_control,

@@ -131,3 +131,78 @@ body,
   mask-image: linear-gradient(to bottom, transparent 0%, black 12%, black 83%, transparent 100%);
   -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 12%, black 83%, transparent 100%);
 }
+
+/* Markdown 预览与 PDF 打印共用的基础排版。 */
+.markdown-preview {
+  color: rgb(212 212 216);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4 {
+  margin: 0.8em 0 0.35em;
+  color: rgb(244 244 245);
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.markdown-preview h1 { font-size: 1.65em; }
+.markdown-preview h2 { font-size: 1.35em; }
+.markdown-preview h3 { font-size: 1.15em; }
+.markdown-preview p { margin: 0.5em 0; }
+.markdown-preview ul,
+.markdown-preview ol { margin: 0.45em 0; padding-left: 1.5em; }
+.markdown-preview li + li { margin-top: 0.18em; }
+.markdown-preview blockquote {
+  margin: 0.7em 0;
+  border-left: 3px solid rgb(139 92 246 / 0.65);
+  padding-left: 0.8em;
+  color: rgb(161 161 170);
+}
+.markdown-preview a { color: rgb(125 211 252); text-decoration: underline; }
+.markdown-preview code {
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.08);
+  padding: 0.1em 0.3em;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.9em;
+}
+.markdown-preview pre {
+  overflow-x: auto;
+  margin: 0.7em 0;
+  border-radius: 8px;
+  background: rgb(0 0 0 / 0.35);
+  padding: 0.8em;
+}
+.markdown-preview pre code { background: transparent; padding: 0; }
+.markdown-preview table { width: 100%; border-collapse: collapse; margin: 0.75em 0; }
+.markdown-preview th,
+.markdown-preview td { border: 1px solid rgb(255 255 255 / 0.14); padding: 0.35em 0.5em; text-align: left; }
+.markdown-preview th { background: rgb(255 255 255 / 0.08); color: rgb(244 244 245); }
+.markdown-preview img { max-width: 100%; border-radius: 6px; }
+
+/* 隐藏打印页使用同一套内容类名，并遵循 A4 分页规则。 */
+.markdown-print {
+  color: #202124;
+  background: #fff;
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 11pt;
+  line-height: 1.65;
+}
+
+@media print {
+  @page { size: A4 portrait; margin: 18mm 16mm 20mm; }
+  .markdown-print h1,
+  .markdown-print h2,
+  .markdown-print h3,
+  .markdown-print h4 { break-after: avoid-page; page-break-after: avoid; }
+  .markdown-print tr,
+  .markdown-print pre,
+  .markdown-print blockquote,
+  .markdown-print img { break-inside: avoid; page-break-inside: avoid; }
+  .markdown-print thead { display: table-header-group; }
+  .markdown-print a { color: inherit; text-decoration: none; }
+}

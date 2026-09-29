@@ -13,6 +13,7 @@
     "core:window:allow-scale-factor",
     "core:window:allow-current-monitor",
     "core:window:allow-primary-monitor",
-    "opener:default"
+    "opener:default",
+    "dialog:default"
   ]
 }

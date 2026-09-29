@@ -8,6 +8,9 @@ export const EXPANDED_SIZE: Record<WidgetSize, { width: number; height: number }
     lg: { width: 520, height: 320 },
   };
 
+/** 应用列表使用独立的紧凑尺寸，避免三张卡片周围出现过多空白。 */
+export const LAUNCHER_SIZE = { width: 420, height: 240 };
+
 /** 收起态胶囊尺寸 */
 export const COMPACT_SIZE = { width: 300, height: 44 };
 

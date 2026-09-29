@@ -1,0 +1,531 @@
+{
+  "schema_version": 1,
+  "feature_title": "桌面 Agent 应用 — 实现计划",
+  "spec_ref": ".cursor/docs/desktop-agent-spec.md",
+  "plan_ref": ".cursor/plan/desktop-agent-plan.md",
+  "status": "in-progress",
+  "last_updated": "2026-09-29",
+  "current_task_id": "PLAN-00-02",
+  "tasks": [
+    {
+      "id": "PLAN-00-01",
+      "title": "Provider Adapter Mock：三种 API 请求/流式响应 fixture",
+      "state": "completed",
+      "trace": {
+        "spec_ids": [
+          "API-01",
+          "API-02",
+          "API-03"
+        ],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": "2026-09-29T09:53:42+08:00",
+      "completed_at": "2026-09-29T10:02:33+08:00",
+      "files_changed": [
+        ".cursor/spikes/provider-adapter/README.md",
+        ".cursor/docs/desktop-agent-spec.md",
+        "src-tauri/tests/provider_protocol_fixtures.rs",
+        "src-tauri/tests/fixtures/providers/chat-completions-request.json",
+        "src-tauri/tests/fixtures/providers/chat-completions-stream.sse",
+        "src-tauri/tests/fixtures/providers/responses-request.json",
+        "src-tauri/tests/fixtures/providers/responses-stream.sse",
+        "src-tauri/tests/fixtures/providers/anthropic-messages-request.json",
+        "src-tauri/tests/fixtures/providers/anthropic-messages-stream.sse"
+      ],
+      "notes": "离线 fixture 覆盖三种请求协议、SSE 文本/工具参数分片/完成与 token usage；Chat Completions 使用 max_completion_tokens，旧字段仅允许显式兼容模式。cargo test --test provider_protocol_fixtures 4 项通过，rustfmt --check 通过。真实 Provider/网络错误及完整生产 Adapter 留给 TASK-07/TASK-21。"
+    },
+    {
+      "id": "PLAN-00-02",
+      "title": "SQLite vs Tauri Store 数据方案 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-03",
+      "title": "Windows Credential Manager/DPAPI 抽象 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-04",
+      "title": "Tiptap / 与 @ 浮层交互原型",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-05",
+      "title": "UIA 记事本控件树操作 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-06",
+      "title": "网络搜索 Provider 接口 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-07",
+      "title": "浏览器/CDP 会话 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-08",
+      "title": "Agent 预算、费用、重试、备用模型和并发锁 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-09",
+      "title": "外部内容隔离、提示词注入和 SSRF 测试",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "PLAN-00-10",
+      "title": "文件编码、原子写入和路径安全 Spike",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§4 Phase 0 — 决策与 Spike"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-01",
+      "title": "AI 应用卡片和 AI panel 状态",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-02",
+      "title": "全局设置中心",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-03",
+      "title": "Plugin Manifest、Registry、启停和权限",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-04",
+      "title": "Tiptap 输入框、Slash 动作目录和 @ 插件目录",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-05",
+      "title": "会话、任务、消息和本地存储",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-06",
+      "title": "ProviderConfig、ModelConfig 和 AI 设置页",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-07",
+      "title": "三种 API Adapter、SSE 和统一流式事件",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-08",
+      "title": "Agent Loop、任务状态、取消、重试、预算、并发和事件协议",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-09",
+      "title": "Permission Policy、审批快照和 Approval UI",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-10",
+      "title": "网易云和 Markdown 内置插件",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-11",
+      "title": "文件安全、Diff、备份、原子写入和撤销",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-12",
+      "title": "网络搜索插件和来源记录",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-13",
+      "title": "浏览器插件和 CDP 适配",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-14",
+      "title": "应用、窗口和剪贴板插件",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-15",
+      "title": "UIA Computer Use",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-16",
+      "title": "SendInput、窗口校验和安全策略",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-17",
+      "title": "截图工具和兼容性错误",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-18",
+      "title": "上下文压缩和摘要 UI",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-19",
+      "title": "任务中心、后台任务和通知",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-20",
+      "title": "集成测试、权限测试和正式打包",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-21",
+      "title": "Run 预算、费用、重试、备用模型和降级",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-22",
+      "title": "外部内容隔离、提示词注入、SSRF 和脱敏",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-23",
+      "title": "浏览器会话、CDP Target 校验和文件传输",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-24",
+      "title": "附件、Artifact 生命周期和会话数据管理",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-25",
+      "title": "Run Journal、资源锁和崩溃恢复",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    },
+    {
+      "id": "TASK-26",
+      "title": "诊断页、事件重放、日志导出和安全审计",
+      "state": "pending",
+      "trace": {
+        "spec_ids": [],
+        "plan_section": "§5 任务分解"
+      },
+      "started_at": null,
+      "completed_at": null,
+      "files_changed": [],
+      "notes": null
+    }
+  ],
+  "blockers": [
+    {
+      "id": "GAP-04",
+      "from_spec": true,
+      "status": "open",
+      "detail": "API Key 生产存储需在 PLAN-00-03 确定；不阻塞当前不含密钥的本地 Provider fixture Spike。"
+    },
+    {
+      "id": "GAP-07",
+      "from_spec": true,
+      "status": "open",
+      "detail": "文件访问范围在实现文件写入前关闭；不阻塞当前 Provider fixture Spike。"
+    },
+    {
+      "id": "GAP-11",
+      "from_spec": true,
+      "status": "open",
+      "detail": "敏感自定义 Header 存储在 Provider 发布前关闭；当前 fixture 不包含凭据。"
+    },
+    {
+      "id": "GAP-13",
+      "from_spec": true,
+      "status": "open",
+      "detail": "远程 HTTPS/localhost HTTP 策略在真实网络请求前关闭；当前 Spike 只用本地静态 fixture。"
+    },
+    {
+      "id": "GAP-15",
+      "from_spec": true,
+      "status": "open",
+      "detail": "文件编辑授权范围在文件编辑实现前关闭；不阻塞当前 Spike。"
+    },
+    {
+      "id": "GAP-16",
+      "from_spec": true,
+      "status": "open",
+      "detail": "搜索供应商在搜索功能前确定；不阻塞当前 Provider fixture Spike。"
+    }
+  ]
+}

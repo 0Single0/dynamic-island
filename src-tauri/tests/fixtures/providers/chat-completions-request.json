@@ -1,0 +1,25 @@
+{
+  "model": "mock-chat-model",
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "Call the lookup tool with id 42." }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup",
+        "description": "Look up a record by id.",
+        "parameters": {
+          "type": "object",
+          "properties": { "id": { "type": "integer" } },
+          "required": ["id"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "stream": true,
+  "stream_options": { "include_usage": true },
+  "max_completion_tokens": 128
+}

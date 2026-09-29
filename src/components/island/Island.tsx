@@ -2,10 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { X } from "lucide-react";
 import { widgetRegistry, getWidget } from "@/widgets";
+import { ApplicationLauncher, type LauncherTarget } from "@/widgets/ApplicationLauncher";
+import { MarkdownPdfExpanded } from "@/widgets/MarkdownPdfExpanded";
 import {
   COMPACT_SIZE,
   EXPANDED_SIZE,
   HOVER_SCALE,
+  LAUNCHER_SIZE,
   WINDOW_SIZE,
   WINDOW_MARGIN_TOP,
 } from "@/config/island";
@@ -17,6 +20,10 @@ import {
 import { IconButton } from "@/components/common/IconButton";
 
 type IslandState = "collapsed" | "hovered" | "expanded";
+type ActivePanel =
+  | { kind: "launcher" }
+  | { kind: "widget"; id: string }
+  | { kind: "tool"; id: "markdown-pdf" };
 
 /**
  * 灵动岛主体。
@@ -27,14 +34,17 @@ type IslandState = "collapsed" | "hovered" | "expanded";
  */
 export function Island() {
   const [state, setState] = useState<IslandState>("collapsed");
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [activePanel, setActivePanel] = useState<ActivePanel>({ kind: "launcher" });
   const hoverTimer = useRef<number | null>(null);
   const pressedRef = useRef(false);
 
-  const activeWidget = activeId ? getWidget(activeId) : undefined;
-  const expandedSize = activeWidget
-    ? EXPANDED_SIZE[activeWidget.size ?? "md"]
-    : EXPANDED_SIZE.md;
+  const activeWidget = activePanel.kind === "widget" ? getWidget(activePanel.id) : undefined;
+  const isLauncher = activePanel.kind === "launcher";
+  const expandedSize = isLauncher
+    ? LAUNCHER_SIZE
+    : activePanel.kind === "tool"
+      ? EXPANDED_SIZE.lg
+    : EXPANDED_SIZE[activeWidget?.size ?? "md"];
 
   // 启动：置顶 + 固定窗口位置（只调一次）
   const initWindow = useCallback(() => {
@@ -61,9 +71,9 @@ export function Island() {
     if (state === "hovered") setState("collapsed");
   };
 
-  const expand = (widgetId: string | null) => {
+  const expand = (panel: ActivePanel) => {
     pressedRef.current = true;
-    setActiveId(widgetId);
+    setActivePanel(panel);
     setState("expanded");
     window.setTimeout(() => {
       pressedRef.current = false;
@@ -72,12 +82,18 @@ export function Island() {
 
   const collapse = () => {
     setState("collapsed");
-    setActiveId(null);
+    setActivePanel({ kind: "launcher" });
   };
 
   const isCollapsed = state !== "expanded";
-  // 点击胶囊体（而非具体小组件）时展开的默认面板
-  const defaultWidget = widgetRegistry[0];
+
+  const openLauncherTarget = (target: LauncherTarget) => {
+    if (target.kind === "widget") {
+      expand({ kind: "widget", id: target.id });
+    } else {
+      expand({ kind: "tool", id: target.id });
+    }
+  };
 
   // 动画帧上把岛体视口逻辑坐标上报给 Rust（换算物理像素后驱动点击穿透）。
   // hover 缩放围绕岛体中心，需按 scale 反算实际占位矩形。
@@ -110,7 +126,7 @@ export function Island() {
         onClick={(event) => {
           // 阻止冒泡到外层透明区域，避免展开态内部点击被判定为“点外部”
           event.stopPropagation();
-          if (isCollapsed) expand(defaultWidget?.id ?? null);
+          if (isCollapsed) expand({ kind: "launcher" });
         }}
         onMouseEnter={enter}
         onMouseLeave={leave}
@@ -147,7 +163,7 @@ export function Island() {
               title={widget.name}
               onClick={(event) => {
                 event.stopPropagation();
-                expand(widget.id);
+                expand({ kind: "widget", id: widget.id });
               }}
               className="cursor-pointer"
             >
@@ -171,16 +187,22 @@ export function Island() {
           className="absolute inset-0 flex flex-col p-4"
           style={{ pointerEvents: isCollapsed ? "none" : "auto" }}
         >
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-zinc-400">
-              {activeWidget?.name ?? "灵动岛"}
+          <div className="flex h-7 shrink-0 items-center justify-between">
+            <span className="text-sm font-semibold text-zinc-100">
+              {activeWidget?.name ?? (isLauncher ? "应用" : "MD 转 PDF")}
             </span>
             <div className="flex items-center">
               <IconButton icon={X} label="收起" onClick={collapse} />
             </div>
           </div>
           <div className="flex-1 overflow-hidden">
-            {activeWidget && <activeWidget.expanded />}
+            {isLauncher ? (
+              <ApplicationLauncher onOpen={openLauncherTarget} />
+            ) : activeWidget ? (
+              <activeWidget.expanded />
+            ) : activePanel.kind === "tool" && activePanel.id === "markdown-pdf" ? (
+              <MarkdownPdfExpanded />
+            ) : null}
           </div>
         </motion.div>
       </motion.div>

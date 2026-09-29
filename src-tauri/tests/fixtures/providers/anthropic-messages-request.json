@@ -1,0 +1,21 @@
+{
+  "model": "mock-anthropic-model",
+  "system": "You are a helpful assistant.",
+  "messages": [
+    { "role": "user", "content": "Call the lookup tool with id 42." }
+  ],
+  "tools": [
+    {
+      "name": "lookup",
+      "description": "Look up a record by id.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "id": { "type": "integer" } },
+        "required": ["id"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "max_tokens": 128,
+  "stream": true
+}
