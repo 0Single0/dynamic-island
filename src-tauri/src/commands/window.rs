@@ -68,8 +68,8 @@ pub fn hide_window(window: Window) -> tauri::Result<()> {
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW,
-    GA_ROOT, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    GetAncestor, GetCursorPos, GetWindowLongW, SetLayeredWindowAttributes, SetWindowLongW, GA_ROOT,
+    GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
 const POLL_INTERVAL_MS: u64 = 16;
@@ -81,6 +81,8 @@ const EDGE_PAD_PX: i32 = 6;
 static ISLAND_RECT: AtomicI64 = AtomicI64::new(0);
 /// 当前是否处于穿透态（避免重复写窗口样式）。
 static CLICK_THROUGH: AtomicBool = AtomicBool::new(false);
+/// 设置页等完整窗口页面需要整窗接收鼠标；灵动岛页面则只接收岛体矩形内的鼠标。
+static FULL_WINDOW_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn pack_rect(x: i32, y: i32, w: i32, h: i32) -> i64 {
     ((x as i16 as i64) & 0xFFFF)
@@ -112,6 +114,15 @@ pub fn set_island_rect(window: Window, x: f64, y: f64, width: f64, height: f64) 
     ISLAND_RECT.store(pack_rect(px, py, pw, ph), Ordering::Release);
 }
 
+/// 切换窗口的鼠标命中模式。
+///
+/// `true`：整个透明窗口都接收鼠标，供设置中心等完整页面使用。
+/// `false`：只让前端上报的灵动岛矩形接收鼠标，矩形外点击穿透到桌面。
+#[tauri::command]
+pub fn set_window_interactive(interactive: bool) {
+    FULL_WINDOW_INTERACTIVE.store(interactive, Ordering::Release);
+}
+
 /// 启动光标轮询线程（仅 setup 时调用一次）。
 pub fn spawn_click_through_thread(app: AppHandle) {
     std::thread::spawn(move || {
@@ -130,7 +141,11 @@ pub fn spawn_click_through_thread(app: AppHandle) {
             // tauri 的 hwnd() 可能拿到 WebView2 子窗口，样式必须设在顶层窗口上
             let Ok(hwnd) = window.hwnd() else { continue };
             let root = unsafe { GetAncestor(HWND(hwnd.0), GA_ROOT) };
-            let hwnd = if !root.0.is_null() { root } else { HWND(hwnd.0) };
+            let hwnd = if !root.0.is_null() {
+                root
+            } else {
+                HWND(hwnd.0)
+            };
 
             // 兜底：确保窗口是 layered 且 alpha=255，切换 WS_EX_TRANSPARENT 才生效
             let mut ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
@@ -138,23 +153,25 @@ pub fn spawn_click_through_thread(app: AppHandle) {
                 ex_style |= WS_EX_LAYERED.0 as i32;
                 unsafe { SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style) };
             }
-            let _ = unsafe {
-                SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
-            };
+            let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) };
 
             let mut cursor = POINT::default();
             if unsafe { GetCursorPos(&mut cursor) }.is_err() {
                 continue;
             }
 
-            let inside = match ISLAND_RECT.load(Ordering::Acquire) {
-                0 => true, // 尚未上报前不穿透，保证岛体可点
-                packed => {
-                    let (x, y, w, h) = unpack_rect(packed);
-                    cursor.x >= x - EDGE_PAD_PX
-                        && cursor.x < x + w + EDGE_PAD_PX
-                        && cursor.y >= y - EDGE_PAD_PX
-                        && cursor.y < y + h + EDGE_PAD_PX
+            let inside = if FULL_WINDOW_INTERACTIVE.load(Ordering::Acquire) {
+                true
+            } else {
+                match ISLAND_RECT.load(Ordering::Acquire) {
+                    0 => true, // 尚未上报前不穿透，保证岛体可点
+                    packed => {
+                        let (x, y, w, h) = unpack_rect(packed);
+                        cursor.x >= x - EDGE_PAD_PX
+                            && cursor.x < x + w + EDGE_PAD_PX
+                            && cursor.y >= y - EDGE_PAD_PX
+                            && cursor.y < y + h + EDGE_PAD_PX
+                    }
                 }
             };
 

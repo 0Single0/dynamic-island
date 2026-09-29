@@ -189,7 +189,9 @@ impl CdpSession {
                 "awaitPromise": false,
             }
         });
-        self.ws.send(Message::Text(request.to_string().into())).await?;
+        self.ws
+            .send(Message::Text(request.to_string().into()))
+            .await?;
 
         // 读到对应 id 的响应为止；忽略事件与其他响应
         loop {

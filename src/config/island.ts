@@ -6,6 +6,7 @@ export const EXPANDED_SIZE: Record<WidgetSize, { width: number; height: number }
     sm: { width: 320, height: 180 },
     md: { width: 420, height: 260 },
     lg: { width: 520, height: 320 },
+    xl: { width: 780, height: 480 },
   };
 
 /** 应用列表使用独立的紧凑尺寸，避免三张卡片周围出现过多空白。 */
@@ -23,8 +24,8 @@ export const HOVER_SCALE = 1.06;
  * 所有伸缩动画都在这个透明窗口内部由 framer-motion 完成。
  */
 export const WINDOW_SIZE = {
-  width: EXPANDED_SIZE.lg.width + 32,
-  height: EXPANDED_SIZE.lg.height + 32,
+  width: EXPANDED_SIZE.xl.width + 32,
+  height: EXPANDED_SIZE.xl.height + 32,
 };
 
 /** 窗口顶边距（屏幕顶部到窗口顶边） */

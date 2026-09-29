@@ -84,11 +84,7 @@ fn playing_list_path() -> PathBuf {
 fn read_once() -> anyhow::Result<Vec<Track>> {
     let text = std::fs::read_to_string(playing_list_path())?;
     let parsed: PlayingList = serde_json::from_str(&text)?;
-    Ok(parsed
-        .list
-        .into_iter()
-        .filter_map(|e| e.track)
-        .collect())
+    Ok(parsed.list.into_iter().filter_map(|e| e.track).collect())
 }
 
 /// 短重试读取（50/100/250ms）。
@@ -189,7 +185,10 @@ fn count_exact_titles(tracks: &[Track], title: &str) -> usize {
     if t_norm.is_empty() {
         return 0;
     }
-    tracks.iter().filter(|t| normalize(&t.name) == t_norm).count()
+    tracks
+        .iter()
+        .filter(|t| normalize(&t.name) == t_norm)
+        .count()
 }
 
 /// 按“标题+歌手+时长”在本地播放列表中精确匹配；达不到门槛返回 None。
@@ -207,8 +206,8 @@ pub fn resolve(title: &str, artist: &str, duration_ms: u64) -> Option<TrackMeta>
     // 门槛 75 分；但迷你条拿不到时长（duration=0 时跳过时长评分），
     // 标题精确同名时保底 60 分（标题60+歌手0 也能过）。同曲不同版本
     // （Live/Remix）名称必带后缀，不会与正曲撞车。
-    let unique_exact_title = count_exact_titles(&tracks, title) == 1
-        && normalize(&best.name) == normalize(title);
+    let unique_exact_title =
+        count_exact_titles(&tracks, title) == 1 && normalize(&best.name) == normalize(title);
     let threshold = if unique_exact_title { 60 } else { 75 };
     if *best_score < threshold {
         eprintln!(

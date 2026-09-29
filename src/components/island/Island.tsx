@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { X } from "lucide-react";
+import { Settings, X } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { widgetRegistry, getWidget } from "@/widgets";
 import { ApplicationLauncher, type LauncherTarget } from "@/widgets/ApplicationLauncher";
 import { MarkdownPdfExpanded } from "@/widgets/MarkdownPdfExpanded";
@@ -35,6 +36,7 @@ type ActivePanel =
 export function Island() {
   const [state, setState] = useState<IslandState>("collapsed");
   const [activePanel, setActivePanel] = useState<ActivePanel>({ kind: "launcher" });
+  const navigate = useNavigate();
   const hoverTimer = useRef<number | null>(null);
   const pressedRef = useRef(false);
 
@@ -156,7 +158,7 @@ export function Island() {
           className="absolute inset-0 flex items-center justify-between gap-4 px-4"
           style={{ pointerEvents: isCollapsed ? "auto" : "none" }}
         >
-          {widgetRegistry.map((widget) => (
+          {widgetRegistry.filter((widget) => widget.id !== "ai").map((widget) => (
             <button
               key={widget.id}
               type="button"
@@ -191,7 +193,10 @@ export function Island() {
             <span className="text-sm font-semibold text-zinc-100">
               {activeWidget?.name ?? (isLauncher ? "应用" : "MD 转 PDF")}
             </span>
-            <div className="flex items-center">
+            <div className="flex items-center gap-1">
+              {isLauncher && (
+                <IconButton icon={Settings} label="打开设置中心" onClick={() => navigate("/settings")} />
+              )}
               <IconButton icon={X} label="收起" onClick={collapse} />
             </div>
           </div>

@@ -131,7 +131,7 @@ MVP 发布边界：
 | 任务 | 产出 | 负责 |
 |------|------|------|
 | PLAN-00-01 | Provider Adapter Mock：三种 API 请求/流式响应 fixture | 开发 |
-| PLAN-00-02 | SQLite vs Tauri Store 试验；确定会话/插件数据方案 | 开发 |
+| PLAN-00-02 | 比较 SQLite 与 Tauri Store；确定 Rust Agent 结构化数据和 UI 偏好的存储边界，并输出 `.cursor/spikes/storage-strategy/README.md` | 开发 |
 | PLAN-00-03 | Windows Credential Manager/DPAPI 抽象试验 | 开发 |
 | PLAN-00-04 | Tiptap `/`、`@` 浮层交互原型 | 前端 |
 | PLAN-00-05 | UIA 读取记事本控件树并执行按钮/输入框操作 | Rust |

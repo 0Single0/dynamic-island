@@ -1,43 +1,66 @@
-import { GlassCard } from "@/components/common/GlassCard";
-import { widgetRegistry } from "@/widgets";
+import { useEffect, useMemo, useState, type Dispatch, type InputHTMLAttributes, type ReactNode, type SetStateAction } from "react";
+import { Bot, Database, Keyboard, LockKeyhole, MonitorCog, Network, Palette, Plug, Plus, Save, ShieldCheck, SlidersHorizontal, X } from "lucide-react";
+import { builtinPluginRegistry } from "@/agent/plugins";
+import { tauriInvoke, type ModelRecord, type ProviderRecord } from "@/agent/api";
+import { Select } from "@/components/common/Select";
+import { AgentIcon } from "@/components/agent/AgentIcons";
 
-/**
- * 设置页：管理启用的小组件与应用行为（占位）。
- * 后续接入持久化配置后可勾选开关各 widget。
- */
+const sections = [
+  { id: "general", label: "通用", icon: SlidersHorizontal }, { id: "ai-models", label: "AI 与模型", icon: Bot },
+  { id: "plugins", label: "插件与连接器", icon: Plug }, { id: "permissions", label: "工具与权限", icon: ShieldCheck },
+  { id: "shortcuts", label: "快捷键", icon: Keyboard }, { id: "context", label: "上下文与历史", icon: Database },
+  { id: "network", label: "网络与代理", icon: Network }, { id: "privacy", label: "数据与隐私", icon: LockKeyhole },
+  { id: "appearance", label: "外观", icon: Palette }, { id: "about", label: "关于", icon: MonitorCog },
+];
+const protocolOptions = [
+  { value: "chat-completions", label: "OpenAI Chat Completions", description: "/v1/chat/completions" },
+  { value: "responses", label: "OpenAI Responses", description: "/v1/responses" },
+  { value: "anthropic-messages", label: "Anthropic Messages", description: "/v1/messages" },
+];
+const blankProvider = { name: "", protocol: "chat-completions", baseUrl: "https://api.openai.com/v1", apiKey: "" };
+const blankModel = { modelId: "", displayName: "", contextWindow: "128000" };
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return <label className="grid gap-1.5 text-xs text-zinc-400"><span>{label}</span>{children}</label>;
+}
+function TextInput(props: InputHTMLAttributes<HTMLInputElement>) {
+  return <input {...props} className={`w-full rounded-lg border border-white/[0.1] bg-white/[0.025] px-3 py-2.5 text-sm text-zinc-200 outline-none transition placeholder:text-zinc-600 focus:border-sky-300/45 ${props.className ?? ""}`} />;
+}
+
+function ModelModal({ form, setForm, onClose, onSave }: { form: typeof blankModel; setForm: Dispatch<SetStateAction<typeof blankModel>>; onClose: () => void; onSave: () => void }) {
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/65 p-6 backdrop-blur-sm"><div className="w-full max-w-xl rounded-2xl border border-white/[0.12] bg-[#252629] p-5 shadow-2xl shadow-black/50">
+    <div className="flex items-center justify-between"><h2 className="text-base font-semibold text-zinc-100">添加模型</h2><button type="button" onClick={onClose} className="rounded-lg p-1.5 text-zinc-500 hover:bg-white/[0.08] hover:text-zinc-200"><X className="h-4 w-4" /></button></div>
+    <div className="mt-5 grid gap-4"><Field label="模型 ID"><TextInput autoFocus value={form.modelId} onChange={(event) => setForm((current) => ({ ...current, modelId: event.target.value }))} placeholder="例如 deepseek-v4.1-flash" /></Field><Field label="显示名称"><TextInput value={form.displayName} onChange={(event) => setForm((current) => ({ ...current, displayName: event.target.value }))} placeholder="留空则使用模型 ID" /></Field><Field label="上下文窗口"><TextInput inputMode="numeric" value={form.contextWindow} onChange={(event) => setForm((current) => ({ ...current, contextWindow: event.target.value }))} placeholder="128000" /></Field><div className="rounded-lg border border-white/[0.08] bg-white/[0.025] px-3 py-2.5 text-xs text-zinc-400">输入类型：文本　·　输出类型：文本</div></div>
+    <div className="mt-6 flex justify-end gap-2"><button type="button" onClick={onClose} className="rounded-lg border border-white/[0.1] px-3 py-2 text-xs text-zinc-400 hover:bg-white/[0.06]">取消</button><button type="button" onClick={onSave} className="rounded-lg bg-zinc-100 px-3 py-2 text-xs font-medium text-zinc-900 hover:bg-white"><Save className="mr-1.5 inline h-3.5 w-3.5" />保存</button></div>
+  </div></div>;
+}
+
 export default function SettingsPage() {
-  return (
-    <div className="flex h-screen w-screen items-center justify-center bg-zinc-950/80 p-6">
-      <GlassCard className="w-full max-w-md" padding="lg">
-        <h1 className="mb-1 text-lg font-semibold text-white">设置</h1>
-        <p className="mb-4 text-xs text-zinc-500">
-          管理灵动岛上的小组件（配置持久化待接入）
-        </p>
-        <ul className="flex flex-col gap-2">
-          {widgetRegistry.map((widget) => {
-            const Icon = widget.icon;
-            return (
-              <li
-                key={widget.id}
-                className="flex items-center gap-3 rounded-lg bg-white/5 px-3 py-2"
-              >
-                <Icon className="h-4 w-4 text-zinc-300" />
-                <div className="flex-1">
-                  <div className="text-sm text-zinc-100">{widget.name}</div>
-                  {widget.description && (
-                    <div className="text-xs text-zinc-500">
-                      {widget.description}
-                    </div>
-                  )}
-                </div>
-                <div className="text-xs text-zinc-600">
-                  {widget.enabledByDefault ? "已启用" : "未启用"}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      </GlassCard>
-    </div>
-  );
+  const [active, setActive] = useState("general");
+  const [providers, setProviders] = useState<ProviderRecord[]>([]);
+  const [models, setModels] = useState<ModelRecord[]>([]);
+  const [activeProviderId, setActiveProviderId] = useState("");
+  const [providerForm, setProviderForm] = useState(blankProvider);
+  const [modelForm, setModelForm] = useState(blankModel);
+  const [notice, setNotice] = useState("");
+  const [modelModalOpen, setModelModalOpen] = useState(false);
+  const activeSection = sections.find((section) => section.id === active) ?? sections[0];
+  const activeProvider = providers.find((provider) => provider.id === activeProviderId);
+  const providerModels = useMemo(() => models.filter((model) => model.providerId === activeProviderId), [models, activeProviderId]);
+
+  useEffect(() => { void Promise.all([tauriInvoke<ProviderRecord[]>("agent_list_provider_configs"), tauriInvoke<ModelRecord[]>("agent_list_model_configs")]).then(([nextProviders, nextModels]) => { setProviders(nextProviders); setModels(nextModels); setActiveProviderId(nextProviders[0]?.id ?? ""); }).catch(() => undefined); }, []);
+  useEffect(() => { if (activeProvider) setProviderForm({ name: activeProvider.name, protocol: activeProvider.protocol, baseUrl: activeProvider.baseUrl, apiKey: "" }); }, [activeProviderId, activeProvider]);
+
+  const saveProvider = async () => { setNotice(""); try { const provider = await tauriInvoke<ProviderRecord>("agent_save_provider_config", { input: { ...providerForm, id: activeProvider?.id, enabled: true } }); setProviders((current) => [...current.filter((item) => item.id !== provider.id), provider]); setActiveProviderId(provider.id); setProviderForm((current) => ({ ...current, apiKey: "" })); setNotice("供应商已保存，API Key 仅写入系统凭据库。"); } catch (error) { setNotice(error instanceof Error ? error.message : "保存供应商失败"); } };
+  const saveModel = async () => { if (!activeProviderId || !modelForm.modelId.trim()) return; try { const model = await tauriInvoke<ModelRecord>("agent_save_model_config", { input: { ...modelForm, providerId: activeProviderId, contextWindow: Number(modelForm.contextWindow) || null, enabled: true } }); setModels((current) => [...current.filter((item) => item.id !== model.id), model]); setModelForm(blankModel); setModelModalOpen(false); } catch (error) { setNotice(error instanceof Error ? error.message : "保存模型失败"); } };
+  const addProvider = () => { setActiveProviderId(""); setProviderForm(blankProvider); setNotice(""); };
+
+  return <div className="flex h-screen w-screen overflow-hidden bg-[#151516] text-zinc-100">
+    <aside className="flex w-56 shrink-0 flex-col border-r border-white/[0.08] bg-black/15 p-3"><div className="mb-5 flex items-center gap-2 px-2 pt-1"><div className="flex h-7 w-7 items-center justify-center rounded-lg bg-sky-300/12 text-sky-200"><Bot className="h-4 w-4" /></div><div><div className="text-sm font-semibold">设置中心</div><div className="text-[10px] text-zinc-500">Dynamic Island</div></div></div><nav className="space-y-1">{sections.map((section) => { const Icon = section.icon; return <button key={section.id} type="button" onClick={() => setActive(section.id)} className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${active === section.id ? "bg-white/[0.09] text-white" : "text-zinc-500 hover:bg-white/[0.045] hover:text-zinc-200"}`}><Icon className="h-3.5 w-3.5" />{section.label}</button>; })}</nav></aside>
+    <main className="min-w-0 flex-1 overflow-y-auto [scrollbar-color:rgba(255,255,255,.18)_transparent]">{active === "ai-models" ? <div className="mx-auto max-w-6xl p-8"><header className="mb-6 flex items-start justify-between"><div><div className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Settings / AI</div><h1 className="mt-1 text-2xl font-semibold">模型设置</h1><p className="mt-1 text-xs text-zinc-500">管理自定义模型供应商，配置后可在输入框的模型菜单中选择使用。</p></div><button type="button" onClick={() => window.history.back()} className="rounded-lg border border-white/[0.08] px-3 py-1.5 text-xs text-zinc-400 hover:bg-white/[0.06] hover:text-white">返回灵动岛</button></header>
+      <div className="grid min-h-[620px] grid-cols-[240px_minmax(0,1fr)] overflow-hidden rounded-2xl border border-white/[0.12] bg-[#242425] shadow-2xl shadow-black/20"><aside className="border-r border-white/[0.1] p-3"><div className="px-2 py-2 text-xs font-medium text-zinc-500">供应商</div>{providers.map((provider) => <button key={provider.id} type="button" onClick={() => setActiveProviderId(provider.id)} className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2.5 text-left text-sm transition ${activeProviderId === provider.id ? "bg-white/[0.09] text-zinc-100" : "text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-200"}`}><span className="grid h-6 w-6 place-items-center rounded-md bg-white/[0.08] text-[11px] text-zinc-300">◇</span><span className="min-w-0 flex-1 truncate">{provider.name}</span><span className={`h-2 w-2 rounded-full ${provider.hasApiKey ? "bg-emerald-400" : "bg-zinc-600"}`} /></button>)}<button type="button" onClick={addProvider} className={`mt-2 flex w-full items-center gap-2 rounded-lg border border-white/[0.14] px-2.5 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] ${!activeProviderId ? "bg-white/[0.06]" : ""}`}><Plus className="h-4 w-4" />添加供应商</button></aside>
+        <section className="p-7"><div className="mb-6"><h2 className="text-xl font-semibold">{activeProviderId ? "编辑模型供应商" : "添加模型供应商"}</h2><p className="mt-1 text-sm text-zinc-500">配置一个完全自定义的 API 端点和初始模型。</p></div><div className="grid gap-4"><Field label="名称"><TextInput value={providerForm.name} onChange={(event) => setProviderForm((current) => ({ ...current, name: event.target.value }))} placeholder="例如：智谱 GLM" /></Field><Field label="Base URL"><TextInput value={providerForm.baseUrl} onChange={(event) => setProviderForm((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="https://api.example.com/v1" /></Field><Field label="API Key"><TextInput type="password" value={providerForm.apiKey} onChange={(event) => setProviderForm((current) => ({ ...current, apiKey: event.target.value }))} placeholder={activeProvider?.hasApiKey ? "已配置，留空则保持不变" : "输入 API Key"} /></Field><Field label="API 格式"><Select value={providerForm.protocol} options={protocolOptions} onChange={(value) => setProviderForm((current) => ({ ...current, protocol: value }))} /></Field></div><div className="mt-7 flex items-center justify-between"><div><h3 className="text-sm font-medium text-zinc-300">模型列表</h3><p className="mt-1 text-xs text-zinc-500">添加模型后即可在聊天页底部选择。</p></div><button type="button" disabled={!activeProviderId} onClick={() => { setModelForm(blankModel); setModelModalOpen(true); }} className="rounded-lg bg-white/[0.09] px-3 py-2 text-xs text-zinc-200 hover:bg-white/[0.14] disabled:cursor-not-allowed disabled:opacity-40"><Plus className="mr-1 inline h-3.5 w-3.5" />添加模型</button></div><div className="mt-3 grid gap-2">{providerModels.length ? providerModels.map((model) => <div key={model.id} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-black/10 px-3 py-3"><div className="grid h-8 w-8 place-items-center rounded-lg bg-white/[0.06] text-xs text-zinc-400">◇</div><div className="min-w-0 flex-1"><div className="truncate text-sm text-zinc-200">{model.displayName || model.modelId}</div><div className="mt-0.5 text-[10px] text-zinc-500">{model.modelId} · {model.contextWindow?.toLocaleString() ?? "未知"} tokens</div></div><span className="rounded-full bg-emerald-300/10 px-2 py-1 text-[10px] text-emerald-200">可用</span></div>) : <div className="rounded-xl border border-dashed border-white/[0.12] px-4 py-7 text-center text-xs text-zinc-500">当前没有配置模型，添加模型后可在聊天页使用。</div>}</div>{notice && <div className="mt-4 rounded-lg border border-sky-300/15 bg-sky-300/8 px-3 py-2 text-xs text-sky-100">{notice}</div>}<div className="mt-7 flex justify-end"><button type="button" onClick={() => void saveProvider()} className="rounded-lg bg-zinc-100 px-4 py-2 text-xs font-medium text-zinc-900 hover:bg-white"><Save className="mr-1.5 inline h-3.5 w-3.5" />保存供应商</button></div></section></div>
+    </div> : <div className="mx-auto max-w-4xl p-8"><header className="mb-7 flex items-start justify-between"><div><div className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Settings</div><h1 className="mt-1 text-xl font-semibold">{activeSection.label}</h1><p className="mt-1 text-xs text-zinc-500">全局设置中心，后续 Agent、插件和数据策略都从这里管理。</p></div><button type="button" onClick={() => window.history.back()} className="rounded-lg border border-white/[0.08] px-3 py-1.5 text-xs text-zinc-400 hover:bg-white/[0.06] hover:text-white">返回灵动岛</button></header>{active === "plugins" ? <section className="space-y-3"><div className="rounded-xl border border-white/[0.08] bg-white/[0.035] px-4 py-3 text-xs leading-5 text-zinc-500">插件默认可用。使用 AI 时，通过输入框中的 <span className="text-sky-200">@</span> 选择本轮需要调用的插件；高风险操作仍会在执行前请求确认。</div>{builtinPluginRegistry.map((plugin) => <div key={plugin.id} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.035] p-4"><div className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/[0.07] text-base text-sky-200"><AgentIcon id={plugin.icon} className="h-5 w-5" /></div><div className="min-w-0 flex-1"><div className="flex items-center gap-2 text-sm font-medium">{plugin.name}<span className="rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[9px] text-zinc-500">{plugin.risk}</span></div><div className="mt-1 text-xs text-zinc-500">{plugin.description}</div><div className="mt-2 text-[10px] text-zinc-600">{plugin.tools.length} 个工具 · v{plugin.version}</div></div><span className="rounded-lg bg-emerald-300/10 px-3 py-1.5 text-xs text-emerald-200">可用</span></div>)}</section> : <section className="rounded-xl border border-white/[0.08] bg-white/[0.035] p-5"><h2 className="text-sm font-medium">{activeSection.label}</h2><p className="mt-2 text-xs leading-5 text-zinc-500">这一分类的详细配置将在对应阶段接入。当前页面已经预留完整设置中心结构。</p></section>}</div>}</main>
+    {modelModalOpen && <ModelModal form={modelForm} setForm={setModelForm} onClose={() => setModelModalOpen(false)} onSave={() => void saveModel()} />}
+  </div>;
 }

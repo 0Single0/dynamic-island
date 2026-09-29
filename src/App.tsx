@@ -1,10 +1,20 @@
-import { Route, Routes } from "react-router-dom";
+import { useEffect } from "react";
+import { Route, Routes, useLocation } from "react-router-dom";
 import { AppToaster } from "@/components/common/AppToaster";
 import { routes } from "@/routes";
+import { setWindowInteractive } from "@/api/window";
 
-export default function App() {
+function RoutedApp() {
+  const location = useLocation();
+
+  useEffect(() => {
+    // 设置中心是完整窗口页面，必须关闭灵动岛区域外的点击穿透；
+    // 回到首页后恢复透明窗口的局部命中策略。
+    void setWindowInteractive(location.pathname !== "/");
+  }, [location.pathname]);
+
   return (
-    <div className="h-screen w-screen overflow-hidden bg-transparent text-zinc-100 antialiased">
+    <>
       <Routes>
         {routes.map((route) => (
           <Route
@@ -15,6 +25,14 @@ export default function App() {
         ))}
       </Routes>
       <AppToaster />
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <div className="h-screen w-screen overflow-hidden bg-transparent text-zinc-100 antialiased">
+      <RoutedApp />
     </div>
   );
 }

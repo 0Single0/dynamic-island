@@ -200,8 +200,11 @@ pub async fn poll_once(runtime: &SyncRuntime, session: &mut CdpSession) -> anyho
     }
 
     // —— 曲目指纹：连续两轮一致才确认切歌 ——
-    let fingerprint =
-        format!("{}|{}", super::playlist::normalize_public(&title), snapshot_duration_ms);
+    let fingerprint = format!(
+        "{}|{}",
+        super::playlist::normalize_public(&title),
+        snapshot_duration_ms
+    );
     let confirmed = {
         let mut inner = runtime.inner.lock().unwrap();
         if inner.fingerprint.as_deref() == Some(fingerprint.as_str()) {
@@ -233,14 +236,12 @@ pub async fn poll_once(runtime: &SyncRuntime, session: &mut CdpSession) -> anyho
         .map(|m| m.duration_ms)
         .filter(|_| snapshot_duration_ms == 0)
         .unwrap_or(snapshot_duration_ms);
-    let effective_position_ms = if snapshot_duration_ms == 0
-        && snapshot_position_ms <= 1000
-        && effective_duration_ms > 0
-    {
-        snapshot_position_ms.saturating_mul(effective_duration_ms) / 1000
-    } else {
-        snapshot_position_ms
-    };
+    let effective_position_ms =
+        if snapshot_duration_ms == 0 && snapshot_position_ms <= 1000 && effective_duration_ms > 0 {
+            snapshot_position_ms.saturating_mul(effective_duration_ms) / 1000
+        } else {
+            snapshot_position_ms
+        };
 
     // 歌词：只在 songId 变化时拉取
     {
@@ -263,10 +264,9 @@ pub async fn poll_once(runtime: &SyncRuntime, session: &mut CdpSession) -> anyho
     let (connection, track_state, lyrics_state) = match &meta {
         Some(m) => {
             let inner_lyrics = runtime.inner.lock().unwrap().lyrics.clone();
-            let lyrics_state =
-                inner_lyrics
-                    .as_ref()
-                    .map(|l| build_lyrics_state(l, effective_position_ms));
+            let lyrics_state = inner_lyrics
+                .as_ref()
+                .map(|l| build_lyrics_state(l, effective_position_ms));
             (
                 if inner_lyrics.is_some() {
                     ConnectionState::Synchronizing
@@ -284,7 +284,11 @@ pub async fn poll_once(runtime: &SyncRuntime, session: &mut CdpSession) -> anyho
                         } else {
                             m.cover_url.clone()
                         };
-                        if local.is_empty() { None } else { Some(local) }
+                        if local.is_empty() {
+                            None
+                        } else {
+                            Some(local)
+                        }
                     },
                     duration_ms: Some(if m.duration_ms > 0 {
                         m.duration_ms
@@ -340,7 +344,10 @@ pub async fn seek(runtime: &SyncRuntime, session: &mut CdpSession, position_ms: 
         .track
         .and_then(|track| track.duration_ms)
         .unwrap_or(0);
-    session.seek(position_ms, duration_ms).await.unwrap_or(false)
+    session
+        .seek(position_ms, duration_ms)
+        .await
+        .unwrap_or(false)
 }
 
 fn build_lyrics_state(lyrics: &Lyrics, position_ms: u64) -> LyricsState {

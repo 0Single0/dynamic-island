@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use tauri::{WebviewWindowBuilder, WebviewUrl};
+use tauri::{WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
 pub fn read_markdown_file(path: String) -> Result<String, String> {
@@ -92,20 +92,16 @@ async fn render_with_webview2(
     title: &str,
 ) -> Result<(), String> {
     let label = format!("markdown-print-{}", uuid_suffix());
-    let print_window = WebviewWindowBuilder::new(
-        app,
-        &label,
-        WebviewUrl::App("index.html".into()),
-    )
-    .title(title)
-    .inner_size(794.0, 1123.0)
-    .position(-2000.0, -2000.0)
-    .decorations(false)
-    .resizable(false)
-    .skip_taskbar(true)
-    .visible(false)
-    .build()
-    .map_err(|e| format!("创建打印页面失败: {e}"))?;
+    let print_window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+        .title(title)
+        .inner_size(794.0, 1123.0)
+        .position(-2000.0, -2000.0)
+        .decorations(false)
+        .resizable(false)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()
+        .map_err(|e| format!("创建打印页面失败: {e}"))?;
 
     let document = printable_document(html, title);
     if let Err(error) = navigate_to_string(&print_window, &document) {
@@ -133,9 +129,7 @@ fn navigate_to_string(window: &tauri::WebviewWindow, html: &str) -> Result<(), S
             let result = webview
                 .controller()
                 .CoreWebView2()
-                .and_then(|core: ICoreWebView2| {
-                    core.NavigateToString(PCWSTR(content.as_ptr()))
-                })
+                .and_then(|core: ICoreWebView2| core.NavigateToString(PCWSTR(content.as_ptr())))
                 .map_err(|e| e.to_string());
             let _ = sender.send(result);
         })
@@ -150,7 +144,7 @@ async fn print_to_pdf(window: &tauri::WebviewWindow, output_path: &str) -> Resul
     use std::sync::mpsc;
 
     use webview2_com::{
-        Microsoft::Web::WebView2::Win32::{ICoreWebView2_7, ICoreWebView2Environment6},
+        Microsoft::Web::WebView2::Win32::{ICoreWebView2Environment6, ICoreWebView2_7},
         PrintToPdfCompletedHandler,
     };
     use windows::core::PCWSTR;
@@ -172,11 +166,11 @@ async fn print_to_pdf(window: &tauri::WebviewWindow, output_path: &str) -> Resul
                     .map_err(|e| e.to_string())?
                     .cast()
                     .map_err(|e| e.to_string())?;
-                let environment: ICoreWebView2Environment6 = webview
-                    .environment()
-                    .cast()
+                let environment: ICoreWebView2Environment6 =
+                    webview.environment().cast().map_err(|e| e.to_string())?;
+                let settings = environment
+                    .CreatePrintSettings()
                     .map_err(|e| e.to_string())?;
-                let settings = environment.CreatePrintSettings().map_err(|e| e.to_string())?;
                 // WebView2 使用英寸；与打印 CSS 的 A4 纵向尺寸保持一致。
                 settings.SetPageWidth(8.27).map_err(|e| e.to_string())?;
                 settings.SetPageHeight(11.69).map_err(|e| e.to_string())?;
@@ -185,14 +179,19 @@ async fn print_to_pdf(window: &tauri::WebviewWindow, output_path: &str) -> Resul
                 settings.SetMarginBottom(0.0).map_err(|e| e.to_string())?;
                 settings.SetMarginLeft(0.0).map_err(|e| e.to_string())?;
                 settings.SetMarginRight(0.0).map_err(|e| e.to_string())?;
-                settings.SetShouldPrintBackgrounds(true).map_err(|e| e.to_string())?;
-                settings.SetShouldPrintHeaderAndFooter(false).map_err(|e| e.to_string())?;
+                settings
+                    .SetShouldPrintBackgrounds(true)
+                    .map_err(|e| e.to_string())?;
+                settings
+                    .SetShouldPrintHeaderAndFooter(false)
+                    .map_err(|e| e.to_string())?;
 
-                let handler = PrintToPdfCompletedHandler::create(Box::new(move |error, success| {
-                    let result = error.map(|_| success).map_err(|e| e.to_string());
-                    let _ = callback_sender.send(result);
-                    Ok(())
-                }));
+                let handler =
+                    PrintToPdfCompletedHandler::create(Box::new(move |error, success| {
+                        let result = error.map(|_| success).map_err(|e| e.to_string());
+                        let _ = callback_sender.send(result);
+                        Ok(())
+                    }));
 
                 core.PrintToPdf(PCWSTR(output.as_ptr()), &settings, &handler)
                     .map_err(|e| e.to_string())
@@ -240,7 +239,8 @@ table {{ width: 100%; border-collapse: collapse; margin: 0.75em 0; break-inside:
 tr {{ break-inside: avoid; page-break-inside: avoid; }} th, td {{ border: 1px solid #d1d5db; padding: 0.35em 0.5em; text-align: left; vertical-align: top; }}
 th {{ background: #f3f4f6; color: #111827; }}
 </style></head><body><main>{}</main></body></html>"#,
-        escape_html(title), body
+        escape_html(title),
+        body
     )
 }
 

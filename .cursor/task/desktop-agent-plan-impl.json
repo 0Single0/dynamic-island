@@ -5,7 +5,7 @@
   "plan_ref": ".cursor/plan/desktop-agent-plan.md",
   "status": "in-progress",
   "last_updated": "2026-09-29",
-  "current_task_id": "PLAN-00-02",
+  "current_task_id": "TASK-11",
   "tasks": [
     {
       "id": "PLAN-00-01",
@@ -37,249 +37,386 @@
     {
       "id": "PLAN-00-02",
       "title": "SQLite vs Tauri Store 数据方案 Spike",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§12.1",
+          "§12.2",
+          "§12.3"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T10:15:32+08:00",
+      "completed_at": "2026-09-29T10:18:00+08:00",
+      "files_changed": [
+        ".cursor/spikes/storage-strategy/README.md",
+        ".cursor/docs/desktop-agent-spec.md",
+        ".cursor/plan/desktop-agent-plan.md",
+        ".cursor/task/desktop-agent-plan-impl.json"
+      ],
+      "notes": "决定由 Rust storage/service 通过 SQLx 直接管理 SQLite 作为 Agent 领域数据唯一权威来源；Tauri Store 仅存非敏感 UI 偏好；API Key/敏感 Header 留给 PLAN-00-03。仅完成架构 Spike，未加入依赖或实现持久化代码。"
     },
     {
       "id": "PLAN-00-03",
       "title": "Windows Credential Manager/DPAPI 抽象 Spike",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T10:22:00+08:00",
+      "completed_at": "2026-09-29T10:43:00+08:00",
+      "files_changed": [
+        "src-tauri/Cargo.toml",
+        "src-tauri/Cargo.lock",
+        "src-tauri/src/lib.rs",
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/agent/secrets.rs",
+        ".cursor/spikes/credential-storage/README.md",
+        ".cursor/docs/desktop-agent-spec.md"
+      ],
+      "notes": "引入 SecretStore 抽象和 Windows native keyring 后端；内存 fake 生命周期测试通过。API Key 不返回前端、不写 SQLite/Store；正式 Provider 接入仍需在真实设置流中验证轮换和删除。"
     },
     {
       "id": "PLAN-00-04",
       "title": "Tiptap / 与 @ 浮层交互原型",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§5.4",
+          "§5.5"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T10:25:00+08:00",
+      "completed_at": "2026-09-29T10:48:00+08:00",
+      "files_changed": [
+        "package.json",
+        "pnpm-lock.yaml",
+        "src/components/agent/Composer.tsx",
+        "src/components/agent/Composer.css"
+      ],
+      "notes": "加入 Tiptap Composer 原型：/ 动作目录、@ 插件目录、过滤、上下键、Enter/Tab 选择、插件 chip、结构化 JSON 提交和 Enter/Shift+Enter 行为。已通过 tsc。"
     },
     {
       "id": "PLAN-00-05",
       "title": "UIA 记事本控件树操作 Spike",
-      "state": "pending",
+      "state": "blocked",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§10.1",
+          "§10.3",
+          "§10.5"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
+      "started_at": "2026-09-29T10:49:00+08:00",
       "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "files_changed": [
+        ".cursor/spikes/uia-notepad/README.md"
+      ],
+      "notes": "已记录 UIA 最小验收流程和安全边界；本机启动记事本被系统转发到已有文档窗口，无法安全获得隔离测试实例，因此没有对用户窗口进行读写，待 Windows runner/独立测试实例补验。"
     },
     {
       "id": "PLAN-00-06",
       "title": "网络搜索 Provider 接口 Spike",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§5.7",
+          "§9.1"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T10:49:00+08:00",
+      "completed_at": "2026-09-29T10:52:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/agent/search.rs",
+        ".cursor/spikes/search-provider/README.md"
+      ],
+      "notes": "完成 WebSearchProvider、SearchRequest、可追溯 SearchResult 和离线 Mock provider；空查询及结果数量边界有测试。"
     },
     {
       "id": "PLAN-00-07",
       "title": "浏览器/CDP 会话 Spike",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§10.1",
+          "§10.5"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:00:00+08:00",
+      "completed_at": "2026-09-29T11:20:00+08:00",
+      "files_changed": [
+        ".cursor/spikes/browser-cdp/README.md",
+        "src-tauri/tests/cdp_session_spike.rs"
+      ],
+      "notes": "隔离 Chrome 临时 Profile 的 CDP 生命周期测试通过：创建 BrowserContext/Target、发现 page Target、Runtime.evaluate、关闭 Target/Context/Browser；未连接用户现有浏览器。"
     },
     {
       "id": "PLAN-00-08",
       "title": "Agent 预算、费用、重试、备用模型和并发锁 Spike",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§7.4",
+          "§14",
+          "§15"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T10:55:00+08:00",
+      "completed_at": "2026-09-29T11:05:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/agent/limits.rs",
+        ".cursor/spikes/run-budget/README.md",
+        ".cursor/spikes/agent-budget-security/README.md"
+      ],
+      "notes": "BudgetGuard 统一强制步数、时间、token、工具/搜索/Computer Use 次数和费用上限；重试分类测试通过。并发锁键模型已记录，正式持久化锁留给 TASK-25。"
     },
     {
       "id": "PLAN-00-09",
       "title": "外部内容隔离、提示词注入和 SSRF 测试",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§4.1",
+          "§6.7",
+          "§18"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:05:00+08:00",
+      "completed_at": "2026-09-29T11:10:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/agent/security.rs",
+        ".cursor/spikes/content-safety/README.md",
+        ".cursor/spikes/agent-budget-security/README.md"
+      ],
+      "notes": "完成 UntrustedContent 标记和 HTTPS/localhost URL 字面量校验离线测试；DNS 解析、重定向和真实下载链路仍需网络工具实现时补齐。"
     },
     {
       "id": "PLAN-00-10",
       "title": "文件编码、原子写入和路径安全 Spike",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§9.3",
+          "§17"
+        ],
         "plan_section": "§4 Phase 0 — 决策与 Spike"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:10:00+08:00",
+      "completed_at": "2026-09-29T11:16:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/agent/filesystem.rs",
+        ".cursor/spikes/filesystem-safety/README.md"
+      ],
+      "notes": "完成授权根、canonicalize、非存在输出父目录、UNC 和符号链接拒绝的路径策略测试；Junction/reparse point、编码探测和原子替换留给文件插件实现。"
     },
     {
       "id": "TASK-01",
       "title": "AI 应用卡片和 AI panel 状态",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§5.1",
+          "§5.2"
+        ],
         "plan_section": "§5 任务分解"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:20:00+08:00",
+      "completed_at": "2026-09-29T11:35:00+08:00",
+      "files_changed": [
+        "src/widgets/ai/index.tsx",
+        "src/widgets/ai/AIExpanded.tsx",
+        "src/widgets/index.ts",
+        "src/widgets/ApplicationLauncher.tsx",
+        "src/components/island/Island.tsx",
+        "src/config/island.ts"
+      ],
+      "notes": "AI Agent 注册为时钟之前的应用卡片，加入展开对话面板、插件 chip 和结构化 Composer 入口；前端暂用阶段占位回复，真实 Provider/Agent Loop 留给后续任务。"
     },
     {
       "id": "TASK-02",
       "title": "全局设置中心",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§5.3",
+          "§5.6"
+        ],
         "plan_section": "§5 任务分解"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:35:00+08:00",
+      "completed_at": "2026-09-29T11:45:00+08:00",
+      "files_changed": [
+        "src/pages/Settings/index.tsx",
+        "src/components/island/Island.tsx"
+      ],
+      "notes": "设置按钮只在应用列表标题栏显示，页面升级为通用设置中心左侧导航，覆盖通用、AI、插件、权限、上下文、网络、隐私、外观和关于分类；插件页支持本地启停交互。"
     },
     {
       "id": "TASK-03",
       "title": "Plugin Manifest、Registry、启停和权限",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§6.1",
+          "§6.2",
+          "§6.4",
+          "API-11",
+          "API-12",
+          "API-13"
+        ],
         "plan_section": "§5 任务分解"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:45:00+08:00",
+      "completed_at": "2026-09-29T11:55:00+08:00",
+      "files_changed": [
+        "src/agent/plugins/types.ts",
+        "src/agent/plugins/index.ts",
+        "src/pages/Settings/index.tsx",
+        "src-tauri/src/agent/plugins/mod.rs",
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/lib.rs"
+      ],
+      "notes": "前后端建立统一的内置 PluginManifest/Registry，包含风险等级、工具和 Slash 动作；桌面插件默认关闭；Rust 暴露 list_builtin_plugins 查询命令，正式启停持久化留给后续存储任务。"
     },
     {
       "id": "TASK-04",
       "title": "Tiptap 输入框、Slash 动作目录和 @ 插件目录",
-      "state": "pending",
+      "state": "completed",
       "trace": {
-        "spec_ids": [],
+        "spec_ids": [
+          "§5.4",
+          "§5.5"
+        ],
         "plan_section": "§5 任务分解"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T11:20:00+08:00",
+      "completed_at": "2026-09-29T11:30:00+08:00",
+      "files_changed": [
+        "package.json",
+        "pnpm-lock.yaml",
+        "src/components/agent/Composer.tsx",
+        "src/components/agent/Composer.css",
+        "src/widgets/ai/AIExpanded.tsx"
+      ],
+      "notes": "Tiptap Composer 已接入 AI 页面，支持 / 动作目录、@ 插件目录、过滤、键盘选择、chip 删除、结构化 JSON 文档提交、Enter 发送和 Shift+Enter 换行。"
     },
     {
       "id": "TASK-05",
       "title": "会话、任务、消息和本地存储",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "completed_at": "2026-09-29T18:20:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/storage.rs",
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/lib.rs",
+        "src-tauri/Cargo.toml",
+        "src-tauri/Cargo.lock"
+      ],
+      "notes": "SQLite 本地存储已落地：会话、消息、Provider、Model、Run、Approval 表和基础 CRUD；数据库位于 Tauri app_data_dir，前端没有任意 SQL。"
     },
     {
       "id": "TASK-06",
       "title": "ProviderConfig、ModelConfig 和 AI 设置页",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "completed_at": "2026-09-29T18:20:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/config.rs",
+        "src/pages/Settings/index.tsx",
+        "src/agent/api.ts"
+      ],
+      "notes": "设置中心已接入供应商和模型表单；支持三种协议选择、Base URL 校验、模型能力基础字段；API Key 只进 SecretStore，前端仅显示是否已配置。"
     },
     {
       "id": "TASK-07",
       "title": "三种 API Adapter、SSE 和统一流式事件",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "completed_at": "2026-09-29T18:20:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/providers.rs",
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/tests/provider_protocol_fixtures.rs"
+      ],
+      "notes": "统一 CanonicalRequest、三种协议请求构造、SSE 事件解析和文本增量抽取已实现；Provider 请求使用 HTTPS/localhost 策略和系统凭据认证。"
     },
     {
       "id": "TASK-08",
       "title": "Agent Loop、任务状态、取消、重试、预算、并发和事件协议",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "completed_at": "2026-09-29T18:20:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/agent/events.rs",
+        "src/widgets/ai/AIExpanded.tsx",
+        "src/agent/api.ts"
+      ],
+      "notes": "最小 Agent Loop 已接入消息持久化、Run 状态、流式事件、客户端生成 runId、取消标记、超时和现有预算/重试策略基础；复杂工具循环、真实工具执行留给后续插件阶段。"
     },
     {
       "id": "TASK-09",
       "title": "Permission Policy、审批快照和 Approval UI",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "completed_at": "2026-09-29T18:20:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/permissions.rs",
+        "src-tauri/src/agent/mod.rs",
+        "src/components/agent/ApprovalCard.tsx"
+      ],
+      "notes": "PermissionPolicy、风险等级、审批参数摘要哈希、5 分钟过期快照和 ApprovalCard UI 基础已完成；审批快照保存在 AgentState，执行内置工具时校验 approvalId、工具名、参数哈希、状态和过期时间并一次性消费。真正的模型 tool-call 自动审批事件串联留给后续工具循环扩展。"
     },
     {
       "id": "TASK-10",
       "title": "网易云和 Markdown 内置插件",
-      "state": "pending",
+      "state": "completed",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
-      "started_at": null,
-      "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "started_at": "2026-09-29T18:20:00+08:00",
+      "completed_at": "2026-09-29T18:38:00+08:00",
+      "files_changed": [
+        "src-tauri/src/agent/tools.rs",
+        "src-tauri/src/agent/mod.rs",
+        "src-tauri/src/lib.rs",
+        "src/agent/plugins/index.ts",
+        "src/agent/plugins/types.ts"
+      ],
+      "notes": "网易云和 Markdown 已接入统一内置 Tool Registry 与 agent_execute_builtin_tool：统一 ToolDefinition、JSON Schema、风险等级、输出上限和 ToolExecutionResult；网易云读取/控制/跳转和 Markdown 读取/转 PDF 复用现有模块。L1 写操作要求有效的一次性 approvalId，执行时校验工具名、参数哈希和过期时间。文件安全和模型自动工具循环留给后续 TASK-11/TASK-08 扩展。"
     },
     {
       "id": "TASK-11",

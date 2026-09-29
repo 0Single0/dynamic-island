@@ -6,7 +6,7 @@ import type { ComponentType } from "react";
  * compact —— 岛体收起时在胶囊内显示的极简信息（时间、频谱、封面等）。
  * expanded —— 岛体展开后渲染的完整面板。
  */
-export type WidgetSize = "sm" | "md" | "lg";
+export type WidgetSize = "sm" | "md" | "lg" | "xl";
 
 export interface WidgetCompactRenderProps {
   /** 是否处于悬浮预览状态（岛体微展时） */

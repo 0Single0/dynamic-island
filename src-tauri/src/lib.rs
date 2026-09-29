@@ -1,4 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod agent;
 mod commands;
 mod markdown;
 mod netease;
@@ -17,12 +18,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|error| error.to_string())?;
+            let agent_state = agent::AgentState::initialize(&app_data_dir).map_err(|error| {
+                std::io::Error::other(format!("agent storage init failed: {error}"))
+            })?;
+            app.manage(agent_state);
             // 注：尝试过 Windows Acrylic（window-vibrancy），但 Win11 的
             // Acrylic 材质自带蓝白系统渐变膜且会混入背后网页颜色，无法去除，
             // 故弃用。质感完全由 CSS 深色半透明底 + 高光描边实现。
             // 系统托盘：显示/隐藏岛体 + 退出
-            let show_hide =
-                MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
+            let show_hide = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_hide, &quit])?;
 
@@ -68,11 +76,25 @@ pub fn run() {
             commands::window::set_always_on_top,
             commands::window::pin_to_top_center,
             commands::window::set_island_rect,
+            commands::window::set_window_interactive,
             commands::window::quit_app,
             commands::window::hide_window,
             markdown::read_markdown_file,
             markdown::read_markdown_image_data,
             markdown::markdown_to_pdf,
+            agent::agent_list_sessions,
+            agent::agent_create_session,
+            agent::agent_list_messages,
+            agent::agent_send_message,
+            agent::agent_cancel_run,
+            agent::agent_preview_approval,
+            agent::agent_execute_builtin_tool,
+            agent::config::agent_list_provider_configs,
+            agent::config::agent_list_model_configs,
+            agent::config::agent_save_provider_config,
+            agent::config::agent_save_model_config,
+            agent::plugins::list_builtin_plugins,
+            agent::tools::list_builtin_tools,
             netease::netease_start_or_connect,
             netease::netease_restart_with_sync,
             netease::netease_control,

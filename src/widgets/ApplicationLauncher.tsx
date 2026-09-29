@@ -23,7 +23,7 @@ export function ApplicationLauncher({
       name: widget.name,
       icon: widget.icon,
       target: { kind: "widget" as const, id: widget.id },
-      accent: widget.id === "music" ? "text-emerald-300" : "text-sky-300",
+      accent: widget.id === "music" ? "text-emerald-300" : widget.id === "ai" ? "text-sky-200" : "text-sky-300",
     })),
     {
       id: "markdown-pdf",

@@ -23,9 +23,7 @@ pub struct Lyrics {
     pub lines: Vec<LyricLine>,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LyricsKind {
     #[default]
@@ -100,13 +98,15 @@ pub async fn fetch(song_id: &str) -> Option<Lyrics> {
     } else if !tl.is_empty() {
         (LyricsKind::Translation, tl.clone())
     } else {
-        return Some(Lyrics { kind: LyricsKind::None, lines: Vec::new() });
+        return Some(Lyrics {
+            kind: LyricsKind::None,
+            lines: Vec::new(),
+        });
     };
 
     if kind == LyricsKind::Original && !tl.is_empty() {
         // 翻译按时间戳挂到主行
-        let tl_map: HashMap<u64, String> =
-            tl.into_iter().map(|l| (l.start_ms, l.text)).collect();
+        let tl_map: HashMap<u64, String> = tl.into_iter().map(|l| (l.start_ms, l.text)).collect();
         for line in &mut lines {
             if let Some(t) = tl_map.get(&line.start_ms) {
                 line.translation = Some(t.clone());

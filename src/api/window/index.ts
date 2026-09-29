@@ -25,6 +25,11 @@ export function setIslandRect(x: number, y: number, width: number, height: numbe
   return invoke<void>("set_island_rect", { x, y, width, height }).catch(() => {});
 }
 
+/** 切换完整页面 / 灵动岛局部点击模式。 */
+export function setWindowInteractive(interactive: boolean) {
+  return invoke<void>("set_window_interactive", { interactive }).catch(() => {});
+}
+
 /** 退出应用 */
 export function quitApp() {
   return invoke<void>("quit_app").catch(() => {});

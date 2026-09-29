@@ -47,10 +47,7 @@ fn outcome_state(outcome: &StartOutcome) -> NeteaseState {
         StartOutcome::Ready => (ConnectionState::WaitingForCdp, None),
         StartOutcome::NeedsRestart => (
             ConnectionState::NeedsRestart,
-            Some(
-                "当前网易云不是由本工具启动，无法取得精确歌词进度。请保存内容后确认重启。"
-                    .into(),
-            ),
+            Some("当前网易云不是由本工具启动，无法取得精确歌词进度。请保存内容后确认重启。".into()),
         ),
         StartOutcome::NotFound => (
             ConnectionState::Error,
@@ -159,7 +156,9 @@ async fn establish(shared: SharedNetease, outcome: StartOutcome) {
 // —— Tauri 命令 ——
 
 #[tauri::command]
-pub async fn netease_start_or_connect(shared: tauri::State<'_, SharedNetease>) -> Result<(), String> {
+pub async fn netease_start_or_connect(
+    shared: tauri::State<'_, SharedNetease>,
+) -> Result<(), String> {
     let shared = shared.inner().clone();
     let outcome = launcher::start_or_connect().await;
     eprintln!("[netease] start_or_connect outcome: {outcome:?}");
@@ -168,7 +167,9 @@ pub async fn netease_start_or_connect(shared: tauri::State<'_, SharedNetease>) -
 }
 
 #[tauri::command]
-pub async fn netease_restart_with_sync(shared: tauri::State<'_, SharedNetease>) -> Result<(), String> {
+pub async fn netease_restart_with_sync(
+    shared: tauri::State<'_, SharedNetease>,
+) -> Result<(), String> {
     let shared = shared.inner().clone();
     let outcome = launcher::restart_with_sync().await;
     eprintln!("[netease] restart_with_sync outcome: {outcome:?}");
@@ -177,7 +178,10 @@ pub async fn netease_restart_with_sync(shared: tauri::State<'_, SharedNetease>) 
 }
 
 #[tauri::command]
-pub async fn netease_control(shared: tauri::State<'_, SharedNetease>, action: String) -> Result<bool, String> {
+pub async fn netease_control(
+    shared: tauri::State<'_, SharedNetease>,
+    action: String,
+) -> Result<bool, String> {
     let mut guard = shared.session.lock().await;
     match guard.as_mut() {
         Some(session) => Ok(sync::control(&shared.runtime, session, &action).await),
@@ -198,7 +202,10 @@ pub async fn netease_seek(
 }
 
 #[tauri::command]
-pub async fn netease_set_lyric_offset(shared: tauri::State<'_, SharedNetease>, offset_ms: u64) -> Result<(), String> {
+pub async fn netease_set_lyric_offset(
+    shared: tauri::State<'_, SharedNetease>,
+    offset_ms: u64,
+) -> Result<(), String> {
     shared.runtime.set_lyric_offset(offset_ms);
     Ok(())
 }
@@ -206,17 +213,17 @@ pub async fn netease_set_lyric_offset(shared: tauri::State<'_, SharedNetease>, o
 #[tauri::command]
 pub async fn netease_disconnect(shared: tauri::State<'_, SharedNetease>) -> Result<(), String> {
     *shared.session.lock().await = None;
-    shared
-        .runtime
-        .publish(NeteaseState {
-            connection: ConnectionState::Idle,
-            ..base_state()
-        });
+    shared.runtime.publish(NeteaseState {
+        connection: ConnectionState::Idle,
+        ..base_state()
+    });
     Ok(())
 }
 
 #[tauri::command]
-pub async fn netease_current_state(shared: tauri::State<'_, SharedNetease>) -> Result<NeteaseState, String> {
+pub async fn netease_current_state(
+    shared: tauri::State<'_, SharedNetease>,
+) -> Result<NeteaseState, String> {
     Ok(shared.runtime.current())
 }
 
@@ -225,11 +232,7 @@ pub async fn netease_current_state(shared: tauri::State<'_, SharedNetease>) -> R
 /// 只放行图片 CDN 域名 + 图片后缀，返回体直接进 <img src>，不落盘。
 #[tauri::command]
 pub async fn netease_cover_data_url(raw_url: String) -> Result<String, String> {
-    const ALLOWED_HOST_SUFFIXES: [&str; 3] = [
-        "music.126.net",
-        "126.net",
-        "netease.im",
-    ];
+    const ALLOWED_HOST_SUFFIXES: [&str; 3] = ["music.126.net", "126.net", "netease.im"];
     // 解出 orpheus://cache/?<real-url> 的真实地址；纯 http(s) 也接受
     let real = raw_url
         .strip_prefix("orpheus://cache/?")
@@ -241,11 +244,7 @@ pub async fn netease_cover_data_url(raw_url: String) -> Result<String, String> {
     let host_ok = reqwest::Url::parse(&real)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
-        .map(|h| {
-            ALLOWED_HOST_SUFFIXES
-                .iter()
-                .any(|s| h.ends_with(s))
-        })
+        .map(|h| ALLOWED_HOST_SUFFIXES.iter().any(|s| h.ends_with(s)))
         .unwrap_or(false);
     if !host_ok {
         return Err("cover host not allowed".into());

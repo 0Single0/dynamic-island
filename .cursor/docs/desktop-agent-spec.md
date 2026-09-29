@@ -1023,12 +1023,13 @@ Rust Windows 侧新增 `computer` 模块，使用 `windows` crate 增加以下�
 
 ### 12.1 存储策略
 
-- 会话、消息、工具调用和压缩摘要：本地 SQLite。[假设: 第一版需要保留会话历史。]
-- 普通 UI 设置：Tauri Store 或 SQLite。
-- API Key：不得明文写入会话或普通 JSON；优先使用 Windows Credential Manager 或 DPAPI 加密存储。
+- Agent 领域数据统一存放在本地 SQLite：Provider/Model（不含凭据）、会话、消息、工具调用、Run、压缩摘要、插件配置/权限、任务和 Artifact 元数据。SQLite 是这些数据的唯一权威来源。
+- SQLite 由 Rust Agent storage/service 层直接访问；前端只调用经过校验的 Tauri command，不直接获得任意 SQL 接口。数据库位于 Tauri `app_data_dir`，使用版本化迁移。
+- Tauri Store 仅可保存非敏感、无权限含义的界面偏好（例如面板折叠状态）；不得保存 Agent/插件权限、Provider/Model 权威配置、会话状态或凭据。相同业务字段不可同时写入 SQLite 和 Store。
+- API Key 和敏感自定义 Header：不得写入 SQLite、Store、会话、日志或导出文件；SQLite 只保留不透明 `secret_ref`。Windows 使用系统凭据保管库，通过 Rust `SecretStore` 抽象访问；UI 仅可获知“已配置/未配置”，不能读取秘密。
 - 日志：本地滚动日志，不写入 API Key、完整密码输入或敏感附件内容。
 
-Tauri Store 适合保存非敏感键值设置，API Key 仍需要单独的安全存储。([tauri.app](https://tauri.app/plugin/store/))
+详细方案比较与实施约束见 [存储方案 Spike](../spikes/storage-strategy/README.md)。Tauri Store 是持久化键值存储，适合轻量 UI 偏好；Agent 的关系型业务数据保留在 SQLite。([Tauri Store](https://v2.tauri.app/plugin/store/))
 
 ### 12.2 表清单
 

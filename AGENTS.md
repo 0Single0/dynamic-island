@@ -67,6 +67,9 @@ src-tauri/
 ## Frontend Rules
 
 - 使用 Tailwind CSS。玻璃拟态表面只用 `index.css` 里的 `.glass-island`（岛体）与 `.glass-panel`（面板），或 `components/common/GlassCard.tsx`，不要散落写 backdrop-filter。
+- 新增或修改页面、组件的 UI 样式必须优先使用 Tailwind utility class；不要为单个页面继续新增 `*.css` 组件样式或 `agent-*` 这类散落的 CSS 类。
+- 只有 Tailwind 无法稳定覆盖的浏览器细节（例如 WebView 编辑器伪元素、原生滚动条、第三方编辑器内部节点）才允许保留少量 CSS，并且应放到公共入口样式或第三方适配文件中，不能把普通布局、间距、颜色、尺寸写回组件 CSS。
+- 修改既有页面时，顺手将本次触及区域从 CSS class 迁移为 Tailwind class；不要同时维护两套表达同一 UI 的样式系统。
 - 使用 `components/common/` 下的公共组件；页面私有组件放 `pages/<page>/components/`。
 - 布局用 Flexbox，外层容器 `h-screen w-screen`；岛体窗口本身透明，根元素 `bg-transparent`。
 - 每个源文件保持在 1,000 行以内，超出前按职责拆分。

@@ -39,7 +39,10 @@ pub fn is_cloudmusic_running() -> bool {
 
 /// 端口上是否已有网易云 CDP 页面（防止把其他 Chromium 程序误当网易云）。
 pub async fn cdp_ready(port: u16) -> bool {
-    super::cdp::find_target(port).await.map(|t| t.is_some()).unwrap_or(false)
+    super::cdp::find_target(port)
+        .await
+        .map(|t| t.is_some())
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
