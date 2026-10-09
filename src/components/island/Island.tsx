@@ -19,12 +19,9 @@ import {
   setIslandRect,
 } from "@/api/window";
 import { IconButton } from "@/components/common/IconButton";
+import { readIslandPanel, rememberIslandPanel, type ActivePanel } from "./panelState";
 
 type IslandState = "collapsed" | "hovered" | "expanded";
-type ActivePanel =
-  | { kind: "launcher" }
-  | { kind: "widget"; id: string }
-  | { kind: "tool"; id: "markdown-pdf" };
 
 /**
  * 灵动岛主体。
@@ -34,12 +31,16 @@ type ActivePanel =
  * compact / expanded 两个内容层绝对定位、透明度交叉淡化。
  */
 export function Island() {
-  const [state, setState] = useState<IslandState>("collapsed");
-  const [activePanel, setActivePanel] = useState<ActivePanel>({ kind: "launcher" });
+  const [state, setState] = useState<IslandState>(() => (readIslandPanel().expanded ? "expanded" : "collapsed"));
+  const [activePanel, setActivePanel] = useState<ActivePanel>(() => readIslandPanel().panel);
   const navigate = useNavigate();
   const hoverTimer = useRef<number | null>(null);
   const pressedRef = useRef(false);
   const [widgetHeaderSlot, setWidgetHeaderSlot] = useState<HTMLSpanElement | null>(null);
+
+  useEffect(() => {
+    rememberIslandPanel(state === "expanded", activePanel);
+  }, [activePanel, state]);
 
   const activeWidget = activePanel.kind === "widget" ? getWidget(activePanel.id) : undefined;
   const isLauncher = activePanel.kind === "launcher";
