@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "feature_title": "Agent requests and durable streaming trace",
+  "spec_ref": null,
+  "plan_ref": "User-approved plan in this conversation",
+  "status": "in-progress",
+  "last_updated": "2026-10-01",
+  "current_task_id": "T-05",
+  "tasks": [
+    {"id":"T-01","title":"Diagnose provider errors and request compatibility","state":"completed","trace":{"plan_section":"2"},"files_changed":["src-tauri/src/agent/provider_error.rs","src-tauri/src/agent/provider_probe.rs"],"notes":"Live matrix confirmed DeepSeek rejects dotted tool names; both configured models accept mapped names, token and usage parameters."},
+    {"id":"T-02","title":"Unified adapters and structured tool loop","state":"completed","trace":{"plan_section":"3"},"files_changed":["src-tauri/src/agent/adapter.rs","src-tauri/src/agent/model.rs","src-tauri/src/agent/stream.rs","src-tauri/src/agent/native_trace.rs"],"notes":"Unified adapters and atomic context exchanges passed production-loop live tests with a labelled read-only fixture."},
+    {"id":"T-03","title":"Durable ordered events and frontend projection","state":"completed","trace":{"plan_section":"4"},"files_changed":["src-tauri/src/agent/storage.rs","src/agent/trace.ts","src/widgets/ai/useAgentConversation.ts","src/widgets/ai/ConversationRows.tsx"],"notes":"Durable sequence replay and frontend reducer tests pass. Native interaction verification remains pending."},
+    {"id":"T-04","title":"Regression and live validation","state":"completed","trace":{"plan_section":"5"},"files_changed":["src-tauri/src/agent/tests.rs","tests/agent-trace.test.mjs","tests/agent-trace-browser.tsx","src/components/agent/Composer.tsx",".cursor/docs/agent-trace-implementation.md"],"notes":"typecheck/build/check/diff-check pass; 32 unit and 5 integration Rust tests, 6 reducer tests pass. Both live Ark probes passed. Browser verified streaming before completion, interleaving, details, errors, sidebar/history, cancellation and draft preservation. Screenshot: E:/CodexCaches/tmp/agent-trace-verified.png."},
+    {"id":"T-05","title":"Native desktop acceptance","state":"blocked","trace":{"plan_section":"5"},"files_changed":[],"notes":"Development app runs, but native automation cannot reliably target the transparent always-on-top window: foreground PID unavailable and clicks rejected as targeting another app. Manual acceptance for real music and desktop restart is still needed; browser fixtures do not replace it."}
+  ],
+  "blockers": [{"id":"VERIFY-NATIVE","from_spec":false,"status":"open","detail":"Native input automation cannot safely target the Tauri window; manual desktop acceptance remains."}]
+}

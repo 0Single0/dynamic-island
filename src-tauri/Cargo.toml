@@ -26,8 +26,11 @@ serde_json = "1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_Security",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
@@ -40,7 +43,14 @@ keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 zeroize = { version = "1.8", features = ["alloc"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 async-trait = "0.1"
+uiautomation = { version = "0.25.1", default-features = false, features = ["control", "input"] }
+tempfile = "3"
+quick-xml = { version = "0.38", features = ["serialize"] }
+scraper = "0.24"
 
+[dev-dependencies]
+# `test` 提供 mock runtime：验证命令 `State` 注册契约（见 lib.rs 的 state_wiring 测试）。
+tauri = { version = "2", features = ["test"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

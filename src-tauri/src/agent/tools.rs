@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::permissions::RiskLevel;
+
+#[async_trait::async_trait]
+pub trait ModelToolExecutor: Sync {
+    async fn execute(&self, name: &str, arguments: Value) -> ToolExecutionResult;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +21,9 @@ pub struct ToolDefinition {
     pub supports_parallel: bool,
     pub side_effects: Vec<String>,
     pub max_output_chars: u32,
+    /// 历史工具名（旧会话/旧客户端用过）：只用于解析收到的调用，不发给模型。
+    #[serde(default)]
+    pub legacy_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,98 +61,10 @@ impl ToolExecutionResult {
     }
 }
 
-pub fn builtin_tools() -> Vec<ToolDefinition> {
-    vec![
-        tool(
-            "netease.get_current_state",
-            "读取网易云当前歌曲、歌词和播放进度",
-            RiskLevel::L0,
-            false,
-            json!({"type":"object","properties":{}}),
-            vec![],
-        ),
-        tool(
-            "netease.control",
-            "控制网易云播放、暂停、上一首或下一首",
-            RiskLevel::L1,
-            false,
-            json!({"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["play","pause","next","previous"]}}}),
-            vec!["修改播放状态"],
-        ),
-        tool(
-            "netease.seek",
-            "跳转网易云播放进度",
-            RiskLevel::L1,
-            false,
-            json!({"type":"object","required":["positionMs"],"properties":{"positionMs":{"type":"integer","minimum":0}}}),
-            vec!["修改播放进度"],
-        ),
-        tool(
-            "markdown.read",
-            "读取用户选中的 Markdown 文件",
-            RiskLevel::L0,
-            false,
-            json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
-            vec![],
-        ),
-        tool(
-            "markdown.convert_to_pdf",
-            "使用 WebView2 将 Markdown 渲染并打印为 PDF",
-            RiskLevel::L1,
-            false,
-            json!({"type":"object","required":["html","outputPath"],"properties":{"html":{"type":"string"},"outputPath":{"type":"string"},"title":{"type":"string"}}}),
-            vec!["创建 PDF 文件"],
-        ),
-        tool(
-            "markdown.open_output",
-            "打开生成的 PDF 文件",
-            RiskLevel::L1,
-            false,
-            json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
-            vec!["打开本地文件"],
-        ),
-    ]
-}
-
-fn tool(
-    name: &str,
-    description: &str,
-    risk_level: RiskLevel,
-    requires_confirmation: bool,
-    input_schema: Value,
-    side_effects: Vec<&str>,
-) -> ToolDefinition {
-    ToolDefinition {
-        name: name.into(),
-        version: "0.1.0".into(),
-        description: description.into(),
-        input_schema,
-        risk_level,
-        requires_confirmation,
-        supports_cancellation: true,
-        supports_parallel: false,
-        side_effects: side_effects.into_iter().map(str::to_owned).collect(),
-        max_output_chars: 12_000,
-    }
-}
-
+/// 只读工具目录命令：内容来自插件运行时，不包含任何启停语义。
 #[tauri::command]
-pub fn list_builtin_tools() -> Vec<ToolDefinition> {
-    builtin_tools()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn builtins_have_schema_and_risk_metadata() {
-        let tools = builtin_tools();
-        assert!(tools
-            .iter()
-            .any(|tool| tool.name == "netease.get_current_state"));
-        assert!(tools
-            .iter()
-            .all(|tool| tool.input_schema["type"] == "object"));
-        assert!(tools.iter().all(|tool| tool.max_output_chars > 0));
-    }
+pub async fn list_builtin_tools(
+    runtime: tauri::State<'_, std::sync::Arc<super::plugins::PluginRuntime>>,
+) -> Result<Vec<ToolDefinition>, String> {
+    Ok(runtime.all_tools().await)
 }

@@ -19,6 +19,24 @@ interface AgentIconProps {
   className?: string;
 }
 
+const knownIconIds: string[] = [
+  "system",
+  "files",
+  "web-search",
+  "desktop",
+  "netease",
+  "markdown",
+  "attach-file",
+  "attach-image",
+  "search",
+  "summarize",
+];
+
+/** 插件清单里的 icon 是字符串，这里收敛回受支持的图标集合，未知值退回默认图标。 */
+export function toAgentIconId(id: string): AgentIconId {
+  return knownIconIds.includes(id) ? (id as AgentIconId) : "system";
+}
+
 /**
  * Shared icon mapping for the Agent picker and settings.
  * Keep this as a component mapping instead of storing rendered nodes in plugin data,

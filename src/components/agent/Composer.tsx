@@ -22,6 +22,9 @@ export interface AgentComposerItem {
 
 export interface AgentComposerProps {
   onSubmit: (document: JSONContent) => void;
+  disabled?: boolean;
+  document?: JSONContent;
+  onDocumentChange?: (document: JSONContent) => void;
   attachments?: AgentComposerItem[];
   skills?: AgentComposerItem[];
   plugins?: AgentComposerItem[];
@@ -54,6 +57,7 @@ const defaultSkills: AgentComposerItem[] = [
 const defaultPlugins: AgentComposerItem[] = [
   { id: "files", label: "文件工具", description: "读取、编辑和生成文件", icon: <AgentIcon id="files" />, group: "插件", pickerKind: "plugin" },
   { id: "web-search", label: "网页搜索", description: "搜索并保留来源卡片", icon: <AgentIcon id="web-search" />, group: "插件", pickerKind: "plugin" },
+  { id: "desktop", label: "电脑", description: "查看并操作受控的桌面窗口", icon: <AgentIcon id="desktop" />, group: "插件", pickerKind: "plugin" },
   { id: "netease", label: "网易云音乐", description: "读取当前歌曲并控制播放", icon: <AgentIcon id="netease" />, group: "插件", pickerKind: "plugin" },
   { id: "markdown", label: "Markdown", description: "将 Markdown 转换为 PDF", icon: <AgentIcon id="markdown" />, group: "插件", pickerKind: "plugin" },
 ];
@@ -146,6 +150,9 @@ function createDirectoryMention(options: {
 
 export function Composer({
   onSubmit,
+  disabled = false,
+  document: draftDocument,
+  onDocumentChange,
   attachments = defaultAttachments,
   skills = defaultSkills,
   plugins = defaultPlugins,
@@ -159,6 +166,8 @@ export function Composer({
   const composerRef = useRef<HTMLDivElement | null>(null);
   const pickerRef = useRef<PickerState | null>(null);
   const selectedIndexRef = useRef(0);
+  const submissionRef = useRef({ disabled, onSubmit, onDocumentChange });
+  submissionRef.current = { disabled, onSubmit, onDocumentChange };
   const pickerItems = useMemo(() => [...attachments, ...plugins], [attachments, plugins]);
   const slashSkills = useMemo(() => skills.map((item) => ({ ...item, group: "技能" })), [skills]);
 
@@ -232,25 +241,36 @@ export function Composer({
   );
   const editor = useEditor({
     extensions: [StarterKit, mentionExtension],
-    content: "",
+    content: draftDocument || "",
     editorProps: {
       attributes: {
         class: "min-h-[38px] max-h-24 cursor-text overflow-y-auto whitespace-pre-wrap break-words text-[13px] leading-[1.55] outline-none select-text [scrollbar-color:rgba(255,255,255,.2)_transparent] [scrollbar-width:thin] [&_p]:m-0 [&_p.is-editor-empty:first-child::before]:pointer-events-none [&_p.is-editor-empty:first-child::before]:float-left [&_p.is-editor-empty:first-child::before]:h-0 [&_p.is-editor-empty:first-child::before]:text-white/[0.38] [&_p.is-editor-empty:first-child::before]:content-[attr(data-placeholder)]",
         "data-placeholder": placeholder,
       },
       handleKeyDown: (_view, event) => {
+        if (event.isComposing || event.keyCode === 229) return false;
         if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
+          if (submissionRef.current.disabled) return true;
           const document = editor?.getJSON();
-          if (editor?.getText().trim() && document) onSubmit(document);
+          if (editor?.getText().trim() && document) submissionRef.current.onSubmit(document);
           editor?.commands.clearContent();
           return true;
         }
         return false;
       },
     },
-    onUpdate: ({ editor: nextEditor }) => setIsEmpty(nextEditor.isEmpty),
+    onUpdate: ({ editor: nextEditor }) => {
+      setIsEmpty(nextEditor.isEmpty);
+      submissionRef.current.onDocumentChange?.(nextEditor.getJSON());
+    },
   });
+
+  useEffect(() => {
+    if (!editor || !draftDocument) return;
+    if (JSON.stringify(editor.getJSON()) !== JSON.stringify(draftDocument)) editor.commands.setContent(draftDocument, { emitUpdate: false });
+    setIsEmpty(editor.isEmpty);
+  }, [editor, draftDocument]);
 
   useEffect(() => {
     if (pickerMode !== "add") return;
@@ -324,12 +344,12 @@ export function Composer({
         type="button"
         className="absolute bottom-2 right-2 grid h-7 w-7 place-items-center rounded-lg border-0 bg-sky-300/[0.16] text-[#d7f0ff] transition hover:bg-sky-300/[0.28] disabled:cursor-default disabled:opacity-35"
         aria-label="发送消息"
-        disabled={isEmpty}
+        disabled={isEmpty || disabled}
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => {
           const document = editor?.getJSON();
-          if (editor?.getText().trim() && document) {
-            onSubmit(document);
+          if (!submissionRef.current.disabled && !editor?.view.composing && editor?.getText().trim() && document) {
+            submissionRef.current.onSubmit(document);
             editor.commands.clearContent();
           }
         }}

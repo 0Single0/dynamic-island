@@ -39,6 +39,7 @@ export function Island() {
   const navigate = useNavigate();
   const hoverTimer = useRef<number | null>(null);
   const pressedRef = useRef(false);
+  const [widgetHeaderSlot, setWidgetHeaderSlot] = useState<HTMLSpanElement | null>(null);
 
   const activeWidget = activePanel.kind === "widget" ? getWidget(activePanel.id) : undefined;
   const isLauncher = activePanel.kind === "launcher";
@@ -190,21 +191,25 @@ export function Island() {
           style={{ pointerEvents: isCollapsed ? "none" : "auto" }}
         >
           <div className="flex h-7 shrink-0 items-center justify-between">
-            <span className="text-sm font-semibold text-zinc-100">
-              {activeWidget?.name ?? (isLauncher ? "应用" : "MD 转 PDF")}
-            </span>
+            <div className="flex min-w-0 items-center gap-2">
+              <span ref={setWidgetHeaderSlot} className="contents" />
+              {isLauncher && <IconButton icon={Settings} label="打开设置中心" onClick={() => navigate("/settings")} />}
+              <span className="text-sm font-semibold text-zinc-100">
+                {activeWidget?.name ?? (isLauncher ? "应用" : "MD 转 PDF")}
+              </span>
+            </div>
             <div className="flex items-center gap-1">
-              {isLauncher && (
-                <IconButton icon={Settings} label="打开设置中心" onClick={() => navigate("/settings")} />
+              {(isLauncher || activeWidget?.id === "ai") && (
+                <IconButton icon={Settings} label={isLauncher ? "打开设置中心" : "打开模型设置"} onClick={() => navigate(isLauncher ? "/settings" : "/settings?section=ai-models")} />
               )}
               <IconButton icon={X} label="收起" onClick={collapse} />
             </div>
           </div>
-          <div className="flex-1 overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-hidden">
             {isLauncher ? (
               <ApplicationLauncher onOpen={openLauncherTarget} />
             ) : activeWidget ? (
-              <activeWidget.expanded />
+              <activeWidget.expanded headerSlot={widgetHeaderSlot} />
             ) : activePanel.kind === "tool" && activePanel.id === "markdown-pdf" ? (
               <MarkdownPdfExpanded />
             ) : null}

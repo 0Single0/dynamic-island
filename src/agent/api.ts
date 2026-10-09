@@ -17,6 +17,60 @@ export interface MessageRecord {
   createdAt: string;
 }
 
+export interface TimelineRecord {
+  id: string;
+  sessionId: string;
+  kind: "user" | "assistant" | "reasoning" | "tool" | string;
+  text?: string | null;
+  title?: string | null;
+  detail?: string | null;
+  status: "running" | "completed" | "failed" | string;
+  position: number;
+  createdAt: string;
+}
+
+export interface ProviderError {
+  category: string;
+  message: string;
+  status?: number | null;
+  protocol: string;
+  model: string;
+  endpoint: string;
+  code?: string | null;
+  param?: string | null;
+  requestId?: string | null;
+  body?: string | null;
+}
+
+export interface ExecutionEvent {
+  version: number;
+  id: string;
+  sessionId: string;
+  runId: string;
+  step?: number | null;
+  blockId?: string | null;
+  callId?: string | null;
+  parentCallId?: string | null;
+  seq: number;
+  eventType: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+export function listExecutionEvents(sessionId: string, afterSeq = 0) {
+  return tauriInvoke<ExecutionEvent[]>("agent_list_events", { sessionId, afterSeq });
+}
+
+/** 删除会话：后端级联清理该会话的消息、轨迹与事件；返回是否命中了会话。 */
+export function deleteSession(sessionId: string) {
+  return tauriInvoke<boolean>("agent_delete_session", { sessionId });
+}
+
+/** 已加载插件目录（只读）：来自插件运行时，用于 @ 选择与设置页展示。 */
+export function listBuiltinPlugins() {
+  return tauriInvoke<import("./plugins/types").PluginStatus[]>("list_builtin_plugins");
+}
+
 export interface ProviderRecord {
   id: string;
   name: string;

@@ -4,8 +4,8 @@
   "spec_ref": ".cursor/docs/desktop-agent-spec.md",
   "plan_ref": ".cursor/plan/desktop-agent-plan.md",
   "status": "in-progress",
-  "last_updated": "2026-09-29",
-  "current_task_id": "TASK-11",
+  "last_updated": "2026-10-02",
+  "current_task_id": "TASK-12",
   "tasks": [
     {
       "id": "PLAN-00-01",
@@ -416,33 +416,43 @@
         "src/agent/plugins/index.ts",
         "src/agent/plugins/types.ts"
       ],
-      "notes": "网易云和 Markdown 已接入统一内置 Tool Registry 与 agent_execute_builtin_tool：统一 ToolDefinition、JSON Schema、风险等级、输出上限和 ToolExecutionResult；网易云读取/控制/跳转和 Markdown 读取/转 PDF 复用现有模块。L1 写操作要求有效的一次性 approvalId，执行时校验工具名、参数哈希和过期时间。文件安全和模型自动工具循环留给后续 TASK-11/TASK-08 扩展。"
+      "notes": "网易云和 Markdown 已接入统一内置 Tool Registry 与 agent_execute_builtin_tool：统一 ToolDefinition、JSON Schema、风险等级、输出上限和 ToolExecutionResult；网易云读取/启动/控制/跳转已纳入模型循环，Markdown 转 PDF 已接入确认和原生保存对话框。文件安全和其他模型工具沿同一执行器继续扩展。"
     },
     {
       "id": "TASK-11",
       "title": "文件安全、Diff、备份、原子写入和撤销",
-      "state": "pending",
+      "state": "doing",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
       "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "files_changed": [
+        "src-tauri/src/agent/plugins/files.rs",
+        "src-tauri/src/agent/general_tools.rs",
+        "src-tauri/src/agent/builtin_executor.rs"
+      ],
+      "notes": "已接入用户原生选中文件读取和另存新建 UTF-8 文本；不隐式授权整盘、不覆盖已有文件。完整 Diff/备份/撤销和已有文件编辑仍待实现。"
     },
     {
       "id": "TASK-12",
       "title": "网络搜索插件和来源记录",
-      "state": "pending",
+      "state": "doing",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
       "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "files_changed": [
+        "src-tauri/src/agent/plugins/web_search.rs",
+        "src-tauri/src/agent/general_tools.rs",
+        "src/pages/Settings/components/SearchSettings.tsx",
+        "src/pages/Settings/index.tsx",
+        "src-tauri/src/lib.rs"
+      ],
+      "notes": "已实现 Bing 公开 RSS、公开 HTTPS SearXNG JSON 后端和公开网页读取；未配置时明确失败，不使用 Mock。默认保持未配置，等待用户在设置中心选择。"
     },
     {
       "id": "TASK-13",
@@ -473,15 +483,20 @@
     {
       "id": "TASK-15",
       "title": "UIA Computer Use",
-      "state": "pending",
+      "state": "doing",
       "trace": {
         "spec_ids": [],
         "plan_section": "§5 任务分解"
       },
       "started_at": null,
       "completed_at": null,
-      "files_changed": [],
-      "notes": null
+      "files_changed": [
+        "src-tauri/src/computer/mod.rs",
+        "src-tauri/src/computer/guard.rs",
+        "src-tauri/src/agent/general_tools.rs",
+        "src-tauri/Cargo.toml"
+      ],
+      "notes": "已接入短期目标 ID 的窗口枚举、控件检查、文本读取和逐次确认的 Invoke/SetValue；不开放任意脚本、键鼠兜底、浏览器/终端或管理员窗口。SendInput、截图/OCR 和浏览器 CDP 仍待后续任务。"
     },
     {
       "id": "TASK-16",

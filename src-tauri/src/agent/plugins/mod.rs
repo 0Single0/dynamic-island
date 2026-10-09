@@ -1,132 +1,71 @@
-use serde::{Deserialize, Serialize};
+//! 内置插件自动注册：宿主统一挂载，Agent 按请求解析工具。
+//!
+//! 业务能力只在各自模块实现一次；插件模块只声明清单与能力绑定。
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PluginRisk {
-    L0,
-    L1,
-    L2,
-    L3,
-}
+pub mod desktop_plugin;
+pub mod files;
+pub mod files_plugin;
+pub mod host;
+pub mod manifest;
+pub mod markdown;
+pub mod markdown_plugin;
+pub mod netease_plugin;
+pub mod registry;
+pub mod runtime;
+pub mod system;
+pub mod web_search;
+mod web_search_plugin;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginManifest {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub description: String,
-    pub builtin: bool,
-    pub enabled_by_default: bool,
-    pub risk: PluginRisk,
-    pub tools: Vec<String>,
-    pub slash_actions: Vec<String>,
-}
+use std::sync::Arc;
 
-pub fn builtin_registry() -> Vec<PluginManifest> {
-    vec![
-        manifest(
-            "system",
-            "系统",
-            "时间、窗口和应用启动",
-            PluginRisk::L0,
-            true,
-            &["system.get_time", "system.list_windows"],
-            &["/system.time"],
-        ),
-        manifest(
-            "files",
-            "文件",
-            "读取、编辑、备份和撤销文件",
-            PluginRisk::L2,
-            true,
-            &["files.search", "files.read", "files.write", "files.diff"],
-            &["/file.open", "/file.search"],
-        ),
-        manifest(
-            "web-search",
-            "网页搜索",
-            "搜索网络并保留来源",
-            PluginRisk::L1,
-            true,
-            &["web_search.search", "web_search.open_result"],
-            &["/web.search"],
-        ),
-        manifest(
-            "desktop",
-            "桌面操作",
-            "受控的 UIA 和键鼠操作",
-            PluginRisk::L3,
-            false,
-            &[
-                "computer.inspect_window",
-                "computer.invoke",
-                "computer.type_text",
-            ],
-            &["/computer.inspect"],
-        ),
-        manifest(
-            "netease",
-            "网易云音乐",
-            "读取歌曲、歌词和播放状态",
-            PluginRisk::L1,
-            true,
-            &["netease.current", "netease.control", "netease.seek"],
-            &["/music.current"],
-        ),
-        manifest(
-            "markdown",
-            "Markdown 转 PDF",
-            "把 Markdown 文件转换为 PDF",
-            PluginRisk::L1,
-            true,
-            &["markdown.read", "markdown.to_pdf"],
-            &["/markdown.pdf"],
-        ),
-    ]
-}
+use tauri::State;
 
-fn manifest(
-    id: &str,
-    name: &str,
-    description: &str,
-    risk: PluginRisk,
-    enabled: bool,
-    tools: &[&str],
-    slash_actions: &[&str],
-) -> PluginManifest {
-    PluginManifest {
-        id: id.into(),
-        name: name.into(),
-        version: "0.1.0".into(),
-        description: description.into(),
-        builtin: true,
-        enabled_by_default: enabled,
-        risk,
-        tools: tools.iter().map(|item| (*item).into()).collect(),
-        slash_actions: slash_actions.iter().map(|item| (*item).into()).collect(),
+use crate::netease::SharedNetease;
+
+pub use manifest::PluginStatus;
+pub use runtime::{PluginError, PluginRuntime};
+
+/// 启动时挂载全部内置插件；失败意味着实现缺陷而不是用户配置问题。
+pub async fn mount_builtin_plugins(
+    runtime: &PluginRuntime,
+    netease: Option<SharedNetease>,
+) -> Result<Vec<String>, PluginError> {
+    let mut mounted = Vec::new();
+    for (manifest, handlers) in [
+        (system::manifest(), system::handlers()),
+        (files_plugin::manifest(), files_plugin::handlers()),
+        (web_search_plugin::manifest(), web_search_plugin::handlers()),
+        (markdown_plugin::manifest(), markdown_plugin::handlers()),
+        (desktop_plugin::manifest(), desktop_plugin::handlers()),
+        (
+            netease_plugin::manifest(),
+            netease_plugin::handlers(netease.clone()),
+        ),
+    ] {
+        let id = manifest.id.clone();
+        // 宿主依赖（AppHandle、取消查询、UIA 目标）在调用时经 HandlerContext 注入。
+        runtime.mount(manifest, handlers).await?;
+        mounted.push(id);
     }
+    Ok(mounted)
 }
 
+/// 只读插件目录：设置中心展示的“已加载能力”，不提供启停控件。
 #[tauri::command]
-pub fn list_builtin_plugins() -> Vec<PluginManifest> {
-    builtin_registry()
+pub async fn list_builtin_plugins(
+    runtime: State<'_, Arc<PluginRuntime>>,
+) -> Result<Vec<PluginStatus>, String> {
+    Ok(runtime.statuses().await)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registry_contains_safe_defaults_and_disabled_desktop() {
-        let plugins = builtin_registry();
-        assert!(plugins.iter().any(|plugin| plugin.id == "netease"));
-        assert!(plugins.iter().any(|plugin| plugin.id == "markdown"));
-        assert!(
-            !plugins
-                .iter()
-                .find(|plugin| plugin.id == "desktop")
-                .unwrap()
-                .enabled_by_default
-        );
-    }
+/// 单个插件的工具清单，供前端展示当前请求会携带的范围。
+#[tauri::command]
+pub async fn list_plugin_tools(
+    runtime: State<'_, Arc<PluginRuntime>>,
+    plugin_id: Option<String>,
+) -> Result<Vec<super::tools::ToolDefinition>, String> {
+    Ok(match plugin_id {
+        Some(id) => runtime.tools_for(&[id]).await,
+        None => runtime.all_tools().await,
+    })
 }

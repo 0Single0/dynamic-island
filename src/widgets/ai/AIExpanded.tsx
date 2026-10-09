@@ -1,258 +1,102 @@
-import { useEffect, useMemo, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import type { JSONContent } from "@tiptap/core";
-import { Check, ChevronDown, ChevronRight, Circle, Loader2, Square, TerminalSquare } from "lucide-react";
+import { useMemo, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
+import { Bot, Loader2, Square, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { Composer, type AgentComposerItem } from "@/components/agent/Composer";
-import { AgentIcon } from "@/components/agent/AgentIcons";
-import { builtinPluginRegistry } from "@/agent/plugins";
+import { AgentIcon, toAgentIconId } from "@/components/agent/AgentIcons";
+import { useBuiltinPlugins } from "@/agent/plugins";
 import { Select } from "@/components/common/Select";
 import { cn } from "@/lib/utils";
-import {
-  documentToPlainText,
-  documentToPluginIds,
-  tauriInvoke,
-  type MessageRecord,
-  type ModelRecord,
-} from "@/agent/api";
+import { tauriInvoke } from "@/agent/api";
+import { HistorySidebar } from "./HistorySidebar";
+import { ErrorRow, MarkdownBody, ReasoningRow, ToolRow } from "./ConversationRows";
+import { useAgentConversation } from "./useAgentConversation";
+import { getDraft, setDraft, subscribeDrafts } from "@/agent/drafts";
+import type { WidgetExpandedRenderProps } from "@/widgets/types";
+import type { ConversationEntry } from "@/agent/trace";
 
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-}
-
-interface AgentStreamPayload {
-  type?: string;
-  run_id?: string;
-  delta?: string;
-  message?: string;
-  phase?: string;
-  title?: string;
-  detail?: string;
-}
-
-interface RunStep {
-  id: string;
-  kind: "thinking" | "tool" | "result";
-  title: string;
-  detail?: string;
-  status: "running" | "completed" | "failed";
-}
-
-function RunActivity({ steps, running }: { steps: RunStep[]; running: boolean }) {
-  const [openSteps, setOpenSteps] = useState<Record<string, boolean>>({});
-  if (!steps.length) return null;
-  const completed = !running && steps.every((step) => step.status === "completed");
-
-  const toggleStep = (id: string) => {
-    setOpenSteps((current) => ({ ...current, [id]: !current[id] }));
-  };
-
-  const getStepIcon = (step: RunStep) => {
-    if (step.status === "running") return Loader2;
-    if (step.status === "failed") return Circle;
-    if (step.kind === "tool") return TerminalSquare;
-    return Check;
-  };
+export function AIExpanded({ headerSlot }: WidgetExpandedRenderProps = {}) {
+  const { entries, sessions, sessionId, isLoading, models, selectedModelId, setSelectedModelId, isSending, activeRunId, viewportRef, followTailRef, loadSession, createNewSession, deleteSession, sendMessage } = useAgentConversation();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const draft = useSyncExternalStore(subscribeDrafts, () => getDraft(sessionId));
+  const toggleSidebar = <button type="button" onClick={() => setSidebarCollapsed(value => !value)} title={sidebarCollapsed ? "展开历史对话" : "折叠历史对话"} aria-label={sidebarCollapsed ? "展开历史对话" : "折叠历史对话"} aria-expanded={!sidebarCollapsed} className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-white/50 transition hover:bg-white/[0.08] hover:text-white">{sidebarCollapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}</button>;
+  const { plugins } = useBuiltinPlugins();
+  const composerPlugins = useMemo<AgentComposerItem[]>(() => plugins.map(plugin => ({
+    id: plugin.id, label: plugin.name, description: plugin.description,
+    icon: <AgentIcon id={toAgentIconId(plugin.icon)} />, group: "插件", pickerKind: "plugin",
+  })), [plugins]);
+  const runningEntry = useMemo(() => {
+    if (!isSending) return undefined;
+    return [...entries].reverse().find((entry): entry is ConversationEntry =>
+      (!activeRunId || entry.runId === activeRunId) &&
+      (entry.kind === "reasoning" || entry.kind === "tool" || entry.kind === "assistant") &&
+      ["receiving", "pending", "running"].includes(entry.status ?? "running"),
+    );
+  }, [activeRunId, entries, isSending]);
+  const runningLabel = runningEntry?.kind === "reasoning"
+    ? "正在思考..."
+    : runningEntry?.kind === "tool"
+      ? runningEntry.status === "receiving" || runningEntry.status === "pending"
+        ? `准备${runningEntry.title || "工具调用"}...`
+        : `正在执行 ${runningEntry.title || "工具"}...`
+      : runningEntry?.kind === "assistant"
+        ? "正在生成回复..."
+        : "正在处理...";
 
   return (
-    <div className="my-1 w-full max-w-[620px] text-white/[0.56]">
-      <div className="flex min-h-6 items-center gap-2 px-0 py-0.5 text-left">
-        <span className={cn(
-          "h-[7px] w-[7px] rounded-full border bg-transparent",
-          running && "border-sky-300/95 shadow-[0_0_0_3px_rgba(125,211,252,.1)]",
-          completed && "border-emerald-300/65 bg-emerald-300/70",
-          !running && !completed && "border-rose-300/75 bg-rose-300/70",
-        )} />
-        <span className="text-[10px] text-white/[0.52]">{running ? "正在处理" : completed ? "已完成" : "运行结束"}</span>
-      </div>
-      <div className="grid gap-0 pb-0.5 pl-px">
-        {steps.map((step) => {
-          const Icon = getStepIcon(step);
-          const expandable = Boolean(step.detail);
-          const expanded = Boolean(openSteps[step.id]);
-          return (
-            <div key={step.id} className="flex min-h-6 items-start gap-2 py-0.5">
-              <div className="grid w-4 shrink-0 place-items-center pt-0.5"><Icon className={`h-3.5 w-3.5 shrink-0 ${step.status === "running" ? "animate-spin text-sky-300" : step.status === "failed" ? "text-rose-300" : "text-zinc-500"}`} /></div>
-              {expandable ? (
-                <button type="button" className="inline-flex min-w-0 items-center gap-[5px] bg-transparent p-0 text-left" onClick={() => toggleStep(step.id)}>
-                  <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] leading-[1.45] text-white/[0.53] hover:text-white/[0.76]">{step.title}</span>
-                  {expanded ? <ChevronDown className="h-3 w-3 shrink-0 text-white/[0.34]" /> : <ChevronRight className="h-3 w-3 shrink-0 text-white/[0.34]" />}
-                  {expanded && <span className="max-w-[380px] overflow-hidden text-ellipsis whitespace-nowrap text-[10px] text-white/[0.35]">{step.detail}</span>}
-                </button>
-              ) : (
-                <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[11px] leading-[1.45] text-white/[0.53]">{step.title}</span>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-export function AIExpanded() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [models, setModels] = useState<ModelRecord[]>([]);
-  const [selectedModelId, setSelectedModelId] = useState("");
-  const [isSending, setIsSending] = useState(false);
-  const [activeRunId, setActiveRunId] = useState<string | null>(null);
-  const [runSteps, setRunSteps] = useState<RunStep[]>([]);
-  const composerPlugins = useMemo<AgentComposerItem[]>(
-    () => builtinPluginRegistry.map((plugin) => ({
-      id: plugin.id,
-      label: plugin.name,
-      description: plugin.description,
-      icon: <AgentIcon id={plugin.icon} />,
-      group: "插件",
-      pickerKind: "plugin",
-    })),
-    [],
-  );
-
-  useEffect(() => {
-    let active = true;
-    void Promise.all([
-      tauriInvoke<{ id: string; title: string }[]>("agent_list_sessions"),
-      tauriInvoke<ModelRecord[]>("agent_list_model_configs"),
-    ]).then(async ([sessions, modelRecords]) => {
-      const session = sessions[0] ?? await tauriInvoke<{ id: string }>("agent_create_session", { title: "桌面 Agent" });
-      if (!active) return;
-      setSessionId(session.id);
-      const enabledModels = modelRecords.filter((model) => model.enabled);
-      setModels(enabledModels);
-      setSelectedModelId(enabledModels[0]?.id ?? "");
-      const stored = await tauriInvoke<MessageRecord[]>("agent_list_messages", { sessionId: session.id });
-      if (active && stored.length) {
-        setMessages(stored
-          .filter((message) => message.role === "user" || message.role === "assistant")
-          .map((message) => ({
-            id: message.id,
-            role: message.role === "user" ? "user" : "assistant",
-            text: message.content,
-          })));
-      }
-    }).catch(() => undefined);
-    return () => { active = false; };
-  }, []);
-
-  useEffect(() => {
-    let stop: (() => void) | undefined;
-    void listen<AgentStreamPayload>("agent://event", ({ payload }) => {
-      if (!payload.run_id) return;
-      if (payload.type === "message_delta" && payload.delta) {
-        const delta = payload.delta;
-        setMessages((current) => {
-          const id = `stream-${payload.run_id}`;
-          const existing = current.find((message) => message.id === id);
-          if (existing) return current.map((message) => message.id === id ? { ...message, text: `${message.text}${delta}` } : message);
-          return [...current, { id, role: "assistant", text: delta }];
-        });
-      }
-      if (payload.type === "run_status" && payload.phase && payload.title) {
-        setRunSteps((current) => {
-          const id = `${payload.run_id}-${payload.phase}`;
-          const existing = current.find((step) => step.id === id);
-          const nextStep: RunStep = { id, kind: payload.phase === "tool" ? "tool" : "thinking", title: payload.title ?? "处理中", detail: payload.detail, status: "running" };
-          return existing ? current.map((step) => step.id === id ? { ...step, ...nextStep } : step) : [...current, nextStep];
-        });
-      }
-      if (payload.type === "run_completed") setRunSteps((current) => current.map((step) => ({ ...step, status: "completed" })));
-      if (payload.type === "run_failed" || payload.type === "run_cancelled") setRunSteps((current) => current.map((step) => ({ ...step, status: "failed" })));
-    }).then((unlisten) => { stop = unlisten; }).catch(() => undefined);
-    return () => { stop?.(); };
-  }, []);
-
-  const sendMessage = async (document: JSONContent) => {
-    const text = documentToPlainText(document);
-    if (!text || isSending) return;
-    const runId = `run-${Date.now()}`;
-    const selectedModel = models.find((model) => model.id === selectedModelId);
-    const pluginIds = documentToPluginIds(document);
-    const selectedPluginNames = pluginIds.map((id) => builtinPluginRegistry.find((plugin) => plugin.id === id)?.name).filter(Boolean) as string[];
-    setMessages((current) => [...current, { id: `user-${Date.now()}`, role: "user", text }]);
-    setIsSending(true);
-    setActiveRunId(runId);
-    setRunSteps([
-      { id: `${runId}-thinking`, kind: "thinking", title: "分析请求", detail: "整理上下文并准备执行", status: "running" },
-      ...(selectedPluginNames.length ? [{ id: `${runId}-tool`, kind: "tool" as const, title: "已选择插件", detail: selectedPluginNames.join("、"), status: "running" as const }] : []),
-    ]);
-    try {
-      let currentSessionId = sessionId;
-      if (!currentSessionId) {
-        const session = await tauriInvoke<{ id: string }>("agent_create_session", { title: text.slice(0, 32) });
-        currentSessionId = session.id;
-        setSessionId(currentSessionId);
-      }
-      const result = await tauriInvoke<{ message: MessageRecord }>("agent_send_message", {
-        input: {
-          sessionId: currentSessionId,
-          content: text,
-          pluginIds,
-          providerId: selectedModel?.providerId,
-          modelId: selectedModel?.id,
-          runId,
-        },
-      });
-      setMessages((current) => [
-        ...current.filter((message) => message.id !== `stream-${runId}`),
-        { id: result.message.id, role: "assistant", text: result.message.content },
-      ]);
-      setRunSteps((current) => current.map((step) => ({ ...step, status: "completed" })));
-    } catch {
-      setMessages((current) => [
-        ...current.filter((message) => message.id !== `stream-${runId}`),
-        { id: `assistant-${Date.now()}`, role: "assistant", text: "当前未连接到可用模型，请先在设置中心配置供应商和模型。" },
-      ]);
-      setRunSteps((current) => current.map((step) => ({ ...step, status: "failed", detail: step.id.endsWith("thinking") ? "运行失败，请检查模型或供应商配置" : step.detail })));
-    } finally {
-      setIsSending(false);
-      setActiveRunId(null);
-    }
-  };
-
-  return (
-    <div className="flex h-full min-h-0 flex-col gap-2" onClick={(event) => event.stopPropagation()}>
-      <div className="min-h-0 flex-1 overflow-y-auto px-1 py-1 [scrollbar-color:rgba(255,255,255,.2)_transparent] [scrollbar-width:thin]">
-        <div className="space-y-3">
-      {messages.map((message) => (
-            <div key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
-              <div className={`max-w-[88%] text-xs leading-5 ${message.role === "user" ? "rounded-xl bg-sky-400/14 px-3 py-2 text-sky-50" : "whitespace-pre-wrap px-1 py-1 text-zinc-300"}`}>{message.text}</div>
-            </div>
-          ))}
-          <RunActivity steps={runSteps} running={isSending} />
-        </div>
-      </div>
-      <Composer
-        plugins={composerPlugins}
-        placeholder="输入消息，使用 @ 选择插件"
-        footer={(
-          <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-zinc-500">
-            <span className="shrink-0">模型</span>
-            <div className="relative min-w-0">
-              <Select
-                value={selectedModelId}
-                options={models.map((model) => ({ value: model.id, label: model.displayName || model.modelId, description: model.modelId }))}
-                onChange={setSelectedModelId}
-                placeholder="未配置模型"
-                className="max-w-[220px] py-1 text-[10px]"
-                aria-label="选择模型"
-              />
-            </div>
-            {activeRunId && (
-              <button
-                type="button"
-                onClick={() => void tauriInvoke("agent_cancel_run", { runId: activeRunId })}
-                className="ml-2 flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-zinc-400 hover:bg-white/[0.07] hover:text-zinc-200"
-              >
-                <Square className="h-3 w-3 fill-current" /> 停止
-              </button>
-            )}
-          </div>
-        )}
-        onSubmit={(document) => { void sendMessage(document); }}
+    <div className="flex h-full min-h-0 overflow-hidden rounded-lg" onClick={(event) => event.stopPropagation()}>
+      <HistorySidebar
+        sessions={sessions}
+        activeSessionId={sessionId}
+        collapsed={sidebarCollapsed}
+        disabled={isSending}
+        onSelect={(session) => { if (!isSending) void loadSession(session); }}
+        onCreate={() => { if (!isSending) void createNewSession(); }}
+        onDelete={(session) => { if (!isSending) void deleteSession(session); }}
       />
+      <section className="flex min-w-0 flex-1 flex-col bg-white/[0.015]">
+        <header className="flex h-10 shrink-0 items-center justify-between border-b border-white/[0.07] px-4">
+          <div className="flex min-w-0 items-center gap-2">
+            {headerSlot ? createPortal(toggleSidebar, headerSlot) : toggleSidebar}
+            <div className="min-w-0 truncate text-[11px] font-medium text-white/[0.72]">{sessions.find((session) => session.id === sessionId)?.title || "新对话"}</div>
+          </div>
+        </header>
+        {isSending && <div className="flex h-8 shrink-0 items-center gap-1.5 border-b border-white/[0.06] px-5 text-[10px] text-white/[0.48]" role="status" aria-live="polite"><Loader2 className="h-3 w-3 animate-spin text-sky-200/70" /><span>{runningLabel}</span></div>}
+        <div ref={viewportRef} onScroll={(event) => {
+          const node = event.currentTarget;
+          followTailRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 90;
+        }} className="min-h-0 flex-1 overflow-y-auto px-5 py-4 [scrollbar-color:rgba(255,255,255,.2)_transparent] [scrollbar-width:thin]">
+          <div className="mx-auto flex w-full max-w-[720px] flex-col gap-1">
+            {entries.length === 0 ? (
+              <div className="flex min-h-[180px] flex-col items-center justify-center text-center">
+                <div className="grid h-9 w-9 place-items-center rounded-xl bg-white/[0.07] text-sky-200/[0.85]"><Bot className="h-5 w-5" /></div>
+                <p className="mt-3 text-xs text-white/[0.5]">直接说你想完成什么</p>
+              </div>
+            ) : entries.map((entry) => {
+              if (entry.kind === "reasoning") return <ReasoningRow key={entry.id} entry={entry} />;
+              if (entry.kind === "tool") return <ToolRow key={entry.id} entry={entry} />;
+              if (entry.kind === "error") return <ErrorRow key={entry.id} entry={entry} />;
+              return <div key={entry.id} className={cn("flex py-1.5", entry.kind === "user" ? "justify-end" : "justify-start")}><div className={cn("max-w-[92%] min-w-0", entry.kind === "user" ? "whitespace-pre-wrap break-words rounded-xl bg-white/[0.09] px-3 py-2 text-[12px] leading-[1.75] text-white/[0.88]" : "px-1")}>{entry.kind === "user" ? entry.text : <MarkdownBody text={entry.text} />}</div></div>;
+            })}
+          </div>
+        </div>
+        <div className="shrink-0 px-4 pb-3 pt-1">
+          <Composer
+            key={sessionId}
+            document={draft}
+            onDocumentChange={document => setDraft(sessionId, document)}
+            disabled={isSending || isLoading}
+            plugins={composerPlugins}
+            placeholder="输入消息，使用 @ 选择插件"
+            footer={(
+              <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-zinc-500">
+                <Select value={selectedModelId} variant="text" menuTitle="选择模型" options={models.map((model) => ({ value: model.id, label: model.displayName || model.modelId }))} onChange={setSelectedModelId} placeholder="未配置模型" className="max-w-[220px] py-1 text-[11px]" aria-label="选择模型" />
+                {activeRunId && <button type="button" onClick={() => void tauriInvoke("agent_cancel_run", { runId: activeRunId })} className="ml-2 flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-zinc-400 hover:bg-white/[0.07] hover:text-zinc-200"><Square className="h-3 w-3 fill-current" /> 停止</button>}
+              </div>
+            )}
+            onSubmit={(document) => { void sendMessage(document); }}
+          />
+        </div>
+      </section>
     </div>
   );
 }

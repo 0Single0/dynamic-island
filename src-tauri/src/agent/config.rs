@@ -170,6 +170,20 @@ pub fn agent_save_model_config(
     Ok(model)
 }
 
+#[tauri::command]
+pub fn agent_delete_model_config(
+    state: State<'_, super::AgentState>,
+    model_id: String,
+) -> Result<(), String> {
+    if model_id.trim().is_empty() {
+        return Err("模型不存在".into());
+    }
+    state
+        .store
+        .delete_model(model_id.trim())
+        .map_err(|error| error.to_string())
+}
+
 fn now() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

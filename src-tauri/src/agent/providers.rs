@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderProtocol {
@@ -20,60 +18,6 @@ impl ProviderProtocol {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CanonicalMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CanonicalRequest {
-    pub model: String,
-    pub system: Option<String>,
-    pub messages: Vec<CanonicalMessage>,
-    pub max_tokens: u32,
-    pub stream: bool,
-}
-
-pub fn build_request(protocol: ProviderProtocol, request: &CanonicalRequest) -> Value {
-    match protocol {
-        ProviderProtocol::ChatCompletions => {
-            let mut messages = Vec::new();
-            if let Some(system) = request.system.as_ref() {
-                messages.push(json!({"role": "system", "content": system}));
-            }
-            messages.extend(
-                request
-                    .messages
-                    .iter()
-                    .map(|message| json!({"role": message.role, "content": message.content})),
-            );
-            json!({
-                "model": request.model,
-                "messages": messages,
-                "max_completion_tokens": request.max_tokens,
-                "stream": request.stream,
-                "stream_options": {"include_usage": true}
-            })
-        }
-        ProviderProtocol::Responses => json!({
-            "model": request.model,
-            "instructions": request.system,
-            "input": request.messages.iter().map(|message| json!({"role": message.role, "content": [{"type": "input_text", "text": message.content}]})).collect::<Vec<_>>(),
-            "max_output_tokens": request.max_tokens,
-            "stream": request.stream
-        }),
-        ProviderProtocol::AnthropicMessages => json!({
-            "model": request.model,
-            "system": request.system,
-            "messages": request.messages.iter().filter(|message| message.role != "system").map(|message| json!({"role": message.role, "content": message.content})).collect::<Vec<_>>(),
-            "max_tokens": request.max_tokens,
-            "stream": request.stream
-        }),
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
     pub event: Option<String>,
@@ -113,57 +57,45 @@ pub fn parse_sse(input: &str) -> Vec<SseEvent> {
     events
 }
 
-pub fn extract_text(protocol: ProviderProtocol, data: &Value) -> Option<String> {
-    match protocol {
-        ProviderProtocol::ChatCompletions => data["choices"][0]["delta"]["content"]
-            .as_str()
-            .map(str::to_owned),
-        ProviderProtocol::Responses => data["delta"].as_str().map(str::to_owned),
-        ProviderProtocol::AnthropicMessages => data["delta"]["text"].as_str().map(str::to_owned),
-    }
+/// Extract one complete SSE frame from arbitrary network byte chunks. Waiting
+/// for the delimiter before UTF-8 decoding preserves split Chinese characters.
+pub fn pop_sse_frame(buffer: &mut Vec<u8>) -> Result<Option<String>, String> {
+    let boundary = (0..buffer.len()).find_map(|index| {
+        if buffer[index..].starts_with(b"\r\n\r\n") {
+            Some((index, 4))
+        } else if buffer[index..].starts_with(b"\n\n") {
+            Some((index, 2))
+        } else {
+            None
+        }
+    });
+    let Some((index, width)) = boundary else {
+        return Ok(None);
+    };
+    let bytes = buffer.drain(..index + width).collect();
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "模型流包含无效 UTF-8".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn builds_three_protocol_shapes() {
-        let request = CanonicalRequest {
-            model: "demo".into(),
-            system: Some("You are helpful".into()),
-            messages: vec![CanonicalMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            max_tokens: 128,
-            stream: true,
-        };
-        assert_eq!(
-            build_request(ProviderProtocol::ChatCompletions, &request)["max_completion_tokens"],
-            128
-        );
-        assert_eq!(
-            build_request(ProviderProtocol::Responses, &request)["input"][0]["content"][0]["type"],
-            "input_text"
-        );
-        assert_eq!(
-            build_request(ProviderProtocol::AnthropicMessages, &request)["max_tokens"],
-            128
-        );
+    fn sse_preserves_multiline_data_and_comments() {
+        let events = parse_sse(": heartbeat\r\nevent: chunk\r\ndata: one\r\ndata: two\r\n\r\n");
+        assert_eq!(events[0].data, "one\ntwo");
+        assert_eq!(events[0].event.as_deref(), Some("chunk"));
     }
-
     #[test]
-    fn parses_multiline_sse_and_protocol_text() {
-        let events =
-            parse_sse("event: message\ndata: {\"delta\":{\"text\":\"a\"}}\n\ndata: [DONE]\n\n");
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            extract_text(
-                ProviderProtocol::AnthropicMessages,
-                &serde_json::from_str(&events[0].data).unwrap()
-            ),
-            Some("a".into())
-        );
+    fn sse_frame_reassembles_split_utf8_and_crlf_delimiter() {
+        let frame = "data: {\"text\":\"你好\"}\r\n\r\n".as_bytes();
+        let split = frame.iter().position(|b| *b >= 0x80).unwrap() + 1;
+        let mut buffer = frame[..split].to_vec();
+        assert!(pop_sse_frame(&mut buffer).unwrap().is_none());
+        buffer.extend_from_slice(&frame[split..]);
+        let parsed = pop_sse_frame(&mut buffer).unwrap().unwrap();
+        assert_eq!(parse_sse(&parsed)[0].data, "{\"text\":\"你好\"}");
+        assert!(buffer.is_empty());
     }
 }

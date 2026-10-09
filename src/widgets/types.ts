@@ -7,6 +7,7 @@ import type { ComponentType } from "react";
  * expanded —— 岛体展开后渲染的完整面板。
  */
 export type WidgetSize = "sm" | "md" | "lg" | "xl";
+export interface WidgetExpandedRenderProps { headerSlot?: HTMLElement | null }
 
 export interface WidgetCompactRenderProps {
   /** 是否处于悬浮预览状态（岛体微展时） */
@@ -24,7 +25,7 @@ export interface WidgetDefinition {
   /** 收起态胶囊内的紧凑展示 */
   compact: ComponentType<WidgetCompactRenderProps>;
   /** 展开态完整面板 */
-  expanded: ComponentType;
+  expanded: ComponentType<WidgetExpandedRenderProps>;
   /** 展开面板的期望宽度档位，影响岛体展开尺寸 */
   size?: WidgetSize;
   /** 是否默认启用；后续接入设置页后由配置驱动 */

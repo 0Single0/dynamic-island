@@ -155,6 +155,20 @@ async fn establish(shared: SharedNetease, outcome: StartOutcome) {
 
 // —— Tauri 命令 ——
 
+/// Agent startup returns an outcome; polling must not hold the tool loop open.
+pub async fn start_for_agent(shared: SharedNetease) -> StartOutcome {
+    let outcome = launcher::start_or_connect().await;
+    if matches!(outcome, StartOutcome::Ready) {
+        let needs_connection = shared.session.lock().await.is_none();
+        if needs_connection {
+            tauri::async_runtime::spawn(establish(shared, StartOutcome::Ready));
+        }
+    } else {
+        shared.runtime.publish(outcome_state(&outcome));
+    }
+    outcome
+}
+
 #[tauri::command]
 pub async fn netease_start_or_connect(
     shared: tauri::State<'_, SharedNetease>,
@@ -274,6 +288,31 @@ pub async fn netease_cover_data_url(raw_url: String) -> Result<String, String> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+/// 播放控制与进度跳转的逐次确认；由插件能力处理器调用，CDP 细节不外泄。
+pub async fn confirm_action(
+    shared: &SharedNetease,
+    description: &str,
+    ctx: &crate::agent::plugins::registry::HandlerContext,
+) -> Result<(), crate::agent::tools::ToolExecutionResult> {
+    crate::agent::native_dialog::confirm(
+        &shared.app,
+        format!("{description}\n\n允许本次操作吗？"),
+        ctx.cancelled.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        if error.error_code.as_deref() == Some("USER_DENIED") {
+            crate::agent::tools::ToolExecutionResult::failure(
+                "USER_DENIED",
+                "用户未确认网易云操作，未执行操作。",
+                false,
+            )
+        } else {
+            error
+        }
+    })
 }
 
 /// 注册命令。
