@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import IslandPage from "@/pages/Island";
 import SettingsPage from "@/pages/Settings";
+import ToolPage from "@/pages/Tool";
 
 export interface AppRoute {
   path: string;
@@ -14,4 +15,6 @@ export interface AppRoute {
 export const routes: AppRoute[] = [
   { path: "/", Component: IslandPage },
   { path: "/settings", Component: SettingsPage },
+  // 工具窗口页：同一个工具组件，给它整个窗口
+  { path: "/tool/:id", Component: ToolPage },
 ];

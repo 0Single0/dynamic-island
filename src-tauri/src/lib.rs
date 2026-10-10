@@ -2,6 +2,7 @@
 mod agent;
 mod commands;
 mod computer;
+mod gateway;
 mod markdown;
 mod netease;
 
@@ -98,6 +99,10 @@ pub fn run() {
             // 网易云同步共享状态
             netease::setup(app.handle())?;
 
+            // 反代号池网关：进程内嵌 HTTP 服务（外部客户端走 /v1/*，面板走 Tauri command）。
+            // 端口被占用时自行回退，不阻塞岛启动。
+            gateway::setup(app.handle())?;
+
             // 内置插件自动注册：业务模块只注册能力，插件清单只描述暴露关系。
             // 这里没有用户启停开关；`@` 只影响单次请求的工具范围。
             let netease = app
@@ -159,6 +164,33 @@ pub fn run() {
             netease::netease_disconnect,
             netease::netease_current_state,
             netease::netease_cover_data_url,
+            // 反代号池：面板命令（HTTP 面在 gateway::server，不经这里）
+            gateway::commands::gateway_status,
+            gateway::commands::gateway_set_runtime,
+            gateway::commands::gateway_refresh_matrix,
+            gateway::commands::gateway_list_channels,
+            gateway::commands::gateway_update_channel,
+            gateway::commands::gateway_list_accounts,
+            gateway::commands::gateway_login_start,
+            gateway::commands::gateway_login_poll,
+            gateway::commands::gateway_set_account_enabled,
+            gateway::commands::gateway_delete_account,
+            gateway::commands::gateway_refresh_account,
+            gateway::commands::gateway_checkin_account,
+            gateway::commands::gateway_fetch_quota,
+            gateway::commands::gateway_reset_account_state,
+            gateway::commands::gateway_add_account,
+            gateway::commands::gateway_upsert_account_config,
+            gateway::commands::gateway_list_routes,
+            gateway::commands::gateway_set_overrides,
+            gateway::commands::gateway_clear_affinity,
+            gateway::commands::gateway_recent_decisions,
+            gateway::commands::gateway_recent_usage,
+            gateway::commands::gateway_usage_series,
+            gateway::commands::gateway_usage_summary,
+            gateway::commands::gateway_paths,
+            gateway::commands::gateway_scheduler_snapshot,
+            gateway::commands::open_tool_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -23,12 +23,14 @@ tauri-plugin-opener = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_Security",
+    # 网关的 402 停放需要 GetLocalTime 算「次日本地 04:00」。
+    "Win32_System_SystemInformation",
 ] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -37,8 +39,8 @@ futures-util = "0.3"
 anyhow = "1"
 base64 = "0.22"
 tauri-plugin-dialog = "2"
-webview2-com = "0.38"
-windows-core = "0.61"
+webview2-com = "0.39"
+windows-core = "0.62"
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 zeroize = { version = "1.8", features = ["alloc"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -47,10 +49,16 @@ uiautomation = { version = "0.25.1", default-features = false, features = ["cont
 tempfile = "3"
 quick-xml = { version = "0.38", features = ["serialize"] }
 scraper = "0.24"
+uuid = { version = "1.27.0", features = ["v4"] }
+axum = "0.8.9"
+sha2 = "0.10"
+aes-gcm = "0.11.1"
+getrandom = "0.4.3"
 
 [dev-dependencies]
 # `test` 提供 mock runtime：验证命令 `State` 注册契约（见 lib.rs 的 state_wiring 测试）。
 tauri = { version = "2", features = ["test"] }
+tower = { version = "0.5.3", features = ["util"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

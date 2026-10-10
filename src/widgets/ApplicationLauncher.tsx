@@ -1,10 +1,10 @@
 import { widgetRegistry } from "@/widgets";
 import type { WidgetDefinition } from "./types";
-import { MarkdownIcon } from "./MarkdownIcon";
+import { toolRegistry, type ToolIcon, type ToolId } from "./tools";
 
 export type LauncherTarget =
   | { kind: "widget"; id: string }
-  | { kind: "tool"; id: "markdown-pdf" };
+  | { kind: "tool"; id: ToolId };
 
 export function ApplicationLauncher({
   onOpen,
@@ -14,7 +14,7 @@ export function ApplicationLauncher({
   const cards: Array<{
     id: string;
     name: string;
-    icon: WidgetDefinition["icon"] | typeof MarkdownIcon;
+    icon: WidgetDefinition["icon"] | ToolIcon;
     target: LauncherTarget;
     accent: string;
   }> = [
@@ -25,13 +25,13 @@ export function ApplicationLauncher({
       target: { kind: "widget" as const, id: widget.id },
       accent: widget.id === "music" ? "text-emerald-300" : widget.id === "ai" ? "text-sky-200" : "text-sky-300",
     })),
-    {
-      id: "markdown-pdf",
-      name: "MD 转 PDF",
-      icon: MarkdownIcon,
-      target: { kind: "tool", id: "markdown-pdf" },
-      accent: "text-violet-300",
-    },
+    ...toolRegistry.map((tool) => ({
+      id: tool.id,
+      name: tool.name,
+      icon: tool.icon,
+      target: { kind: "tool" as const, id: tool.id },
+      accent: tool.id === "proxy-pool" ? "text-amber-300" : "text-violet-300",
+    })),
   ];
 
   return (

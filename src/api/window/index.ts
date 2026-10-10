@@ -1,4 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+/** 当前窗口标签（`main` / `tool-<id>`）。浏览器预览下返回空串。 */
+export function currentWindowLabel(): string {
+  try {
+    return getCurrentWindow().label;
+  } catch {
+    return "";
+  }
+}
 
 /**
  * 窗口控制 API：与 src-tauri/src/commands/window.rs 一一对应。
@@ -33,6 +43,19 @@ export function setWindowInteractive(interactive: boolean) {
 /** 退出应用 */
 export function quitApp() {
   return invoke<void>("quit_app").catch(() => {});
+}
+
+/**
+ * 打开（或聚焦）工具窗口。传工具 id，窗口标签固定为 `tool-<id>`，
+ * 所以重复点击只会聚焦已开的窗口，不会开一堆。
+ */
+export function openToolWindow(
+  toolId: string,
+  title: string,
+  width: number,
+  height: number,
+) {
+  return invoke<void>("open_tool_window", { toolId, title, width, height });
 }
 
 /** 隐藏窗口到托盘 */

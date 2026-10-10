@@ -4,7 +4,9 @@ import { Settings, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { widgetRegistry, getWidget } from "@/widgets";
 import { ApplicationLauncher, type LauncherTarget } from "@/widgets/ApplicationLauncher";
-import { MarkdownPdfExpanded } from "@/widgets/MarkdownPdfExpanded";
+import { getTool } from "@/widgets/tools";
+import { openToolWindow } from "@/api/window";
+import { toast } from "@/utils/toast";
 import {
   COMPACT_SIZE,
   EXPANDED_SIZE,
@@ -43,12 +45,13 @@ export function Island() {
   }, [activePanel, state]);
 
   const activeWidget = activePanel.kind === "widget" ? getWidget(activePanel.id) : undefined;
+  const activeTool = activePanel.kind === "tool" ? getTool(activePanel.id) : undefined;
   const isLauncher = activePanel.kind === "launcher";
   const expandedSize = isLauncher
     ? LAUNCHER_SIZE
-    : activePanel.kind === "tool"
-      ? EXPANDED_SIZE.lg
-    : EXPANDED_SIZE[activeWidget?.size ?? "md"];
+    : activeTool
+      ? EXPANDED_SIZE[activeTool.size]
+      : EXPANDED_SIZE[activeWidget?.size ?? "md"];
 
   // 启动：置顶 + 固定窗口位置（只调一次）
   const initWindow = useCallback(() => {
@@ -94,9 +97,21 @@ export function Island() {
   const openLauncherTarget = (target: LauncherTarget) => {
     if (target.kind === "widget") {
       expand({ kind: "widget", id: target.id });
-    } else {
-      expand({ kind: "tool", id: target.id });
+      return;
     }
+    // 声明了独立窗口的工具：开窗 + 收起岛体，不在 780×480 的胶囊里挤。
+    const tool = getTool(target.id);
+    if (tool?.window) {
+      collapse();
+      void openToolWindow(tool.id, tool.window.title, tool.window.width, tool.window.height).catch(
+        (reason) =>
+          toast.error(
+            reason instanceof Error ? reason.message : "工具窗口打不开（改了 Rust 侧需要重新编译）",
+          ),
+      );
+      return;
+    }
+    expand({ kind: "tool", id: target.id });
   };
 
   // 动画帧上把岛体视口逻辑坐标上报给 Rust（换算物理像素后驱动点击穿透）。
@@ -191,12 +206,16 @@ export function Island() {
           className="absolute inset-0 flex flex-col p-4"
           style={{ pointerEvents: isCollapsed ? "none" : "auto" }}
         >
-          <div className="flex h-7 shrink-0 items-center justify-between">
+          {/* 这一条同时是窗口拖拽手柄：岛体是无边框窗口，没有系统标题栏可拖。 */}
+          <div
+            data-tauri-drag-region
+            className="flex h-7 shrink-0 cursor-grab items-center justify-between active:cursor-grabbing"
+          >
             <div className="flex min-w-0 items-center gap-2">
               <span ref={setWidgetHeaderSlot} className="contents" />
               {isLauncher && <IconButton icon={Settings} label="打开设置中心" onClick={() => navigate("/settings")} />}
               <span className="text-sm font-semibold text-zinc-100">
-                {activeWidget?.name ?? (isLauncher ? "应用" : "MD 转 PDF")}
+                {activeWidget?.name ?? activeTool?.name ?? (isLauncher ? "应用" : "")}
               </span>
             </div>
             <div className="flex items-center gap-1">
@@ -211,8 +230,8 @@ export function Island() {
               <ApplicationLauncher onOpen={openLauncherTarget} />
             ) : activeWidget ? (
               <activeWidget.expanded headerSlot={widgetHeaderSlot} />
-            ) : activePanel.kind === "tool" && activePanel.id === "markdown-pdf" ? (
-              <MarkdownPdfExpanded />
+            ) : activeTool ? (
+              <activeTool.component />
             ) : null}
           </div>
         </motion.div>
