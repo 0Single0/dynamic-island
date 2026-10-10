@@ -353,6 +353,25 @@ mod tests {
             "要能读懂上游给的恢复时刻（北京时间）"
         );
 
+        // 真机实测报文（中文！我们发 Accept-Language: zh-CN，上游就把文案本地化了）：
+        // 认死英文 "reset at" 会解析不出恢复时刻，退化成 10m/20m 退避 —— 而真实恢复在第二天。
+        let real_cn = refine(
+            429,
+            r#"{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-10-11 14:46:40 UTC+8 重置，您也可以切换其他模型继续使用。","requestId":"a9d6fe19_000001"}"#,
+            "deepseek-v4.1-flash",
+        );
+        assert_eq!(
+            real_cn.reset_at_ms,
+            Some(1_791_701_200_000),
+            "中文文案里的恢复时刻也要能解析出来（2026-10-11 14:46:40 +08:00）"
+        );
+        assert!(
+            real_cn.message.contains("后恢复"),
+            "提示要带上剩余时间：{}",
+            real_cn.message
+        );
+        assert!(!real_cn.message.contains("未知"), "{}", real_cn.message);
+
         // 没有 reset 时刻也要保持模型级（池子给模型退避，账号照用）。
         let bare = refine(429, r#"{"code":6004,"msg":"usage exceeds frequency limit"}"#, "glm-5.3");
         assert_eq!(bare.reset_at_ms, None);

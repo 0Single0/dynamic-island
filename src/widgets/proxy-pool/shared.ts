@@ -83,9 +83,18 @@ export function formatTokens(value: number): string {
   return String(value);
 }
 
+/**
+ * 时长。冷却可能长到"第二天才恢复"（模型额度按天重置），
+ * 所以超过一小时要进位到小时/天 —— 别让人看到「1260m」这种东西。
+ */
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
-  return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${Math.round(hours)}h`;
+  return `${Math.round(hours / 24)}d`;
 }
 
 export function formatClock(ts: number): string {
