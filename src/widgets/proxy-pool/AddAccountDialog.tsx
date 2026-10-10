@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 
 import * as api from "@/api/gateway";
+import { errorText } from "./shared";
 import type { GatewayChannel, GatewayLoginTicket } from "@/api/gateway";
 import { toast } from "@/utils/toast";
 
@@ -57,11 +58,11 @@ export function AddAccountDialog({
           }
         } catch (reason) {
           stopPolling();
-          setHint(reason instanceof Error ? reason.message : "轮询失败");
+          setHint(errorText(reason, "轮询失败"));
         }
       }, 2500);
     } catch (reason) {
-      setHint(reason instanceof Error ? reason.message : "无法开始登录");
+      setHint(errorText(reason, "无法开始登录"));
     }
   };
 

@@ -183,7 +183,7 @@ fn stream_response(
                 Ok(frame) => session.adapter.parse_event(&frame),
                 Err(error) => {
                     status = "upstream_aborted";
-                    error_detail.get_or_insert_with(|| error.message.clone());
+                    error_detail.get_or_insert_with(|| error.describe());
                     vec![CanonicalEvent::Error {
                         message: error.message,
                     }]
@@ -270,7 +270,7 @@ async fn collect_completion(
     }
 
     let completion = encode::openai::fold(&events, &id, &meta.model, created);
-    let error_detail = completion.as_ref().err().map(|error| error.message.clone());
+    let error_detail = completion.as_ref().err().map(|error| error.describe());
     let (status, usage, reported, produced) = match &completion {
         Ok(value) => {
             let text = value["choices"][0]["message"]["content"]

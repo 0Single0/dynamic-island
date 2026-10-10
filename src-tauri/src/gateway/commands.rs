@@ -330,7 +330,8 @@ pub async fn gateway_probe_account(
             std::time::Duration::from_secs(45),
         )
         .await
-        .map_err(message)?;
+        // 探针失败要把**上游原文**带回去：只报"失败"等于让人猜。
+        .map_err(|error| error.describe())?;
     Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
 }
 

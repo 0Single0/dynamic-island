@@ -6,7 +6,7 @@ import type { GatewayAccount } from "@/api/gateway";
 import { IconButton } from "@/components/common/IconButton";
 import { toast } from "@/utils/toast";
 
-import { expiryText, formatClock, formatDuration, type ModelChip } from "./shared";
+import { errorText, expiryText, formatClock, formatDuration, type ModelChip } from "./shared";
 
 /** 表格列名（顺序即渲染顺序）。 */
 type AccountColumn =
@@ -117,7 +117,7 @@ export function accountCell(
       toast.success(done);
       context.onChange();
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : failure);
+      toast.error(errorText(reason, failure));
     }
   };
 
@@ -224,7 +224,12 @@ export function accountCell(
         </span>
       );
     }
-    case "models":
+    case "models": {
+      // 折叠着也要能看出"有模型在限流"：数字后面点一个小黄点。
+      const limitedModels = new Set((account.model_limits ?? []).map((limit) => limit.model));
+      const limitedCount = context.support.filter(
+        (model) => limitedModels.has(model.upstream) || limitedModels.has(model.id),
+      ).length;
       return (
         <button
           type="button"
@@ -233,13 +238,21 @@ export function accountCell(
             context.onToggleModels();
           }}
           className="w-full truncate text-center text-[10px] text-zinc-400 hover:text-zinc-100"
-          title="展开可用模型（点模型名即复制）"
+          title={
+            limitedCount > 0
+              ? `展开可用模型（${limitedCount} 个正被上游限流，展开看是哪个）· 点模型名即复制`
+              : "展开可用模型（点模型名即复制）"
+          }
         >
           {context.support.length === 0
             ? "暂无模型"
             : `${context.support.length} 个模型 ${context.expanded ? "▴" : "▾"}`}
+          {limitedCount > 0 && (
+            <span className="ml-0.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-400 align-middle" />
+          )}
         </button>
       );
+    }
     case "tasks":
       return (
         <button

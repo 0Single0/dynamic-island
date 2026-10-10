@@ -133,7 +133,7 @@ pub(super) fn record_rejection(
             total_ms: 0,
             effort: None,
             upstream_model: None,
-            error_detail: Some(format!("[{:?}] {}", error.kind, error.message)),
+            error_detail: Some(format!("[{:?}] {}", error.kind, error.describe())),
         });
 }
 

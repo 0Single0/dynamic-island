@@ -434,7 +434,7 @@ impl PoolAccount {
 }
 
 /// 把毫秒差说成人话：38s / 6m / 2h。
-fn humanize(delta_ms: u64) -> String {
+pub fn humanize(delta_ms: u64) -> String {
     let seconds = delta_ms / 1000;
     if seconds < 60 {
         return format!("{seconds} 秒");

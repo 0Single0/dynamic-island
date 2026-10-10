@@ -7,6 +7,8 @@ import { IconButton } from "@/components/common/IconButton";
 import { Select } from "@/components/common/Select";
 import { toast } from "@/utils/toast";
 import {
+  errorText,
+  formatDuration,
   formatTokens,
   useChannelModels,
   useTaskRunState,
@@ -114,7 +116,13 @@ export function ProxyPoolExpanded() {
  * 模型卡片：点一下复制模型名；下面两行是**这个模型怎么用**——
  * 倍率、上下文/输出上限、能力徽标（图片/工具/思考）、思考档位与默认档。
  */
-function ModelCard({ model }: { model: ModelChip }) {
+/**
+ * 模型卡。`limit` 来自该**账号**的模型级限流（上游按模型限额时只停这个模型）——
+ * 标在卡片上，一眼能看出"不是号废了，是这个模型在等"。
+ */
+function ModelCard({ model, limit }: { model: ModelChip; limit?: { until_ms: number } }) {
+  const limited = limit !== undefined && limit.until_ms > Date.now();
+  const limitedFor = limited ? formatDuration(limit.until_ms - Date.now()) : "";
   const badges = [
     model.capabilities.vision ? "图片" : null,
     model.capabilities.tool_calls ? "工具" : null,
@@ -124,20 +132,31 @@ function ModelCard({ model }: { model: ModelChip }) {
   return (
     <button
       type="button"
-      title="点击复制模型名"
+      title={
+        limited
+          ? `被上游限流，${limitedFor} 后恢复（同账号其他模型不受影响）· 点击复制模型名`
+          : "点击复制模型名"
+      }
       onClick={(event) => {
         event.stopPropagation();
         void navigator.clipboard?.writeText(model.id);
         toast.success(`已复制 ${model.id}`);
       }}
-      className="flex flex-col gap-1 rounded-lg border border-white/10 bg-white/[0.03] px-2 py-1.5 text-left transition-colors hover:border-sky-400/40 hover:bg-sky-400/10"
+      className={`flex flex-col gap-1 rounded-lg border px-2 py-1.5 text-left transition-colors hover:border-sky-400/40 hover:bg-sky-400/10 ${
+        limited ? "border-amber-400/35 bg-amber-400/[0.06]" : "border-white/10 bg-white/[0.03]"
+      }`}
     >
       <span className="flex items-center gap-1.5">
-        <span className="truncate font-mono text-[10px] text-zinc-100">{model.id}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-zinc-100">
+          {model.id}
+        </span>
+        {limited && (
+          <span className="shrink-0 rounded bg-amber-400/20 px-1 text-[9px] text-amber-100">
+            限流 {limitedFor}
+          </span>
+        )}
         <span
-          className={`ml-auto shrink-0 text-[9px] ${
-            model.free ? "text-emerald-300" : "text-zinc-500"
-          }`}
+          className={`shrink-0 text-[9px] ${model.free ? "text-emerald-300" : "text-zinc-500"}`}
         >
           {model.free ? "免费" : (model.credits ?? "—")}
         </span>
@@ -201,7 +220,7 @@ function AccountProbe({ channelId, uid }: { channelId: string; uid: string }) {
     try {
       setOutcome(await api.probeAccount(channelId, uid, model || undefined));
     } catch (reason) {
-      setFailure(reason instanceof Error ? reason.message : "探针失败");
+      setFailure(errorText(reason, "探针失败"));
     } finally {
       setRunning(false);
     }
@@ -241,7 +260,8 @@ function AccountProbe({ channelId, uid }: { channelId: string; uid: string }) {
       </div>
 
       {failure && (
-        <div className="mt-1 rounded-md border border-rose-400/25 bg-rose-400/8 px-2 py-1 text-[10px] text-rose-100">
+        // 上游原文可能带换行/JSON：保留排版，能直接看清上游说了什么。
+        <div className="mt-1 whitespace-pre-wrap break-all rounded-md border border-rose-400/25 bg-rose-400/8 px-2 py-1 font-mono text-[10px] leading-relaxed text-rose-100">
           {failure}
         </div>
       )}
@@ -365,6 +385,10 @@ function AccountsView({
           </div>
           {accounts.map((account) => {
             const support = models[account.channel_id] ?? [];
+            // 模型级限流的 key 是 upstream 名；退一步也用 id 兜一下（两者常常相同）。
+            const limitsByModel = new Map(
+              (account.model_limits ?? []).map((limit) => [limit.model, limit]),
+            );
             return (
               <div
                 key={`${account.channel_id}/${account.uid}`}
@@ -401,7 +425,11 @@ function AccountsView({
                     ) : (
                       <div className="grid grid-cols-[repeat(auto-fill,minmax(230px,1fr))] gap-1.5">
                         {support.map((model) => (
-                          <ModelCard key={model.id} model={model} />
+                          <ModelCard
+                            key={model.id}
+                            model={model}
+                            limit={limitsByModel.get(model.upstream) ?? limitsByModel.get(model.id)}
+                          />
                         ))}
                       </div>
                     )}
@@ -452,7 +480,7 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
     } catch (reason) {
       setTasks(null);
       writeTaskRun(key, {
-        error: reason instanceof Error ? reason.message : "读取任务失败",
+        error: errorText(reason, "读取任务失败"),
       });
     }
   }, [channelId, key]);
@@ -472,7 +500,7 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
       }
       writeTaskRun(key, { running: true, results: [], summary: null, error: null });
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : "启动失败";
+      const message = errorText(reason, "启动失败");
       writeTaskRun(key, { error: message });
       toast.error(message);
     }
@@ -526,7 +554,7 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
       void load();
       void api.fetchQuota(channelId, uid).catch(() => null);
     } catch (reason) {
-      toast.error(reason instanceof Error ? reason.message : "领取失败");
+      toast.error(errorText(reason, "领取失败"));
     } finally {
       setClaiming(null);
     }

@@ -4,6 +4,8 @@ import type { GatewayTaskRunResult } from "@/api/gateway";
 
 export interface ModelChip {
   id: string;
+  /** 上游真实模型名。模型级限流按它记，面板标"限流"也要按它对上。 */
+  upstream: string;
   credits: string | null;
   free: boolean;
   context_length: number | null;
@@ -31,6 +33,7 @@ export function useChannelModels() {
           if (!list.some((model) => model.id === entry.model)) {
             list.push({
               id: entry.model,
+              upstream: route.upstream_model,
               credits: route.credits,
               free: route.free,
               context_length: route.context,
@@ -59,6 +62,19 @@ export function useChannelModels() {
   }, [load]);
 
   return map;
+}
+
+/**
+ * 取错误的可读文本。
+ *
+ * **Tauri 命令失败时拒绝的是一个字符串**（`Err(String)`），不是 `Error` 实例 ——
+ * 所以 `reason instanceof Error ? reason.message : "失败"` 这种写法永远走兜底，
+ * 把后端带回来的上游原文丢掉（探针一直只显示"探针失败"就是这个原因）。
+ */
+export function errorText(reason: unknown, fallback: string): string {
+  if (typeof reason === "string" && reason.trim() !== "") return reason;
+  if (reason instanceof Error && reason.message.trim() !== "") return reason.message;
+  return fallback;
 }
 
 export function formatTokens(value: number): string {

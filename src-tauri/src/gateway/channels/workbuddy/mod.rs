@@ -220,6 +220,11 @@ impl ChannelAdapter for WorkbuddyChannel {
 /// `upstream_model` 只用来描述**范围**：这个渠道的限额是按模型的，
 /// 6004 要落到 [`ErrorScope::AccountModel`]，不能拉黑整个账号。
 pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
+    let refined = refine_kind(status, body, upstream_model);
+    refined.with_upstream(openai_compat::raw(body))
+}
+
+fn refine_kind(status: u16, body: &str, upstream_model: &str) -> GatewayError {
     match known_code(body) {
         Some(12403) => GatewayError::invalid_request(
             "上游拒绝了当前客户端标识（UA）：检查渠道的出站身份配置",
@@ -235,14 +240,29 @@ pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
         // 正文会给 "your usage will reset at <时间>"）。必须落到该模型：
         // 同账号的其他模型照常能跑 —— 早先写成 Account，等于一个模型限额把整个账号拉黑。
         // 拿不到 reset 时刻也算模型级（池子会给它一个模型退避），不能因此停整个账号。
-        Some(6004) => GatewayError::new(
-            ErrorKind::RateLimited,
-            ErrorScope::AccountModel(upstream_model.to_string()),
-            429,
-            "该模型被上游限流（同账号其他模型不受影响）",
-            true,
-        )
-        .with_reset_at(openai_compat::parse_rate_limit_reset(body)),
+        Some(6004) => {
+            let reset_at = openai_compat::parse_rate_limit_reset(body);
+            // 恢复时刻写进提示里：客户端/面板要能用它决定"等还是换模型"。
+            let when = match reset_at {
+                Some(until) => {
+                    let remaining = until.saturating_sub(crate::gateway::timeutil::now_ms());
+                    format!(
+                        "，预计 {} 后恢复",
+                        crate::gateway::core::pool::humanize(remaining)
+                    )
+                }
+                // 上游没给时刻：如实说"我们自己按模型退避"，别让人以为是上游承诺。
+                None => "，恢复时刻未知（上游未给出，按模型退避重试）".to_string(),
+            };
+            GatewayError::new(
+                ErrorKind::RateLimited,
+                ErrorScope::AccountModel(upstream_model.to_string()),
+                429,
+                format!("该模型被上游限流{when}（同账号其他模型不受影响）"),
+                true,
+            )
+            .with_reset_at(reset_at)
+        }
         _ => openai_compat::classify_openai_error(status, body),
     }
 }
@@ -341,6 +361,27 @@ mod tests {
         // 裸 429（没有 6004）= 账号级软限流，仍按账号退避（与参考实现一致）。
         let soft = refine(429, "too many requests", "glm-5.3");
         assert_eq!(soft.scope, ErrorScope::Account);
+    }
+
+    /// 分类后的错误必须**留着上游原文**：面板/请求日志/探针要能看到上游到底说了什么。
+    /// （只留一句人话提示，等于出事时把线索丢掉。）
+    #[test]
+    fn classified_errors_keep_the_upstream_body() {
+        let body = r#"{"code":6004,"msg":"usage exceeds frequency limit, your usage will reset at 1970-01-02 00:00:00 UTC+0"}"#;
+        let error = refine(429, body, "deepseek-v4.1-flash");
+        assert!(
+            error.upstream.as_deref().is_some_and(|raw| raw.contains("6004")),
+            "原文要留着"
+        );
+        let described = error.describe();
+        assert!(described.contains("上游返回"), "{described}");
+        assert!(described.contains("reset at"), "{described}");
+        // 能算出恢复时刻时，提示里要写清楚（客户端据此决定等还是换模型）。
+        assert!(error.message.contains("后恢复"), "{}", error.message);
+
+        // 通用分类路径同样保留原文。
+        let generic = refine(429, "slow down please", "glm-5.3");
+        assert_eq!(generic.upstream.as_deref(), Some("slow down please"));
     }
 
     #[test]

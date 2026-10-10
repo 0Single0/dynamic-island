@@ -10,6 +10,24 @@ use crate::gateway::timeutil::civil_to_epoch_ms;
 
 /// 状态码 → 统一语义。调用方（调度器）在拿到结果后会把带 reset 的 429 收窄到模型级冷却。
 pub fn classify_openai_error(status: u16, body: &str) -> GatewayError {
+    // 分类结果带上上游原文：面板的请求日志、探针、错误详情全靠它。
+    classify_status(status, body).with_upstream(raw(body))
+}
+
+/// 上游原文（保留换行，截断到 600 字符）——给"上游返回了什么"用。
+pub fn raw(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.len() <= 600 {
+        return trimmed.to_string();
+    }
+    let mut cut = 600;
+    while cut > 0 && !trimmed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &trimmed[..cut])
+}
+
+fn classify_status(status: u16, body: &str) -> GatewayError {
     match status {
         400 | 413 | 422 => GatewayError::invalid_request(short(body, "上游拒绝了请求参数")),
         401 => GatewayError::new(

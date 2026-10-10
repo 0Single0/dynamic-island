@@ -72,6 +72,9 @@ pub struct GatewayError {
     pub retryable: bool,
     /// 上游给出的恢复时刻（纪元毫秒），只有 429 一类会带。
     pub reset_at_ms: Option<u64>,
+    /// 上游原文（截断）。**必须留着**：出问题时人要看的就是"上游到底说了什么"，
+    /// 只给一句人话提示（"该模型被上游限流"）等于把线索丢掉。
+    pub upstream: Option<String>,
 }
 
 impl GatewayError {
@@ -89,6 +92,24 @@ impl GatewayError {
             message: message.into(),
             retryable,
             reset_at_ms: None,
+            upstream: None,
+        }
+    }
+
+    /// 附上上游原文（已截断）。空白正文不记，免得出现"上游返回：  "这种噪音。
+    pub fn with_upstream(mut self, upstream: impl Into<String>) -> Self {
+        let text = upstream.into();
+        if !text.trim().is_empty() {
+            self.upstream = Some(text);
+        }
+        self
+    }
+
+    /// 给人看的完整描述：人话提示 + 上游原文（面板、请求日志、探针都用它）。
+    pub fn describe(&self) -> String {
+        match &self.upstream {
+            Some(raw) => format!("{}；上游返回：{}", self.message, raw),
+            None => self.message.clone(),
         }
     }
 
