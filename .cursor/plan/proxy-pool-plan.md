@@ -31,7 +31,7 @@
 | 第二渠道（qoder） | ⬜ | 等 qoder 的接入资料；扩展机制与配置已就绪（写适配器 + registry + 配置，核心零改动） |
 | 硬化（压测 / 故障演练 / 面板在真机上的视觉验收） | ⬜ | — |
 
-当前验证：`cargo test --lib` 205 通过（gateway 157 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+当前验证：`cargo test --lib` 208 通过（gateway 150 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
 
 **探针的组织方式（2026-10-10）**：真实账号探针集中在 `gateway/channels/workbuddy/tasks.rs` 底部的 `mod probe`，共用一份 `Fixture`（从应用自己的库里读 wb-cn 账号）—— 早先 6 个探针各抄一份装配样板，光样板就 300 行，把文件顶到 1000 行上限以上。探针**刻意不写断言**：它们的用途是观察上游真实字段（accept_status 取值、claim 幂等返回），断言写死了反而会掩盖上游变化。铁律不变：**枚举值/字段名一律先探针看真的，再写进代码** —— `accept_status` 与 `already_claimed` 都是这么定的。
 
@@ -234,16 +234,24 @@ routes = matrix.routes(public_model)                     // 别名解析 → 候
 | ErrorKind | Scope | 动作 |
 |---|---|---|
 | `AuthExpired`(401) | Account | 冷却 60s（池内仅 1 个可用账号时 3s），换号；**不触发刷新** |
-| `RateLimited` 带 reset | AccountModel(model) | 只冷该模型到 reset 时刻，同账号其他模型照用 |
+| `RateLimited` 模型级 + reset | AccountModel(model) | 只冷该模型到 reset 时刻，同账号其他模型照用 |
+| `RateLimited` 模型级无 reset | AccountModel(model) | 只冷该模型：`600s·2^(n-1)` ≤ 7200s（**按模型各自的 streak**），账号不连坐 |
 | `RateLimited` 无 reset | Account | 软限流：`600s·2^(n-1)` ≤ 7200s，解绑亲和并换号 |
+| `RateLimited` 账号级带 reset | Account | 停整个账号到那个时刻（上游没说哪个模型时的保守处理） |
 | `QuotaExhausted`(402) | Account | 停放到次日本地 04:00 |
 | `ContentPolicy`(403) | Request | **不换账号**；提示词降级后原号重试一次 |
 | `Upstream5xx` | Account | 连续 3 次 → 熔断 `1800s·2^(n-3)` ≤ 21600s |
 | `Network` | Account | 短睡指数退避重试（300ms 起），计入降级窗口（连续 5 次 → 600s 窗口） |
 | `InvalidRequest`(400/413/422) | Request | 不重试、不改账号状态、直接透传 |
-| 任一次成功 | — | 清空模型冷却、软限流计数、失败计数、熔断与降级窗口 |
+| 任一次成功 | — | 清空**该模型**的冷却与 streak、软限流计数、失败计数、熔断与降级窗口 |
 
 尝试次数 `max(2, 该模型候选可用账号数) + 1`；全池失败按最后一次错误映射（OpenAI：`{"error":{...}}`；Anthropic：`{"type":"error",...}` 且 400/422→invalid_request_error、401→authentication_error、403→permission_error、429→rate_limit_error、503/529→overloaded_error）。
+
+**限流粒度是渠道自己的事（2026-10-10 实现）**：`classify_error(status, body, upstream_model)` 会把**实际发出去的 upstream 模型名**交给渠道，由渠道决定落到哪个 `ErrorScope`；核心调度器不认识任何具体渠道。workbuddy 的落地：
+
+- **6004 = 模型级限额**（参考实现原文 "usage exceeds frequency limit"）。正文会给 `your usage will reset at 2026-09-19 18:29:03 UTC+8`，我们解析成时刻 → 只停这个模型到那一刻；解析不出来也保持模型级（按模型退避），**绝不因为一个模型限额把整个账号拉黑**。裸 429（没有 6004）仍按参考实现当账号级软限流处理。
+- **模型级冷却的 key 必须用 upstream 名**：写的时候（`narrow_scope`）和读的时候（`router::pick` / 亲和检查 / `on_success`）都用 `route.upstream_model`。早先写用对外名、读用 upstream 名 —— 结果是"明明记了冷却，调度器却查不到"，账号继续被选中、继续吃 429（这类 bug 不会报错，只会表现成"限流好像没用"）。
+- 面板会把它显示出来：账号仍算可用（`is_ready("")`），但状态列的 `?` 与"限流等待"列会给出**模型级**限流（"模型 1" + 悬停看到是哪个模型、还有多久），避免把"某个模型限额"误判成"号废了"。
 
 ### 6.5 并发与生命周期（Rust 特有）
 

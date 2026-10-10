@@ -147,7 +147,9 @@ export function accountCell(
           <span className={account.ready ? "text-emerald-300" : "text-amber-300"}>
             {account.ready ? "可用" : account.enabled ? "受限" : "停用"}
           </span>
-          {!account.ready && (
+          {/* 可用也要给 ?：账号能被调度，但可能"某个模型在限流"——
+              那是最容易被误判成"号废了"的情形，必须能一眼看到原因。 */}
+          {(!account.ready || account.blocked_reasons.length > 0) && (
             <span
               title={
                 account.blocked_reasons.length > 0
@@ -188,21 +190,40 @@ export function accountCell(
           {account.inflight}/{account.max_inflight}
         </span>
       );
-    case "cooldown":
+    case "cooldown": {
+      // 账号级冷却优先；没有账号冷却但有**模型级**限流时如实显示 ——
+      // 上游按模型限额是常态（workbuddy 6004），账号本身还能跑其他模型。
+      const accountCooldown = account.cooldown_until_ms - Date.now();
+      if (accountCooldown > 0) {
+        return (
+          <span className="text-[10px] text-zinc-400" title="被上游拒绝后进入冷却，到点自动恢复">
+            {formatDuration(accountCooldown)}
+          </span>
+        );
+      }
+      const limits = account.model_limits ?? [];
+      if (limits.length === 0) {
+        return (
+          <span className="text-[10px] text-zinc-400" title="没有冷却">
+            —
+          </span>
+        );
+      }
+      const detail = limits
+        .map(
+          (limit) =>
+            `${limit.model}：${formatDuration(Math.max(0, limit.until_ms - Date.now()))} 后恢复`,
+        )
+        .join("\n");
       return (
         <span
-          className="text-[10px] text-zinc-400"
-          title={
-            account.cooldown_until_ms > Date.now()
-              ? "被上游拒绝后进入冷却，到点自动恢复"
-              : "没有冷却"
-          }
+          className="text-[10px] text-sky-300/90"
+          title={`上游按模型限额（账号仍可用，其他模型不受影响）\n${detail}`}
         >
-          {account.cooldown_until_ms > Date.now()
-            ? formatDuration(account.cooldown_until_ms - Date.now())
-            : "—"}
+          模型 {limits.length}
         </span>
       );
+    }
     case "models":
       return (
         <button

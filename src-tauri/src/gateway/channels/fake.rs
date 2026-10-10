@@ -158,7 +158,7 @@ impl ChannelAdapter for FakeChannel {
         }
     }
 
-    fn classify_error(&self, status: u16, body: &str) -> GatewayError {
+    fn classify_error(&self, status: u16, body: &str, _upstream_model: &str) -> GatewayError {
         openai_compat::classify_openai_error(status, body)
     }
 
@@ -200,7 +200,11 @@ impl ChannelAdapter for FakeChannel {
         let remaining = self.remaining_failures.load(Ordering::SeqCst);
         if remaining > 0 {
             self.remaining_failures.store(remaining - 1, Ordering::SeqCst);
-            return Err(self.classify_error(self.fail_status, "fake injected failure"));
+            return Err(self.classify_error(
+                self.fail_status,
+                "fake injected failure",
+                &request.model,
+            ));
         }
         let frames: Vec<Result<String, GatewayError>> =
             self.frames(request).into_iter().map(Ok).collect();

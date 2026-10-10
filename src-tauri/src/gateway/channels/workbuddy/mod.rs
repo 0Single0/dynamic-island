@@ -107,8 +107,8 @@ impl ChannelAdapter for WorkbuddyChannel {
         openai_compat::parse_openai_chunk(frame)
     }
 
-    fn classify_error(&self, status: u16, body: &str) -> GatewayError {
-        refine(status, body)
+    fn classify_error(&self, status: u16, body: &str, upstream_model: &str) -> GatewayError {
+        refine(status, body, upstream_model)
     }
 
     async fn list_models(
@@ -216,7 +216,10 @@ impl ChannelAdapter for WorkbuddyChannel {
 /// 上游错误语义：先在正文里找已知数字码，找不到就按状态码兜底。
 ///
 /// 数字码比状态码精确得多 —— 例如 12403 是「UA 不被接受」，按状态码只会看到 400。
-pub fn refine(status: u16, body: &str) -> GatewayError {
+///
+/// `upstream_model` 只用来描述**范围**：这个渠道的限额是按模型的，
+/// 6004 要落到 [`ErrorScope::AccountModel`]，不能拉黑整个账号。
+pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
     match known_code(body) {
         Some(12403) => GatewayError::invalid_request(
             "上游拒绝了当前客户端标识（UA）：检查渠道的出站身份配置",
@@ -228,11 +231,15 @@ pub fn refine(status: u16, body: &str) -> GatewayError {
         Some(11148) => {
             GatewayError::invalid_request("工具调用序列断裂（本地自愈未覆盖），建议重开会话")
         }
+        // 6004 = **模型级**限额（参考实现的原话："usage exceeds frequency limit"，
+        // 正文会给 "your usage will reset at <时间>"）。必须落到该模型：
+        // 同账号的其他模型照常能跑 —— 早先写成 Account，等于一个模型限额把整个账号拉黑。
+        // 拿不到 reset 时刻也算模型级（池子会给它一个模型退避），不能因此停整个账号。
         Some(6004) => GatewayError::new(
             ErrorKind::RateLimited,
-            ErrorScope::Account,
+            ErrorScope::AccountModel(upstream_model.to_string()),
             429,
-            "该模型被上游限流",
+            "该模型被上游限流（同账号其他模型不受影响）",
             true,
         )
         .with_reset_at(openai_compat::parse_rate_limit_reset(body)),
@@ -290,28 +297,55 @@ mod tests {
 
     #[test]
     fn numeric_codes_are_translated_more_precisely_than_status_codes() {
-        let ua = refine(400, r#"{"code":12403,"msg":"unknown user agent"}"#);
+        let ua = refine(400, r#"{"code":12403,"msg":"unknown user agent"}"#, "m");
         assert!(ua.message.contains("客户端标识"), "{}", ua.message);
         assert!(!ua.retryable, "配置问题重试没用");
 
-        let tools = refine(400, "code 11148 tool call sequence broken");
+        let tools = refine(400, "code 11148 tool call sequence broken", "m");
         assert!(tools.message.contains("工具调用序列断裂"), "{}", tools.message);
 
-        let image = refine(400, "{\"code\":11135}");
+        let image = refine(400, "{\"code\":11135}", "m");
         assert!(image.message.contains("图片数据非法"), "{}", image.message);
 
-        // 6004 是模型级限流，带 reset 时刻。
+        // 6004 是模型级限流，带 reset 时刻 —— 范围必须落到那个模型。
         let limited = refine(
             429,
             "code 6004 busy, your usage will reset at 1970-01-02 00:00:00 UTC+0",
+            "deepseek-v4.1-flash",
         );
         assert_eq!(limited.kind, ErrorKind::RateLimited);
         assert_eq!(limited.reset_at_ms, Some(86_400_000));
+        assert_eq!(
+            limited.scope,
+            ErrorScope::AccountModel("deepseek-v4.1-flash".into()),
+            "6004 只停这一个模型，不是整个账号"
+        );
+
+        // 参考实现里 6004 的真实措辞：恢复时刻用 "your usage will reset at ... UTC+8"。
+        let real = refine(
+            429,
+            r#"{"code":6004,"msg":"your usage exceeds frequency limit, your usage will reset at 2026-09-19 18:29:03 UTC+8"}"#,
+            "deepseek-v4.1-flash",
+        );
+        assert_eq!(
+            real.reset_at_ms,
+            Some(1_789_813_743_000),
+            "要能读懂上游给的恢复时刻（北京时间）"
+        );
+
+        // 没有 reset 时刻也要保持模型级（池子给模型退避，账号照用）。
+        let bare = refine(429, r#"{"code":6004,"msg":"usage exceeds frequency limit"}"#, "glm-5.3");
+        assert_eq!(bare.reset_at_ms, None);
+        assert_eq!(bare.scope, ErrorScope::AccountModel("glm-5.3".into()));
+
+        // 裸 429（没有 6004）= 账号级软限流，仍按账号退避（与参考实现一致）。
+        let soft = refine(429, "too many requests", "glm-5.3");
+        assert_eq!(soft.scope, ErrorScope::Account);
     }
 
     #[test]
     fn unknown_body_falls_back_to_status_semantics() {
-        let error = refine(401, "unauthorized");
+        let error = refine(401, "unauthorized", "m");
         assert_eq!(error.kind, ErrorKind::AuthExpired);
         assert!(error.retryable);
     }

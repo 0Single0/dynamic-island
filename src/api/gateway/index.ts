@@ -44,6 +44,8 @@ export interface GatewayAccount {
   cooldown_until_ms: number;
   /** 不可用原因（冷却 / 熔断 / 额度停放 / 没凭据 / 停用），供状态旁的 tooltip。 */
   blocked_reasons: string[];
+  /** 模型级限流：账号可用，但这几个模型在等到期（上游按模型限额）。 */
+  model_limits: Array<{ model: string; until_ms: number }>;
   inflight: number;
   max_inflight: number;
   priority: number;

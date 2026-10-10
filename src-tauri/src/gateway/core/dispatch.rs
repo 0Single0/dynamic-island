@@ -161,7 +161,6 @@ pub async fn open_chat_session(
                 let Some(picked) = router::pick(
                     &candidates,
                     &tried,
-                    &request.model,
                     hint.as_ref(),
                     &scoring,
                     session_seed.wrapping_add(attempts as u64),
@@ -215,7 +214,10 @@ pub async fn open_chat_session(
 
         match try_open(state, &candidate, request).await {
             Ok((adapter, frames)) => {
-                candidate.account.on_success(&request.model);
+                // 成功要按 upstream 名清冷却：模型级冷却的 key 就是这个。
+                candidate
+                    .account
+                    .on_success(&candidate.route.upstream_model);
                 let key = affinity_key.clone().or_else(|| keys.first().cloned());
                 let affinity_key = match (state.affinity.enabled(), key) {
                     (true, Some(key)) => {
@@ -271,7 +273,8 @@ pub async fn open_chat_session(
                 });
             }
             Err(error) => {
-                let error = narrow_scope(error, &request.model);
+                // 收窄范围时也用 upstream 名 —— 池子里的模型冷却就是按它记的。
+                let error = narrow_scope(error, &candidate.route.upstream_model);
                 candidate.account.apply_error(&error, &policy, now_ms());
                 eprintln!(
                     "[gateway] trace={trace_id} fail account={} kind={:?} retryable={} {}",
@@ -369,6 +372,10 @@ async fn try_open(
 
 /// 带 reset 时刻的 429 上游语义是「只限制这个模型」，把 scope 收窄到模型级，
 /// 避免因为一个模型限流把整个账号（含其他模型）拉黑。
+/// 通用收窄规则：带恢复时刻的账号级 429 视为"只限这个模型"（该上游家族的形态）。
+///
+/// 渠道知道得更准的（例如 workbuddy 的 6004）会在 `classify_error` 里直接给出
+/// [`ErrorScope::AccountModel`]，不依赖这条兜底规则。
 fn narrow_scope(mut error: GatewayError, model: &str) -> GatewayError {
     if error.reset_at_ms.is_some() && matches!(error.scope, ErrorScope::Account) {
         error.scope = ErrorScope::AccountModel(model.to_string());

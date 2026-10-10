@@ -185,7 +185,14 @@ pub trait ChannelAdapter: Send + Sync {
     fn parse_event(&self, frame: &str) -> Vec<CanonicalEvent>;
 
     /// 把上游状态码/错误码翻译成统一语义。调度器只认 [`GatewayError::kind`] 与 `scope`。
-    fn classify_error(&self, status: u16, body: &str) -> GatewayError;
+    ///
+    /// `upstream_model` 是这次实际发出去的模型名 —— 调度器在构建报文前已经把
+    /// [`CanonicalRequest::model`] 改写成了路由的 upstream 名，所以这里拿到的是真名。
+    ///
+    /// 为什么要传模型名：**限流粒度是渠道自己的事**。workbuddy 的 6004 只限一个模型
+    /// （同账号其他模型照用），这个语义只有该渠道知道，所以由它在分类时落到
+    /// [`ErrorScope::AccountModel`]；核心调度器不认识任何具体渠道。
+    fn classify_error(&self, status: u16, body: &str, upstream_model: &str) -> GatewayError;
 
     /// 拉模型目录。`Ok(None)` 表示"拉取失败，请回落快照"，**不是**"这个渠道没有模型"。
     async fn list_models(
@@ -207,8 +214,9 @@ pub trait ChannelAdapter: Send + Sync {
             Err(transport::UpstreamFailure { status: 0, body }) => {
                 Err(GatewayError::network(body))
             }
+            // 这里的 request.model 已被调度器改写为路由的 upstream 模型名。
             Err(transport::UpstreamFailure { status, body }) => {
-                Err(self.classify_error(status, &body))
+                Err(self.classify_error(status, &body, &request.model))
             }
         }
     }
