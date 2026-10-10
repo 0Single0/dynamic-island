@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import * as api from "@/api/gateway";
 import type { GatewayChannel, GatewayStatus, GatewayUsageRow } from "@/api/gateway";
 import { toast } from "@/utils/toast";
@@ -10,7 +10,11 @@ export { UsageView } from "./usage";
 /**
  * 请求日志：一条请求一行（时间/模型/强度/账号/模式/结果/耗时/首字/速度/各类 token/积分）。
  *
- * 失败的行左侧泛红，并带一个 `?`：点开就是**上游返回的原文** —— 排查时最想知道的就是这个。
+ * 列定义只有**这一份**（表头与数据行共用）：以前是两处各自硬编码，
+ * 改一处忘另一处就会整表错位 —— 已经错过一次了。
+ * 行容器 w-max + 横向滚动：列宽按内容撑开，看不全就左右滚，不压缩截断。
+ *
+ * 失败的行左侧泛红，并带一个 `?`：点开就是**上游返回的原文**。
  */
 export function RequestLogView() {
   const [rows, setRows] = useState<GatewayUsageRow[]>([]);
@@ -42,31 +46,126 @@ export function RequestLogView() {
     );
   }
 
-  const columns: Array<[string, string]> = [
-    ["w-14", "时间"],
-    ["min-w-0 flex-[1.4]", "模型"],
-    ["w-10", "强度"],
-    ["min-w-0 flex-[0.8]", "账号"],
-    ["w-10", "模式"],
-    ["w-14", "结果"],
-    ["w-14", "耗时"],
-    ["w-14", "首字"],
-    ["w-14", "速度"],
-    ["w-14", "输入"],
-    ["w-12", "输出"],
-    ["w-10", "思考"],
-    ["w-12", "缓存"],
-    ["w-16", "总 token"],
-    ["w-10", "积分"],
-    ["w-6", "?"],
+  /** 唯一的列定义：宽度类 + 表头。行渲染按同一顺序取 cell。 */
+  const columns: Array<{ key: string; width: string; label: string }> = [
+    { key: "ts", width: "w-16", label: "时间" },
+    { key: "model", width: "w-40", label: "模型" },
+    { key: "effort", width: "w-12", label: "强度" },
+    { key: "account", width: "w-24", label: "账号" },
+    { key: "stream", width: "w-12", label: "模式" },
+    { key: "status", width: "w-16", label: "结果" },
+    { key: "total_ms", width: "w-16", label: "耗时" },
+    { key: "ttft", width: "w-16", label: "首字" },
+    { key: "speed", width: "w-14", label: "速度" },
+    { key: "prompt", width: "w-16", label: "输入" },
+    { key: "completion", width: "w-14", label: "输出" },
+    { key: "reasoning", width: "w-12", label: "思考" },
+    { key: "cache", width: "w-12", label: "缓存" },
+    { key: "total", width: "w-16", label: "总 token" },
+    { key: "credit", width: "w-12", label: "积分" },
+    { key: "detail", width: "w-8", label: "?" },
   ];
 
+  /** 单元格渲染：key 对齐列定义，样式统一（等宽数字用 font-mono）。 */
+  const cell = (row: GatewayUsageRow, key: string): ReactNode => {
+    const failed = row.status !== "completed" || row.error_detail !== null;
+    const mono = "font-mono";
+    switch (key) {
+      case "ts":
+        return <span className={`${mono} text-zinc-500`}>{formatClock(row.ts)}</span>;
+      case "model":
+        return (
+          <span className="text-zinc-200" title={row.upstream_model}>
+            {row.model}
+          </span>
+        );
+      case "effort":
+        return <span className="text-zinc-500">{row.effort ?? "-"}</span>;
+      case "account":
+        return (
+          <span className="text-zinc-400" title={row.account_uid}>
+            {row.account_uid.slice(0, 8)}
+          </span>
+        );
+      case "stream":
+        return <span className="text-zinc-500">{row.stream ? "流式" : "非流"}</span>;
+      case "status":
+        return (
+          <span className={failed ? "text-rose-300" : "text-emerald-300"}>
+            {failed ? statusLabel(row.status) : "完成"}
+          </span>
+        );
+      case "total_ms":
+        return <span className={mono}>{row.total_ms} ms</span>;
+      case "ttft":
+        return (
+          <span className={mono}>{row.ttft_ms === null ? "-" : `${row.ttft_ms} ms`}</span>
+        );
+      case "speed":
+        return (
+          <span className={mono}>
+            {row.tokens_per_second > 0 ? `${row.tokens_per_second}/s` : "-"}
+          </span>
+        );
+      case "prompt":
+        return <span className={mono}>{formatTokens(row.prompt_tokens)}</span>;
+      case "completion":
+        return <span className={mono}>{formatTokens(row.completion_tokens)}</span>;
+      case "reasoning":
+        return (
+          <span className="text-zinc-500">
+            {row.reasoning_tokens > 0 ? formatTokens(row.reasoning_tokens) : "-"}
+          </span>
+        );
+      case "cache":
+        return (
+          <span className="text-zinc-500">
+            {row.total_tokens > 0
+              ? `${Math.round((row.cached_tokens / row.total_tokens) * 100)}%`
+              : "-"}
+          </span>
+        );
+      case "total":
+        return <span className={`font-medium ${mono}`}>{formatTokens(row.total_tokens)}</span>;
+      case "credit":
+        return (
+          <span
+            title={
+              row.credit !== null
+                ? `上游积分：${row.credit}`
+                : row.estimated
+                  ? "上游没给 usage：这一行的 token 是本地估算，积分不可用"
+                  : "上游这次没返回积分"
+            }
+          >
+            {row.credit === null ? (row.estimated ? "估" : "-") : row.credit.toFixed(2)}
+          </span>
+        );
+      case "detail":
+        return row.error_detail ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              setOpened(opened === `${row.ts}-${row.account_uid}` ? null : `${row.ts}-${row.account_uid}`);
+            }}
+            title="查看上游返回"
+            className="mx-auto flex h-4 w-4 items-center justify-center rounded-full bg-rose-400/25 text-[9px] text-rose-100 hover:bg-rose-400/45"
+          >
+            ?
+          </button>
+        ) : null;
+      default:
+        return null;
+    }
+  };
+
   return (
-    <div className="flex flex-col gap-0.5">
-      <div className="flex items-center gap-2 px-2 pb-1 text-[10px] text-zinc-500">
-        {columns.map(([width, label]) => (
-          <span key={label} className={`${width} shrink-0 text-center`}>
-            {label}
+    <div className="w-max min-w-full flex flex-col gap-0.5">
+      <div className="flex w-max min-w-full items-center gap-2 px-2 pb-1 text-[10px] text-zinc-500">
+        {columns.map((column) => (
+          <span key={column.key} className={`${column.width} shrink-0 text-center`}>
+            {column.label}
           </span>
         ))}
       </div>
@@ -76,73 +175,20 @@ export function RequestLogView() {
         return (
           <div key={key} className="flex flex-col">
             <div
-              className={`flex items-center gap-2 overflow-hidden rounded-md px-2 py-1 text-[10px] ${
+              className={`flex w-max min-w-full items-center gap-2 rounded-md px-2 py-1 text-[10px] ${
                 failed ? "bg-rose-400/[0.06]" : "bg-white/[0.02]"
               }`}
             >
-              <span className="w-14 shrink-0 font-mono text-zinc-500">{formatClock(row.ts)}</span>
-              <span className="min-w-0 flex-[1.4] truncate text-zinc-200" title={row.upstream_model}>
-                {row.model}
-              </span>
-              <span className="w-10 shrink-0 text-zinc-500">{row.effort ?? "-"}</span>
-              <span className="min-w-0 flex-[0.8] truncate text-zinc-400" title={row.account_uid}>
-                {row.account_uid.slice(0, 8)}
-              </span>
-              <span className="w-10 shrink-0 text-zinc-500">{row.stream ? "流式" : "非流"}</span>
-              <span className={`w-14 shrink-0 ${failed ? "text-rose-300" : "text-emerald-300"}`}>
-                {failed ? statusLabel(row.status) : "完成"}
-              </span>
-              <span className="w-14 shrink-0 text-zinc-400">{row.total_ms} ms</span>
-              <span className="w-14 shrink-0 text-zinc-400">
-                {row.ttft_ms === null ? "-" : `${row.ttft_ms} ms`}
-              </span>
-              <span className="w-14 shrink-0 text-zinc-400">
-                {row.tokens_per_second > 0 ? `${row.tokens_per_second}/s` : "-"}
-              </span>
-              <span className="w-14 shrink-0 text-zinc-400">{formatTokens(row.prompt_tokens)}</span>
-              <span className="w-12 shrink-0 text-zinc-400">
-                {formatTokens(row.completion_tokens)}
-              </span>
-              <span className="w-10 shrink-0 text-zinc-500">
-                {row.reasoning_tokens > 0 ? formatTokens(row.reasoning_tokens) : "-"}
-              </span>
-              <span className="w-12 shrink-0 text-zinc-500">
-                {row.total_tokens > 0
-                  ? `${Math.round((row.cached_tokens / row.total_tokens) * 100)}%`
-                  : "-"}
-              </span>
-              <span className="w-16 shrink-0 font-medium text-zinc-100">
-                {formatTokens(row.total_tokens)}
-              </span>
-              <span
-                className="w-10 shrink-0 text-center text-zinc-500"
-                title={
-                  row.credit !== null
-                    ? `上游积分：${row.credit}`
-                    : row.estimated
-                      ? "上游没给 usage：这一行的 token 是本地估算，积分不可用"
-                      : "上游这次没返回积分"
-                }
-              >
-                {row.credit === null ? (row.estimated ? "估" : "-") : row.credit.toFixed(2)}
-              </span>
-              <span className="w-6 shrink-0">
-                {row.error_detail && (
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setOpened(opened === key ? null : key);
-                    }}
-                    title="查看上游返回"
-                    className="flex h-4 w-4 items-center justify-center rounded-full bg-rose-400/25 text-[9px] text-rose-100 hover:bg-rose-400/45"
-                  >
-                    ?
-                  </button>
-                )}
-              </span>
+              {columns.map((column) => (
+                <span
+                  key={column.key}
+                  className={`${column.width} flex shrink-0 items-center justify-center text-center`}
+                >
+                  {cell(row, column.key)}
+                </span>
+              ))}
             </div>
-            {opened === key && row.error_detail && (
+            {opened === `${row.ts}-${row.account_uid}` && row.error_detail && (
               <pre className="mb-1 mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap rounded-md border border-rose-400/25 bg-black/45 px-2 py-1.5 text-[10px] leading-relaxed text-rose-100">
                 {row.error_detail}
               </pre>
@@ -328,7 +374,7 @@ export function SettingsView({
   );
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+export function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="rounded-xl border border-white/8 bg-white/[0.025] p-2.5">
       <div className="mb-1.5 text-[11px] text-zinc-400">{title}</div>

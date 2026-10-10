@@ -308,6 +308,164 @@ pub async fn gateway_fetch_quota(
     serde_json::to_value(snapshot).map_err(|error| error.to_string())
 }
 
+/// 单账号真实探针：发一条最小请求验证这个账号到底能不能用。
+///
+/// `model` 可指定（不指定就用该渠道第一个可用模型），
+/// 与参考实现的 `/accounts/test` 同口径：真实打上游、成功清错误、失败记冷却。
+#[tauri::command]
+pub async fn gateway_probe_account(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    model: Option<String>,
+) -> Result<Value, String> {
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let outcome =
+        crate::gateway::core::dispatch::probe_account(
+            &state,
+            &account,
+            model.as_deref(),
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        .map_err(message)?;
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+/// 该渠道可用于测试的模型列表（探针的下拉选项）。
+#[tauri::command]
+pub async fn gateway_probe_models(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+) -> Result<Value, String> {
+    let matrix = state.ensure_matrix(false).await;
+    let models: Vec<String> = matrix
+        .public_models()
+        .into_iter()
+        .filter(|model| {
+            matrix
+                .routes(model)
+                .iter()
+                .any(|route| route.channel_id == channel_id)
+        })
+        .collect();
+    Ok(json!(models))
+}
+
+/// 渠道任务清单（面板「任务」表格）。渠道没有任务体系时返回 null。
+#[tauri::command]
+pub async fn gateway_list_tasks(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+) -> Result<Value, String> {
+    let adapter = state.channel(&channel_id).ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .first_account_for(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 还没有账号，先登录一个"))?;
+    let tasks = adapter
+        .list_tasks(&state.client, &account)
+        .await
+        .map_err(message)?;
+    Ok(match tasks {
+        Some(tasks) => Value::Array(
+            tasks
+                .into_iter()
+                .map(|task| serde_json::to_value(task).unwrap_or(Value::Null))
+                .collect(),
+        ),
+        None => Value::Null,
+    })
+}
+
+/// 一键执行该账号的任务：**后台跑**，结果逐条进进度表，前端轮询即可实时看到。
+///
+/// 同一账号已在执行时直接返回 false（跳过），避免重复上报把任务搞乱。
+#[tauri::command]
+pub async fn gateway_run_tasks(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+) -> Result<Value, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    if !state.begin_task_run(&channel_id, &uid) {
+        return Ok(json!({ "started": false, "reason": "该账号的任务正在执行中" }));
+    }
+
+    let shared = std::sync::Arc::clone(&state);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    // 进度消费者：把每条结果写进状态表，前端轮询读到就能实时展示。
+    let consumer_state = std::sync::Arc::clone(&shared);
+    let consumer_channel = channel_id.clone();
+    let consumer_uid = uid.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(result) = receiver.recv().await {
+            consumer_state.push_task_result(&consumer_channel, &consumer_uid, result);
+        }
+    });
+
+    let runner_state = std::sync::Arc::clone(&shared);
+    let runner_channel = channel_id.clone();
+    let runner_uid = uid.clone();
+    let client = state.client.clone();
+    tauri::async_runtime::spawn(async move {
+        let snapshot = account.snapshot();
+        let outcome = adapter.run_tasks(&client, &snapshot, sender).await;
+        let (done, earned) = match &outcome {
+            Ok(results) => (
+                results.iter().filter(|r| r.status == "done").count() as u32,
+                results.iter().map(|r| r.earned).sum(),
+            ),
+            Err(error) => {
+                runner_state.fail_task_run(&runner_channel, &runner_uid, &error.message);
+                return;
+            }
+        };
+        runner_state.finish_task_run(&runner_channel, &runner_uid, done, earned);
+    });
+
+    Ok(json!({ "started": true }))
+}
+
+/// 任务执行进度（前端轮询）：running / 逐条结果 / 汇总。
+#[tauri::command]
+pub async fn gateway_task_progress(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+) -> Result<Value, String> {
+    Ok(state.task_progress(&channel_id, &uid))
+}
+
+/// 领取**单项**已达标任务的奖励（任务行上的「领取」）。
+///
+/// 与 `gateway_run_tasks` 的区别：这里不上报任何事件，只调领奖接口 ——
+/// 用于"进度早就达标了、只是没领过"的情况（例如你在官方客户端手动做完的任务）。
+#[tauri::command]
+pub async fn gateway_claim_task(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    code: String,
+) -> Result<crate::gateway::channels::TaskRunResult, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    adapter
+        .claim_task(&state.client, &account.snapshot(), &code)
+        .await
+        .map_err(|error| error.message)
+}
+
 /// 重置账号的运行态：清冷却、熔断、失败计数、模型级限流。
 ///
 /// 用途：手动排障（比如确认上游已经恢复，不想等冷却到期）。

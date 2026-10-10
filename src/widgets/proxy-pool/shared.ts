@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "@/api/gateway";
+import type { GatewayTaskRunResult } from "@/api/gateway";
 
 export interface ModelChip {
   id: string;
@@ -103,4 +104,44 @@ export function errorLabel(kind: string): string {
     internal: "网关内部错误",
   };
   return labels[kind] ?? kind;
+}
+
+/**
+ * 任务执行状态：放在**模块级**而不是组件里。
+ *
+ * 为什么：任务执行是长任务（18 项 × 最多 10 轮 × 1.1 秒间隔），
+ * 存在组件 state 里的话，切到别的账号/页面会卸载组件 → 状态与结果全丢，
+ * 看起来就像"执行被重置了"（其实上游还在跑，只是界面忘了）。
+ */
+export interface TaskRunState {
+  running: boolean;
+  results: GatewayTaskRunResult[] | null;
+  summary: { done: number; earned: number } | null;
+  error: string | null;
+}
+
+const EMPTY_RUN: TaskRunState = { running: false, results: null, summary: null, error: null };
+const runStates = new Map<string, TaskRunState>();
+const runListeners = new Set<() => void>();
+
+export function readTaskRun(key: string): TaskRunState {
+  return runStates.get(key) ?? EMPTY_RUN;
+}
+
+export function writeTaskRun(key: string, patch: Partial<TaskRunState>) {
+  runStates.set(key, { ...readTaskRun(key), ...patch });
+  for (const listener of runListeners) listener();
+}
+
+/** 订阅任务执行状态（跨组件挂载存活）。 */
+export function useTaskRunState(key: string): TaskRunState {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const listener = () => force((value) => value + 1);
+    runListeners.add(listener);
+    return () => {
+      runListeners.delete(listener);
+    };
+  }, []);
+  return readTaskRun(key);
 }

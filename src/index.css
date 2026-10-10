@@ -322,3 +322,32 @@ body,
   min-height: 0;
   overflow-y: auto;
 }
+
+/* ===== 反代号池：深色滚动条 =====
+   WebView 默认滚动条是白底黑条，在深色面板里非常扎眼。
+   只作用于显式声明 .gw-scroll / .gw-scroll-x 的容器，不影响岛体其他区域。 */
+.gw-scroll,
+.gw-scroll-x {
+  scrollbar-color: rgb(63 63 70) transparent;
+}
+.gw-scroll::-webkit-scrollbar,
+.gw-scroll-x::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.gw-scroll::-webkit-scrollbar-track,
+.gw-scroll-x::-webkit-scrollbar-track {
+  background: transparent;
+}
+.gw-scroll::-webkit-scrollbar-thumb,
+.gw-scroll-x::-webkit-scrollbar-thumb {
+  background: rgb(63 63 70);
+  border-radius: 4px;
+}
+.gw-scroll::-webkit-scrollbar-thumb:hover,
+.gw-scroll-x::-webkit-scrollbar-thumb:hover {
+  background: rgb(82 82 91);
+}
+.gw-scroll-x::-webkit-scrollbar-corner {
+  background: transparent;
+}

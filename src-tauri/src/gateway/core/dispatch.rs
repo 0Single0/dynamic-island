@@ -445,3 +445,208 @@ mod tests {
         ));
     }
 }
+
+/// 单账号真实探针：只对该账号发一条最小请求，返回耗时与回复摘要。
+///
+/// 与参考实现的 `/accounts/test` 同口径：**真实打上游**（不是测端口通不通），
+/// 成功即清掉该账号的错误状态，失败按统一语义记冷却。
+/// 指定 `model` 时用指定模型，否则用该渠道第一个可用模型。
+pub async fn probe_account(
+    state: &GatewayState,
+    account: &Arc<PoolAccount>,
+    model: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<ProbeOutcome, GatewayError> {
+    let started = std::time::Instant::now();
+    let adapter = state
+        .channel(&account.key.channel_id)
+        .ok_or_else(|| GatewayError::internal("渠道没有可用适配器"))?;
+
+    // 选模型：显式指定 > 矩阵里第一个属于该渠道的模型。
+    let matrix = state.ensure_matrix(false).await;
+    // 默认选**免费**模型（探针会真实消耗积分，不该拿付费档试）；
+    // 没有免费的就退回该渠道的第一个可用模型。
+    let belongs_to_channel = |model: &str| {
+        matrix
+            .routes(model)
+            .iter()
+            .any(|route| route.channel_id == account.key.channel_id)
+    };
+    let chosen = match model {
+        Some(model) => model.to_string(),
+        None => {
+            let candidates: Vec<String> = matrix
+                .public_models()
+                .into_iter()
+                .filter(|model| belongs_to_channel(model))
+                .collect();
+            candidates
+                .iter()
+                .find(|model| {
+                    matrix
+                        .routes(model)
+                        .iter()
+                        .any(|route| route.channel_id == account.key.channel_id && route.is_free())
+                })
+                .cloned()
+                .or_else(|| candidates.first().cloned())
+                .ok_or_else(|| {
+                    GatewayError::invalid_request("该渠道没有任何模型可用于测试")
+                })?
+        }
+    };
+    let upstream_model = matrix
+        .routes(&chosen)
+        .into_iter()
+        .find(|route| route.channel_id == account.key.channel_id)
+        .map(|route| route.upstream_model)
+        .unwrap_or_else(|| chosen.clone());
+
+    // 最小请求：一句 hi，非流式由本地折叠。
+    let request = CanonicalRequest {
+        model: upstream_model.clone(),
+        system: Vec::new(),
+        messages: vec![crate::gateway::protocol::cir::Message {
+            role: crate::gateway::protocol::cir::Role::User,
+            content: vec![crate::gateway::protocol::cir::Block::text("hi")],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            reasoning: None,
+        }],
+        tools: Vec::new(),
+        tool_choice: None,
+        temperature: None,
+        top_p: None,
+        max_tokens: Some(64),
+        stream: false,
+        reasoning: None,
+        metadata: Default::default(),
+        raw: serde_json::json!({}),
+    };
+
+    if !refresh::ensure_credential(state, account).await {
+        return Err(GatewayError::new(
+            ErrorKind::AuthExpired,
+            ErrorScope::Account,
+            401,
+            "凭据不可用，需要重新登录",
+            false,
+        ));
+    }
+
+    let attempt = async {
+        let frames = adapter
+            .chat_stream(&account.snapshot(), &request, &state.client)
+            .await?;
+        let mut frames = frames;
+        let mut events = Vec::new();
+        use futures_util::StreamExt as _;
+        while let Some(frame) = frames.next().await {
+            match frame {
+                Ok(frame) => events.extend(adapter.parse_event(&frame)),
+                Err(error) => return Err(error),
+            }
+        }
+        let completion = crate::gateway::protocol::encode::openai::fold(
+            &events,
+            "probe",
+            &upstream_model,
+            0,
+        )?;
+        Ok::<_, GatewayError>(completion)
+    };
+
+    match tokio::time::timeout(timeout, attempt).await {
+        Err(_) => {
+            let error = GatewayError::network("探针超时");
+            account.apply_error(&error, &state.pool.policy(), now_ms());
+            Err(error)
+        }
+        Ok(Err(error)) => {
+            account.apply_error(&error, &state.pool.policy(), now_ms());
+            Err(error)
+        }
+        Ok(Ok(completion)) => {
+            // 成功即清错误状态（与调度路径一致）。
+            account.on_success(&request.model);
+            let message = &completion["choices"][0]["message"];
+            let reply = message["content"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .or_else(|| message["reasoning_content"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let usage = &completion["usage"];
+            Ok(ProbeOutcome {
+                model: chosen,
+                upstream_model,
+                reply: clip(&reply, 80),
+                latency_ms: started.elapsed().as_millis() as u64,
+                prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+                completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+            })
+        }
+    }
+}
+
+/// 探针结果（面板展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeOutcome {
+    pub model: String,
+    pub upstream_model: String,
+    pub reply: String,
+    pub latency_ms: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(limit.saturating_sub(3)).collect();
+    clipped.push_str("...");
+    clipped
+}
+
+#[cfg(test)]
+mod probe_tests {
+    //! 探针的手动验证：用本机真实账号跑一次，确认链路可用。
+    //! `cargo test --lib probe_real_account -- --ignored --nocapture`
+    use super::*;
+    use crate::agent::secrets::OsCredentialStore;
+    use crate::gateway::{config::Config, storage::Storage};
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_real_account() {
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let _ = storage.list_accounts().expect("账号");
+
+        let config = Config::load_or_create(&dir).expect("配置");
+        let state = GatewayState::initialize_with_secrets(
+            config,
+            dir.clone(),
+            &OsCredentialStore,
+        )
+        .expect("状态");
+        let Some(account) = state.pool.accounts().into_iter().next() else {
+            panic!("号池为空");
+        };
+        let outcome = probe_account(
+            &state,
+            &account,
+            None,
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        .expect("探针通过");
+        println!("=== 探针结果 ===");
+        println!("{}", serde_json::to_string_pretty(&outcome).unwrap_or_default());
+    }
+}

@@ -37,7 +37,8 @@ export const toolRegistry: ToolDefinition[] = [
     name: "反代号池",
     icon: RadioTower,
     size: "xl",
-    window: { title: "反代号池", width: 1040, height: 720 },
+    // 号池表是 11 列固定宽度：默认窗口给足，免得一打开就挤（列宽固定，不随窗口缩放）。
+    window: { title: "反代号池", width: 1280, height: 780 },
     component: ProxyPoolExpanded,
   },
   {

@@ -225,6 +225,85 @@ export function resetAccountState(channelId: string, uid: string) {
   });
 }
 
+export interface GatewayTask {
+  code: string;
+  name: string;
+  status: string;
+  progress: string;
+  reward: number;
+  automatable: boolean;
+  note: string;
+}
+
+export interface GatewayTaskRunResult {
+  code: string;
+  name: string;
+  status: string;
+  message: string;
+  earned: number;
+}
+
+export interface GatewayProbeOutcome {
+  model: string;
+  upstream_model: string;
+  reply: string;
+  latency_ms: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 单账号真实探针：发一条最小请求，验证这个账号能不能用。 */
+export function probeAccount(channelId: string, uid: string, model?: string) {
+  return invoke<GatewayProbeOutcome>("gateway_probe_account", {
+    channelId,
+    uid,
+    model: model || null,
+  });
+}
+
+/** 该渠道可用于探针的模型列表。 */
+export function probeModels(channelId: string) {
+  return invoke<string[]>("gateway_probe_models", { channelId });
+}
+
+/** 渠道任务清单（渠道没有任务体系时返回 null）。 */
+export function listTasks(channelId: string) {
+  return invoke<GatewayTask[] | null>("gateway_list_tasks", { channelId });
+}
+
+/** 启动该账号的任务执行（后台跑，立即返回；已在执行则 started=false）。 */
+export function runTasks(channelId: string, uid: string) {
+  return invoke<{ started: boolean; reason?: string }>("gateway_run_tasks", {
+    channelId,
+    uid,
+  });
+}
+
+export interface GatewayTaskProgress {
+  running: boolean;
+  started_at?: number;
+  finished_at?: number;
+  results: GatewayTaskRunResult[];
+  done: number;
+  earned: number;
+  error?: string;
+}
+
+/** 任务执行进度（前端轮询，逐条实时显示）。 */
+export function taskProgress(channelId: string, uid: string) {
+  return invoke<GatewayTaskProgress>("gateway_task_progress", { channelId, uid });
+}
+
+/**
+ * 领取单项已达标任务的奖励（任务行上的「领取」）。
+ *
+ * 只调领奖接口，不上报任何事件 —— 用于"进度早就达标、只是没领过"的任务。
+ * 失败原因（未达标 / 已领过）在返回的 message 里，不当异常抛。
+ */
+export function claimTask(channelId: string, uid: string, code: string) {
+  return invoke<GatewayTaskRunResult>("gateway_claim_task", { channelId, uid, code });
+}
+
 export function checkinAccount(channelId: string, uid: string) {
   return invoke<{ ok: boolean }>("gateway_checkin_account", { channelId, uid });
 }

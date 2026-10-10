@@ -87,6 +87,39 @@ pub struct ModelCapabilities {
     pub reasoning: bool,
 }
 
+/// 渠道无关的"运营任务"视图：面板的「任务」表格按它渲染。
+///
+/// 各渠道口径不同（workbuddy 是成长任务/签到/猫猫旅行，将来的渠道可能完全不同），
+/// 所以只归一通用字段；渠道特有的说明放 `note` 原样透出。
+/// 自动化做不了的任务也要列出（`automatable=false` + 原因），诚实比假装能做重要。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskInfo {
+    /// 渠道内部的任务编号（accept/claim 用）。
+    pub code: String,
+    pub name: String,
+    /// not_accepted / in_progress / claimable / done / unsupported
+    pub status: String,
+    /// 进度 "2/5"；拿不到就给空串。
+    pub progress: String,
+    /// 奖励积分（0 = 未标注）。
+    pub reward: u32,
+    pub automatable: bool,
+    /// 不能自动化时的原因 / 需要的动作（如"需在桌面端打开资料库"）。
+    pub note: String,
+}
+
+/// 一次任务执行的结果行（面板的执行记录）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRunResult {
+    pub code: String,
+    pub name: String,
+    /// done / skipped / failed / not_in_window
+    pub status: String,
+    pub message: String,
+    /// 本轮拿到的积分（未领到为 0）。
+    pub earned: u32,
+}
+
 /// 渠道无关的额度快照。
 ///
 /// 各渠道口径天然不同（workbuddy 是积分/资源包，将来 qoder 可能是额度、
@@ -207,6 +240,41 @@ pub trait ChannelAdapter: Send + Sync {
         _state: &str,
     ) -> Result<LoginPoll, GatewayError> {
         Err(GatewayError::unsupported("该渠道不支持登录流程"))
+    }
+
+    /// 运营任务清单（面板「任务」表格）。`Ok(None)` = 该渠道没有任务体系。
+    async fn list_tasks(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<Option<Vec<TaskInfo>>, GatewayError> {
+        Ok(None)
+    }
+
+    /// 一键执行可自动化的任务，逐条结果**实时**推到 `progress`，末尾返回全量。
+    ///
+    /// 走通道而不是只返回 Vec：任务执行是长任务（几十秒到几分钟），
+    /// 面板要能一条条看到进展，而不是等全部跑完才弹一个框。
+    async fn run_tasks(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _progress: tokio::sync::mpsc::UnboundedSender<TaskRunResult>,
+    ) -> Result<Vec<TaskRunResult>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    /// 单独领取一项**已达标**任务的奖励（面板任务行上的「领取」）。
+    ///
+    /// 与 `run_tasks` 分开：进度已经达标、只是没领过的任务（比如你在官方端手动做完了），
+    /// 不该为了领一次奖把事件再上报一遍。
+    async fn claim_task(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _code: &str,
+    ) -> Result<TaskRunResult, GatewayError> {
+        Err(GatewayError::unsupported("该渠道不支持单独领取任务奖励"))
     }
 
     /// 额度/余额快照。`Ok(None)` = 该渠道没有额度概念，或这次没查到。

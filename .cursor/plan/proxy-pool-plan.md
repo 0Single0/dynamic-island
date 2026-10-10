@@ -24,18 +24,34 @@
 | Anthropic 入口（`/v1/messages`、`count_tokens`） | ✅ | 解码（system/tool_use/tool_result/image/document/thinking、`tool_choice.any`→required、服务端工具降级）；有状态 SSE 编码器（message_start → content_block_start/delta/stop → message_delta → message_stop，文本块与工具块显式开合）；非流式折叠；Anthropic 错误信封；`count_tokens` 用本地 CJK 估算 |
 | Responses 入口（`/v1/responses`） | ✅ | 解码（`input` 字符串/item 数组、`instructions`→system、`function_call`/`function_call_output`→tool 序列（相邻 call 自动合并）、`max_output_tokens`、`reasoning.effort`、服务端工具剔除、**`previous_response_id` 本地 400**）；有状态 SSE 编码器（`response.created` → `output_item.added/delta/done` → `response.completed`，reasoning/message/function_call 三类 item）；非流式折叠成 `object:"response"`；`finish_reason=length` → `status:"incomplete"` |
 | 账号额度展示 | ✅ | 渠道无关的 `QuotaSnapshot`（label/unit/remaining/total/used/details/fetched_at）+ `ChannelAdapter::fetch_quota` 契约 + 账号行"额度"列（悬停看明细与抓取时间）+ 金币按钮手动刷新 + 登录成功后自动抓一次；workbuddy 接国内版计费接口（资源包汇总 → 免费/付费包明细 → 容量汇总，兼容 Precise 变体与 Size/Remain/Used 缺项修正） |
-| 定时器（保活 / 定时签到 / 目录预热 / 探针） | ⬜ | 目前只有手动刷新与手动签到 |
+| 任务中心（账号行「任务」列） | ✅ | 任务清单挂在**账号**上（同一渠道不同账号进度不同）；事件族逐字对齐参考实现（canvas / playbook / expert / team / skill / automation / skin / chat / buddy / heartbeat，团队与专家按轮次换 id —— 上游按 `(eventCode, id)` 去重）；接取后**必须重读**清单（未接取时 progress 为 null）；上报 200 ≠ 计分（回读进度才认）；一键执行在 **Rust 后台**跑并逐条推进度表（`gateway_run_tasks`/`gateway_task_progress`），面板 1 秒轮询 —— 切页面/切账号都不丢 |
+| 任务领取 | ✅ | 领取走 **Web 域** `/activity/growth/tasks/{code}/claim`；幂等语义实测：已领过 → `code:0 / already_claimed:true / credit:0`，未达标 → 400 `task not completed`。抽成 `claim_one`，`run()` 与行内「领取」共用；「已领取」只认 `accept_status == "claimed"`（早先读 `progress.claimed`/`claim_status` 都不存在，导致领过的显示"可领取"+每轮重复领） |
+| 定时器（保活 / 定时签到 / 目录预热 / 探针） | ⬜ | **额度自动刷新已落地**：`gateway/ops.rs` 常驻任务，启动 20s 后每 60s 扫一遍，只刷超过 5 分钟未更新的账号（**不依赖面板打开**）；其余（签到/预热/探针）待做 |
 | 额度守卫（保留积分 / 每日 Token / 每日积分 / 单模型） | ⬜ | 需要额度查询接口一起做 |
 | 第二渠道（qoder） | ⬜ | 等 qoder 的接入资料；扩展机制与配置已就绪（写适配器 + registry + 配置，核心零改动） |
 | 硬化（压测 / 故障演练 / 面板在真机上的视觉验收） | ⬜ | — |
 
-当前验证：`cargo test --lib` 187 通过（gateway 130 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、Anthropic 与 Responses 两条协议的事件序列与状态映射）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+当前验证：`cargo test --lib` 205 通过（gateway 157 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+
+**探针的组织方式（2026-10-10）**：真实账号探针集中在 `gateway/channels/workbuddy/tasks.rs` 底部的 `mod probe`，共用一份 `Fixture`（从应用自己的库里读 wb-cn 账号）—— 早先 6 个探针各抄一份装配样板，光样板就 300 行，把文件顶到 1000 行上限以上。探针**刻意不写断言**：它们的用途是观察上游真实字段（accept_status 取值、claim 幂等返回），断言写死了反而会掩盖上游变化。铁律不变：**枚举值/字段名一律先探针看真的，再写进代码** —— `accept_status` 与 `already_claimed` 都是这么定的。
 
 **新增渠道时额度怎么接**：实现 `ChannelAdapter::fetch_quota` 即可，把上游口径翻译成 `QuotaSnapshot`（`label` 写"积分 / 额度 / 试用期"，`unit` 写"点 / 元 / 天"）。面板只按这两个字段展示，**不认识任何具体渠道** —— 所以 qoder 接额度、kiro 接试用期都不需要动界面。查不到时返回 `Ok(None)`，界面显示"—"，不编造数字。
 
 **实战排障记录（2026-10-09）**：ZCode 接网关报 `Cannot read properties of undefined (reading 'summaryParts')`——不是模型/账号问题，是 **Responses 流缺收尾事件**：AI SDK 要求 reasoning item 带 `reasoning_summary_part.added/.done`（它在 part 上维护 `summaryParts`），message item 带 `output_text.done`，且所有 `output_item.done` 按顺序配对。已照参考实现的协议形态补全并加回归测试锁死事件顺序。教训：**协议适配的对照物是"真实客户端消费的流"，不是文档**——同一个客户端走官方端点正常、走网关崩溃，第一件事就是逐事件 diff 两条流。
 
 **已知偏差（与计划不同但有意为之）**：面板用 Tauri 命令轮询（2s，收起即停）而非事件推送 —— 省掉 Rust 侧为面板维护事件通道；若将来要看板常驻再换事件。
+
+**号池表格的列宽策略（2026-10-10，试错后定型）**：**比例权重（`flex-[权重]`，操作列 `shrink-0` 定宽 168px）**。窗口多宽表格就多宽，**永不溢出**；窄了每列都窄一点（文字截断），宽了每列都宽一点。
+
+试过并否掉的三版，记下来免得再走一遍：
+- **按比例伸缩但操作列没定宽**：窄窗口时 5 个 32px 图标被 flex 压成 23px（"操作栏太挤"）。
+- **固定宽度 + 表格内横向滚动 + 操作列 sticky 钉右侧**：sticky 本身生效（真 DOM 实测：未滚动时操作列就已被拉到可视右缘），但操作列 176px 钉住后会**盖住它左边那几列** —— 表格 1066px / 可视区 674px 时，"请求中~测试" 全被压在操作列底下。
+- **最小宽度（min-w-*）**：硬下限，窗口比它们之和窄时整行照样溢出 —— 账号列被挤出可视区 + 底部多一条横向滚动条（"溢出就不管了？"）。
+- 验证方式：真实组件在 1040/1200/1280/1440/1920 五档宽度下量 `scrollWidth == clientWidth`（溢出必须为 0）。
+- 账号列宽度按**最长昵称**算（下限 96、上限 160），现在体现为**权重** 0.96..1.60：短昵称不浪费宽度，超长昵称也不会把整行顶变形。
+- 凭据只显示天数（"26 天"）；额度进度条**不把比例夹到 1**：剩余超过总量（赠送/加包）时填满 + 百分比带 "+"（如 115%+），否则溢出了也看不见。
+
+工具窗口默认尺寸从 1040×720 调到 1280×780（列多了，给足宽度更舒服；窗口再窄也不会溢出，只是每列更窄）。
 
 ## 1. 目标一句话
 

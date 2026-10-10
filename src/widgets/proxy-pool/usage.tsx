@@ -61,8 +61,6 @@ export function UsageView() {
   const prompt = usage?.prompt_tokens ?? 0;
   const cached = usage?.cached_tokens ?? 0;
   const completion = usage?.completion_tokens ?? 0;
-  // "真实消耗" = 输入里没命中缓存的部分 + 输出：这才是真正新算的 token。
-  const fresh = Math.max(0, prompt - cached) + completion;
 
   return (
     <div className="flex flex-col gap-3">
@@ -103,13 +101,13 @@ export function UsageView() {
       {/* 主指标卡：左边一个大的，右边两个小的 */}
       <div className="flex items-stretch gap-3 rounded-xl border border-white/8 bg-white/[0.03] p-3">
         <div className="flex min-w-0 flex-1 flex-col justify-center">
-          <span className="text-[11px] text-zinc-400">真实消耗 Tokens</span>
+          <span className="text-[11px] text-zinc-400">总 token 消耗</span>
           <div className="flex items-baseline gap-2">
             <span className="text-[26px] font-semibold leading-tight text-zinc-50">
-              {formatTokens(fresh)}
+              {formatTokens(usage?.total_tokens ?? 0)}
             </span>
             <span className="text-[10px] text-zinc-500">
-              缓存命中省下 {formatTokens(cached)}
+              输入 {formatTokens(prompt)} · 输出 {formatTokens(completion)}
             </span>
           </div>
         </div>
@@ -127,11 +125,11 @@ export function UsageView() {
         </div>
       </div>
 
-      <div className="grid grid-cols-5 gap-2">
+      <div className="grid grid-cols-4 gap-2">
         <SubCard
           icon={<ArrowDownToLine className="h-3.5 w-3.5 text-violet-300" />}
-          label="新增输入"
-          value={formatTokens(Math.max(0, prompt - cached))}
+          label="输入"
+          value={formatTokens(prompt)}
         />
         <SubCard
           icon={<ArrowUpFromLine className="h-3.5 w-3.5 text-rose-300" />}
@@ -142,11 +140,6 @@ export function UsageView() {
           icon={<Layers className="h-3.5 w-3.5 text-sky-300" />}
           label="缓存命中"
           value={formatTokens(cached)}
-        />
-        <SubCard
-          icon={<Layers className="h-3.5 w-3.5 text-emerald-300" />}
-          label="总 token"
-          value={formatTokens(usage?.total_tokens ?? 0)}
         />
         <SubCard
           icon={<Percent className="h-3.5 w-3.5 text-emerald-300" />}

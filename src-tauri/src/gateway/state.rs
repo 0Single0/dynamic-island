@@ -66,6 +66,8 @@ pub struct GatewayState {
     matrix_built_at: AtomicU64,
     /// 最近的调度决策（面板的"调度"视图与排障用）。
     decisions: RwLock<VecDeque<serde_json::Value>>,
+    /// 任务执行进度：key = `channel/uid`。长任务在后台跑，前端轮询这里看进展。
+    task_runs: RwLock<HashMap<String, serde_json::Value>>,
     status: RwLock<ServerStatus>,
     warnings: RwLock<Vec<String>>,
 }
@@ -128,6 +130,7 @@ impl GatewayState {
             matrix_lock: tokio::sync::Mutex::new(()),
             matrix_built_at: AtomicU64::new(0),
             decisions: RwLock::new(VecDeque::with_capacity(DECISION_HISTORY)),
+            task_runs: RwLock::new(HashMap::new()),
             status: RwLock::new(ServerStatus::default()),
             warnings: RwLock::new(warnings),
         }))
@@ -255,6 +258,90 @@ impl GatewayState {
             }
             decisions.push_back(entry);
         }
+    }
+
+    /// 开始一次任务执行；已在执行中返回 false（调用方据此跳过该账号）。
+    pub fn begin_task_run(&self, channel_id: &str, uid: &str) -> bool {
+        let Ok(mut runs) = self.task_runs.write() else {
+            return false;
+        };
+        let key = format!("{channel_id}/{uid}");
+        if runs
+            .get(&key)
+            .map(|entry| entry["running"].as_bool().unwrap_or(false))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        runs.insert(
+            key,
+            serde_json::json!({
+                "running": true,
+                "started_at": now_ms(),
+                "finished_at": serde_json::Value::Null,
+                "results": [],
+                "done": 0,
+                "earned": 0,
+            }),
+        );
+        true
+    }
+
+    /// 推一条任务结果（后台执行线程调用）。
+    pub fn push_task_result(
+        &self,
+        channel_id: &str,
+        uid: &str,
+        result: crate::gateway::channels::TaskRunResult,
+    ) {
+        let Ok(mut runs) = self.task_runs.write() else {
+            return;
+        };
+        let Some(entry) = runs.get_mut(&format!("{channel_id}/{uid}")) else {
+            return;
+        };
+        if let Some(list) = entry["results"].as_array_mut() {
+            list.push(serde_json::to_value(result).unwrap_or(serde_json::Value::Null));
+        }
+    }
+
+    pub fn finish_task_run(&self, channel_id: &str, uid: &str, done: u32, earned: u32) {
+        let Ok(mut runs) = self.task_runs.write() else {
+            return;
+        };
+        if let Some(entry) = runs.get_mut(&format!("{channel_id}/{uid}")) {
+            entry["running"] = serde_json::json!(false);
+            entry["finished_at"] = serde_json::json!(now_ms());
+            entry["done"] = serde_json::json!(done);
+            entry["earned"] = serde_json::json!(earned);
+        }
+    }
+
+    pub fn fail_task_run(&self, channel_id: &str, uid: &str, message: &str) {
+        let Ok(mut runs) = self.task_runs.write() else {
+            return;
+        };
+        if let Some(entry) = runs.get_mut(&format!("{channel_id}/{uid}")) {
+            entry["running"] = serde_json::json!(false);
+            entry["finished_at"] = serde_json::json!(now_ms());
+            entry["error"] = serde_json::json!(message);
+        }
+    }
+
+    /// 读任务执行进度（前端轮询）。
+    pub fn task_progress(&self, channel_id: &str, uid: &str) -> serde_json::Value {
+        self.task_runs
+            .read()
+            .ok()
+            .and_then(|runs| runs.get(&format!("{channel_id}/{uid}")).cloned())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "running": false,
+                    "results": [],
+                    "done": 0,
+                    "earned": 0,
+                })
+            })
     }
 
     /// 最近的决策，最新在前。

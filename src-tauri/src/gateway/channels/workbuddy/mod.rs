@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod billing;
+pub mod tasks;
 pub mod catalog;
 pub mod hygiene;
 pub mod identity;
@@ -156,6 +157,43 @@ impl ChannelAdapter for WorkbuddyChannel {
         state: &str,
     ) -> Result<LoginPoll, GatewayError> {
         auth::login_poll(client, &self.hosts, state).await
+    }
+
+    async fn list_tasks(
+        &self,
+        client: &reqwest::Client,
+        account: &AccountSnapshot,
+    ) -> Result<Option<Vec<crate::gateway::channels::TaskInfo>>, GatewayError> {
+        if self.realm != Realm::Cn {
+            // 国际版没有国内成长任务中心。
+            return Ok(None);
+        }
+        tasks::list(client, &self.hosts, account).await.map(Some)
+    }
+
+    async fn run_tasks(
+        &self,
+        client: &reqwest::Client,
+        account: &AccountSnapshot,
+        progress: tokio::sync::mpsc::UnboundedSender<crate::gateway::channels::TaskRunResult>,
+    ) -> Result<Vec<crate::gateway::channels::TaskRunResult>, GatewayError> {
+        if self.realm != Realm::Cn {
+            return Ok(Vec::new());
+        }
+        tasks::run(client, &self.hosts, account, progress).await
+    }
+
+    async fn claim_task(
+        &self,
+        client: &reqwest::Client,
+        account: &AccountSnapshot,
+        code: &str,
+    ) -> Result<crate::gateway::channels::TaskRunResult, GatewayError> {
+        if self.realm != Realm::Cn {
+            return Err(GatewayError::unsupported("国际版没有成长任务体系"));
+        }
+        // 领奖的失败原因（未达标/已领过）是**行内文案**，不是异常：返回 Ok 交给面板展示。
+        Ok(tasks::claim(client, &self.hosts, account, code).await)
     }
 
     async fn fetch_quota(
