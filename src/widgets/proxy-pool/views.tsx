@@ -16,9 +16,13 @@ export { UsageView } from "./usage";
  *
  * 失败的行左侧泛红，并带一个 `?`：点开就是**上游返回的原文**。
  */
+/** 每页行数：日志一行信息密度高，50 条在展开面板里大约两屏。 */
+const LOG_PAGE_SIZE = 50;
+
 export function RequestLogView() {
   const [rows, setRows] = useState<GatewayUsageRow[]>([]);
   const [opened, setOpened] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,6 +41,11 @@ export function RequestLogView() {
       window.clearInterval(timer);
     };
   }, []);
+
+  // 新数据到达时页数可能收缩（后端保留窗口有限），把页码夹回有效范围。
+  const pageCount = Math.max(1, Math.ceil(rows.length / LOG_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount);
+  const pageRows = rows.slice((safePage - 1) * LOG_PAGE_SIZE, safePage * LOG_PAGE_SIZE);
 
   if (rows.length === 0) {
     return (
@@ -161,41 +170,68 @@ export function RequestLogView() {
   };
 
   return (
-    <div className="w-max min-w-full flex flex-col gap-0.5">
-      <div className="flex w-max min-w-full items-center gap-2 px-2 pb-1 text-[10px] text-zinc-500">
-        {columns.map((column) => (
-          <span key={column.key} className={`${column.width} shrink-0 text-center`}>
-            {column.label}
-          </span>
-        ))}
-      </div>
-      {rows.map((row) => {
-        const key = `${row.ts}-${row.account_uid}-${row.model}`;
-        const failed = row.status !== "completed" || row.error_detail !== null;
-        return (
-          <div key={key} className="flex flex-col">
-            <div
-              className={`flex w-max min-w-full items-center gap-2 rounded-md px-2 py-1 text-[10px] ${
-                failed ? "bg-rose-400/[0.06]" : "bg-white/[0.02]"
-              }`}
-            >
-              {columns.map((column) => (
-                <span
-                  key={column.key}
-                  className={`${column.width} flex shrink-0 items-center justify-center text-center`}
-                >
-                  {cell(row, column.key)}
-                </span>
-              ))}
-            </div>
-            {opened === `${row.ts}-${row.account_uid}` && row.error_detail && (
-              <pre className="mb-1 mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap rounded-md border border-rose-400/25 bg-black/45 px-2 py-1.5 text-[10px] leading-relaxed text-rose-100">
-                {row.error_detail}
-              </pre>
-            )}
+    // 外层 h-full + overflow-hidden：分页栏钉在底部，不跟表格一起滚。
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="gw-scroll gw-scroll-x min-h-0 flex-1 overflow-auto pr-1">
+        <div className="w-max min-w-full flex flex-col gap-0.5">
+          <div className="flex w-max min-w-full items-center gap-2 px-2 pb-1 text-[10px] text-zinc-500">
+            {columns.map((column) => (
+              <span key={column.key} className={`${column.width} shrink-0 text-center`}>
+                {column.label}
+              </span>
+            ))}
           </div>
-        );
-      })}
+          {pageRows.map((row) => {
+            const key = `${row.ts}-${row.account_uid}-${row.model}`;
+            const failed = row.status !== "completed" || row.error_detail !== null;
+            return (
+              <div key={key} className="flex flex-col">
+                <div
+                  className={`flex w-max min-w-full items-center gap-2 rounded-md px-2 py-1 text-[10px] ${
+                    failed ? "bg-rose-400/[0.06]" : "bg-white/[0.02]"
+                  }`}
+                >
+                  {columns.map((column) => (
+                    <span
+                      key={column.key}
+                      className={`${column.width} flex shrink-0 items-center justify-center text-center`}
+                    >
+                      {cell(row, column.key)}
+                    </span>
+                  ))}
+                </div>
+                {opened === `${row.ts}-${row.account_uid}` && row.error_detail && (
+                  <pre className="mb-1 mt-0.5 max-h-40 overflow-auto whitespace-pre-wrap rounded-md border border-rose-400/25 bg-black/45 px-2 py-1.5 text-[10px] leading-relaxed text-rose-100">
+                    {row.error_detail}
+                  </pre>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="mt-1 flex shrink-0 items-center justify-end gap-2 px-1 text-[10px] text-zinc-500">
+        <span>
+          共 {rows.length} 条 · 第 {safePage}/{pageCount} 页
+        </span>
+        <button
+          type="button"
+          onClick={() => setPage(Math.max(1, safePage - 1))}
+          disabled={safePage <= 1}
+          className="rounded-md bg-white/8 px-2 py-0.5 text-zinc-300 hover:bg-white/14 disabled:opacity-35"
+        >
+          上一页
+        </button>
+        <button
+          type="button"
+          onClick={() => setPage(Math.min(pageCount, safePage + 1))}
+          disabled={safePage >= pageCount}
+          className="rounded-md bg-white/8 px-2 py-0.5 text-zinc-300 hover:bg-white/14 disabled:opacity-35"
+        >
+          下一页
+        </button>
+      </div>
     </div>
   );
 }

@@ -95,17 +95,20 @@ export function ProxyPoolExpanded() {
             {error}
           </div>
         )}
-        <div className="gw-scroll gw-scroll-x min-h-0 min-w-0 flex-1 overflow-auto pr-1">
-          {section === "accounts" ? (
-            <AccountsView channels={channels} accounts={accounts} onChange={refresh} />
-          ) : section === "logs" ? (
-            <RequestLogView />
-          ) : section === "usage" ? (
-            <UsageView />
-          ) : (
-            <SettingsView status={status} channels={channels} onChange={refresh} />
-          )}
-        </div>
+        {/* 日志页自带滚动容器 + 底部分页栏：分页不随表格滚动，所以不走外层滚动包裹。 */}
+        {section === "logs" ? (
+          <RequestLogView />
+        ) : (
+          <div className="gw-scroll gw-scroll-x min-h-0 min-w-0 flex-1 overflow-auto pr-1">
+            {section === "accounts" ? (
+              <AccountsView channels={channels} accounts={accounts} onChange={refresh} />
+            ) : section === "usage" ? (
+              <UsageView />
+            ) : (
+              <SettingsView status={status} channels={channels} onChange={refresh} />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
