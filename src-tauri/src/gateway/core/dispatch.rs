@@ -286,11 +286,18 @@ pub async fn open_chat_session(
                     state.affinity.clear(&key);
                     let _ = state.storage.delete_affinity(&key);
                 }
+                // 渠道校验拦截（11-128）：换号重试最稳 —— 出站身份跟着账号变，
+                // 同一个身份连发被拦的概率更高。
+                let switch_account = error.kind == ErrorKind::ChannelBlocked;
                 last_error = Some(error);
                 // 先归还槽位再换号，否则这个账号在本轮请求里再也选不到。
                 drop(guard);
                 if !retryable {
                     break;
+                }
+                if switch_account {
+                    // 强制换号：把"亲和指回同一账号"的捷径跳过。
+                    hint = None;
                 }
                 // P2：403 内容审核要在这里用降级提示词原号重试一次（换号无效）。
             }

@@ -66,11 +66,16 @@ pub fn build_chat_body(model: &str, request: &CanonicalRequest) -> Value {
         map.remove("input");
     }
 
-    // 工具选择语义也要重建：Anthropic 的 `{type: any}` 解码成了 OpenAI 的
-    // `required`，但它躺在 CIR 里 —— 不写出去的话，raw 透传的原始值（Anthropic
-    // 形状）反而成了生效配置，上游解析不了就会误判。
+    // 工具选择**归一成上游要的字符串**：上游是 Go 服务，`Request.tool_choice`
+    // 声明为 string —— 发对象会 11101 "cannot unmarshal object into ... string"
+    //（畸形请求有时还会撞上渠道校验的 11-128）。Claude Code 指定工具时发的
+    // `{type:"tool",name}` 解码出来是 OpenAI 的 function 对象，必须在这里降级；
+    // 参考实现同样在最后一道做这个归一（`normalize_tool_choice`）。
+    // 语义：auto/required/none 原样；指定工具 = 工具名（上游的 string 形状）。
     if let Some(choice) = &request.tool_choice {
-        body["tool_choice"] = choice.clone();
+        if let Some(normalized) = normalize_tool_choice(choice) {
+            body["tool_choice"] = json!(normalized);
+        }
     }
 
     body["model"] = json!(model);
@@ -366,6 +371,40 @@ fn is_deepseek(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("deepseek")
 }
 
+/// 把 OpenAI 形状的 `tool_choice` 归一成上游的字符串形状。
+///
+/// 返回 `None` = 无法识别的形状，整个字段不要发（发畸形值必被上游拒绝）。
+/// `"none"` 保留 tools 声明：语义由 tool_choice 本身表达，删 tools 会让
+/// 模型拿不到函数签名、把调用降级成正文里的伪 JSON（参考实现踩过的坑）。
+fn normalize_tool_choice(choice: &Value) -> Option<String> {
+    match choice {
+        Value::String(text) => {
+            let lowered = text.trim().to_ascii_lowercase();
+            match lowered.as_str() {
+                "auto" | "required" | "none" => Some(lowered),
+                // OpenAI 的 {type:"function",function:{name}} 之外没有别的对象，
+                // 字符串只可能是这三种语义；其他字符串不猜，丢掉。
+                _ => None,
+            }
+        }
+        Value::Object(map) => {
+            let kind = map.get("type").and_then(Value::as_str)?;
+            match kind {
+                "auto" | "required" | "none" => Some(kind.to_string()),
+                "function" => Some(
+                    map.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map(|name| name.trim().to_string())?,
+                ),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 上游只支持流式：非流式由网关本地折叠；usage 只能从 `stream_options` 拿到。
 fn force_stream(body: &mut Value) {
     body["stream"] = json!(true);
@@ -594,9 +633,10 @@ mod tests {
     /// 客户端协议的**顶层提示词字段**不能跟着 raw 透传出去：
     /// 提示词已经清洗过并重建进 messages，留着原文等于把清洗整个绕过
     /// （Anthropic 的 `system` / Responses 的 `instructions`、`input`）。
-    /// 工具选择语义走 CIR 重建，不吃 raw 透传的 Anthropic 原始形状。
+    /// 工具选择归一成上游要的**字符串**：发对象会 11101（上游是 Go，
+    /// `Request.tool_choice` 声明为 string）。指定工具 = 工具名。
     #[test]
-    fn tool_choice_is_rebuilt_not_passed_through() {
+    fn tool_choice_is_normalized_to_upstream_string_shape() {
         let mut req = request();
         req.messages.push(user("hi"));
         req.tools.push(ToolSpec {
@@ -604,14 +644,42 @@ mod tests {
             description: None,
             parameters: Some(json!({"type": "object"})),
         });
+        // Claude Code 指定工具（经 Anthropic 解码后是 OpenAI function 对象）。
         req.tool_choice = Some(json!({"type": "function", "function": {"name": "shell"}}));
-        // raw 里带着 Anthropic 形状的旧值 —— 重建值必须覆盖它。
+        // raw 里带着 Anthropic 形状的旧值 —— 归一值必须覆盖它。
         req.raw = json!({"tool_choice": {"type": "any"}});
         let body = build_chat_body("glm-5.3", &req);
         assert_eq!(
-            body["tool_choice"]["function"]["name"], "shell",
-            "以 CIR 解码结果为准，raw 的 Anthropic 形状不能漏出去"
+            body["tool_choice"], "shell",
+            "指定工具要发工具名字符串，不是对象"
         );
+
+        // 三种语义对象 → 字符串。
+        for (value, expect) in [
+            (json!({"type": "auto"}), "auto"),
+            (json!({"type": "required"}), "required"),
+            (json!({"type": "none"}), "none"),
+        ] {
+            let mut req = request();
+            req.messages.push(user("hi"));
+            req.tool_choice = Some(value);
+            let body = build_chat_body("glm-5.3", &req);
+            assert_eq!(body["tool_choice"], expect);
+        }
+
+        // OpenAI 客户端直接发字符串也认。
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.tool_choice = Some(json!("auto"));
+        let body = build_chat_body("glm-5.3", &req);
+        assert_eq!(body["tool_choice"], "auto");
+
+        // 认不出的形状整个字段不发（发畸形值必被拒）。
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.tool_choice = Some(json!({"type": "weird"}));
+        let body = build_chat_body("glm-5.3", &req);
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
@@ -695,6 +763,95 @@ mod probe {
     use crate::gateway::channels::{workbuddy::identity, AccountSnapshot};
     use crate::gateway::storage::Storage;
     use crate::gateway::transport::{self, UpstreamRequest};
+
+    /// 真机验证：Claude Code 形状的请求（带 tools + tool_choice 指定工具）
+    /// 经 build_chat_body 重建后能被上游接受（不再 11101 / 11-128）。
+    #[tokio::test]
+    #[ignore]
+    async fn probe_claude_code_shape() {
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "wb-cn")
+            .expect("没有 wb-cn 账号");
+        let credential = record.credential.expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+        };
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let client = reqwest::Client::new();
+
+        // Claude Code 的典型形状：system 带自我声明 + tools + 指定 tool_choice。
+        let request = crate::gateway::protocol::cir::CanonicalRequest {
+            model: "glm-5.3".into(),
+            system: vec![crate::gateway::protocol::cir::Block::text(
+                "You are Claude Code, Anthropic's official CLI tool for Claude.",
+            )],
+            messages: vec![crate::gateway::protocol::cir::Message {
+                role: crate::gateway::protocol::cir::Role::User,
+                content: vec![crate::gateway::protocol::cir::Block::text("hi")],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            tools: vec![crate::gateway::protocol::cir::ToolSpec {
+                name: "shell".into(),
+                description: Some("run a command".into()),
+                parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
+            }],
+            tool_choice: Some(serde_json::json!({"type": "function", "function": {"name": "shell"}})),
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            stream: true,
+            reasoning: None,
+            metadata: Default::default(),
+            // 模拟 Anthropic 入口的 raw：顶层 system + Anthropic 形状 tool_choice。
+            raw: serde_json::json!({
+                "system": "You are Claude Code, Anthropic's official CLI tool for Claude.",
+                "tool_choice": {"type": "tool", "name": "shell"},
+            }),
+        };
+        let body = super::build_chat_body("glm-5.3", &request);
+        println!("重建后的 tool_choice = {}", body["tool_choice"]);
+        println!("重建后有没有顶层 system = {}", body.get("system").is_some());
+
+        let headers = identity::chat_headers(
+            &account.channel_id,
+            identity::Realm::Cn,
+            identity::Outbound::Desktop,
+            &hosts,
+            &account,
+            1,
+        );
+        let upstream = UpstreamRequest {
+            url: hosts.chat_url("/v2/chat/completions"),
+            headers,
+            body,
+        };
+        match transport::send(&upstream, &client).await {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                let blocked = text.contains("11-128") || text.contains("11101") || text.contains("unapproved");
+                println!("HTTP {} {} {}", status, if blocked { "【被拦】" } else { "放行" },
+                    text.chars().take(150).collect::<String>().replace("
+", " "));
+            }
+            Err(failure) => println!("被拒 status={} {}", failure.status, failure.body.chars().take(200).collect::<String>()),
+        }
+    }
 
     #[tokio::test]
     #[ignore]
