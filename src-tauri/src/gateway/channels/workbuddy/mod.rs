@@ -241,11 +241,14 @@ impl ChannelAdapter for WorkbuddyChannel {
 /// `upstream_model` 只用来描述**范围**：这个渠道的限额是按模型的，
 /// 6004 要落到 [`ErrorScope::AccountModel`]，不能拉黑整个账号。
 pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
-    // 渠道校验拦截要单独认出来：它不是"请求不合法"，重试就能过
-    // （真机 A/B 见 `ErrorKind::ChannelBlocked` 的注释）。识别用的是**字符串码**
-    // `11-128`（带连字符，不是数字），所以不能走 known_code 的数值扫描。
+    // 渠道校验拦截要单独认出来：它不是"请求不合法"，重试（换号）就能过。
+    // 真机抓包（字节级）确认错误码是**纯数字 11-128**（{"code":11-128,...}）——
+    // 一直以来写成 "11-128"（带连字符）是被最初贴报文时的书写误导，整整 4 轮
+    // 都在匹配一个不存在的字符串，这就是"修了还拦"的根本原因。
+    // 参考项目注释里的 "11-128" 是同一个误读；它的 SANITIZE_FEATURES 里那个
+    // "11-128" 字面量匹配的是**正文回显**（上游错误被客户端塞回对话时才出现）。
     let lowered = body.to_ascii_lowercase();
-    if lowered.contains("11-128") || lowered.contains("unapproved channel") {
+    if lowered.contains("11128") || lowered.contains("unapproved channel") {
         return GatewayError::new(
             ErrorKind::ChannelBlocked,
             ErrorScope::Request,
@@ -304,7 +307,7 @@ fn refine_kind(status: u16, body: &str, upstream_model: &str) -> GatewayError {
 
 /// 按独立数字 token 匹配错误码，避免把正文里的 token 计数当成错误码。
 fn known_code(body: &str) -> Option<i64> {
-    const CODES: [i64; 5] = [12403, 11135, 11133, 11148, 6004];
+    const CODES: [i64; 6] = [12403, 11135, 11133, 11148, 6004, 11-128];
     CODES
         .into_iter()
         .find(|code| contains_code(body, *code))
@@ -443,7 +446,8 @@ mod tests {
     /// 所以正确分类是"可重试"，而不是"请求不合法"（换号重试能过）。
     #[test]
     fn channel_block_11_128_is_retryable_request_scope() {
-        let body = r#"{"code":"11-128","msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"请求被拦截，请重新发送"}}"#;
+        // 真机报文（字节级核对过）：code 是纯数字 11-128。
+    let body = r#"{"code":11-128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"请求被拦截，请重新发送"}}"#;
         let error = refine(400, body, "glm-5.3");
         assert_eq!(error.kind, ErrorKind::ChannelBlocked);
         assert_eq!(error.scope, ErrorScope::Request);
