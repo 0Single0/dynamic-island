@@ -241,6 +241,20 @@ impl ChannelAdapter for WorkbuddyChannel {
 /// `upstream_model` 只用来描述**范围**：这个渠道的限额是按模型的，
 /// 6004 要落到 [`ErrorScope::AccountModel`]，不能拉黑整个账号。
 pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
+    // 渠道校验拦截要单独认出来：它不是"请求不合法"，重试就能过
+    // （真机 A/B 见 `ErrorKind::ChannelBlocked` 的注释）。识别用的是**字符串码**
+    // `11-128`（带连字符，不是数字），所以不能走 known_code 的数值扫描。
+    let lowered = body.to_ascii_lowercase();
+    if lowered.contains("11-128") || lowered.contains("unapproved channel") {
+        return GatewayError::new(
+            ErrorKind::ChannelBlocked,
+            ErrorScope::Request,
+            429,
+            "上游渠道校验拦截（该判定带随机性，重试即可；换账号重试更稳）",
+            true,
+        )
+        .with_upstream(openai_compat::raw(body));
+    }
     let refined = refine_kind(status, body, upstream_model);
     refined.with_upstream(openai_compat::raw(body))
 }
@@ -422,6 +436,22 @@ mod tests {
         // 通用分类路径同样保留原文。
         let generic = refine(429, "slow down please", "glm-5.3");
         assert_eq!(generic.upstream.as_deref(), Some("slow down please"));
+    }
+
+    /// 11-128（渠道校验拦截）：**字符串码**，带连字符，数值扫描认不到。
+    /// 真机 A/B：同一报文一次放行一次被拦、随后 16 连发 0 拦 —— 随机判定，
+    /// 所以正确分类是"可重试"，而不是"请求不合法"（换号重试能过）。
+    #[test]
+    fn channel_block_11_128_is_retryable_request_scope() {
+        let body = r#"{"code":"11-128","msg":"Illegal API invocation from an unapproved channel","displayTips":{"zh":"请求被拦截，请重新发送"}}"#;
+        let error = refine(400, body, "glm-5.3");
+        assert_eq!(error.kind, ErrorKind::ChannelBlocked);
+        assert_eq!(error.scope, ErrorScope::Request);
+        assert!(error.retryable, "重试（最好换号）就能过");
+        assert!(error.upstream.as_deref().is_some_and(|raw| raw.contains("unapproved")));
+        // 英文措辞也要认。
+        let plain = refine(400, "Illegal API invocation from an unapproved channel", "glm-5.3");
+        assert_eq!(plain.kind, ErrorKind::ChannelBlocked);
     }
 
     #[test]

@@ -32,7 +32,7 @@
 | 第二渠道（qoder） | ⬜ | 等 qoder 的接入资料；扩展机制与配置已就绪（写适配器 + registry + 配置，核心零改动） |
 | 硬化（压测 / 故障演练 / 面板在真机上的视觉验收） | ⬜ | — |
 
-当前验证：`cargo test --lib` 211 通过（gateway 150 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+当前验证：`cargo test --lib` 213 通过（gateway 150 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
 
 **探针的组织方式（2026-10-10）**：真实账号探针集中在 `gateway/channels/workbuddy/tasks.rs` 底部的 `mod probe`，共用一份 `Fixture`（从应用自己的库里读 wb-cn 账号）—— 早先 6 个探针各抄一份装配样板，光样板就 300 行，把文件顶到 1000 行上限以上。探针**刻意不写断言**：它们的用途是观察上游真实字段（accept_status 取值、claim 幂等返回），断言写死了反而会掩盖上游变化。铁律不变：**枚举值/字段名一律先探针看真的，再写进代码** —— `accept_status` 与 `already_claimed` 都是这么定的。
 
@@ -253,6 +253,10 @@ routes = matrix.routes(public_model)                     // 别名解析 → 候
 - **6004 = 模型级限额**（参考实现原文 "usage exceeds frequency limit"）。正文会给 `your usage will reset at 2026-09-19 18:29:03 UTC+8`，我们解析成时刻 → 只停这个模型到那一刻；解析不出来也保持模型级（按模型退避），**绝不因为一个模型限额把整个账号拉黑**。裸 429（没有 6004）仍按参考实现当账号级软限流处理。
 - **模型级冷却的 key 必须用 upstream 名**：写的时候（`narrow_scope`）和读的时候（`router::pick` / 亲和检查 / `on_success`）都用 `route.upstream_model`。早先写用对外名、读用 upstream 名 —— 结果是"明明记了冷却，调度器却查不到"，账号继续被选中、继续吃 429（这类 bug 不会报错，只会表现成"限流好像没用"）。
 - 面板会把它显示出来：账号仍算可用（`is_ready("")`），但状态列的 `?` 与"限流等待"列会给出**模型级**限流（"模型 1" + 悬停看到是哪个模型、还有多久），避免把"某个模型限额"误判成"号废了"。
+
+**11-128 是随机拦截，不是内容指纹（2026-10-12 真机 A/B 定性）**：Claude Code 打 `/v1/messages` 偶发 `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel"}`。逐段 A/B（Claude Code 完整声明/短句/billing 头/anthropics 域名都放行；`Default branch (...)` 一次放行一次被拦；随后同文 16 连发 0 拦）证明**触发与正文、频率都无关，是上游侧随机/状态性判定**。处理：新 `ErrorKind::ChannelBlocked`（Request 范围、retryable=true、重试/换号即可），池子对它**不做任何冷却**；识别用字符串码（带连字符，数值扫描认不到）。教训：指纹表"哪些串触发拦截"的老结论不能照抄 —— 上游风控会变，**定性必须本机 A/B**。
+
+顺带修掉一个真泄漏：`build_chat_body` 以客户端原始报文为基底透传渠道特有字段，但 Anthropic 的顶层 `system`、Responses 的 `instructions`/`input` 也跟着漏出去 —— 提示词明明清洗过并重建进了 `messages`，原文却原样再发一遍，把清洗整个绕过。现已删除这三个顶层字段。
 
 **上游文案会本地化 —— 别认句子，认时间戳（2026-10-10 真机教训）**：6004 的恢复时刻在正文里，但**语种跟着请求头变**。我们发 `Accept-Language: zh-CN`，上游回的是中文「您的使用量已超出频率限制，将在 2026-10-11 14:46:40 UTC+8 重置，您也可以切换其他模型继续使用。」；参考实现（英文客户端）看到的是 `your usage will reset at ...`。早先只找英文 `reset at`，中文文案就解析不出来 → 退成"恢复时刻未知" + 10m/20m 翻倍退避，而**真实恢复在约 21 小时后**（那是按天重置的模型额度预算，不是短窗限流）。现在改成：扫描正文里第一个 `YYYY-MM-DD[ T]HH:MM:SS`（配 `UTC±N`，缺省 +8），中英俄任何措辞都能解析。同类"认措辞"的坑要引以为戒 —— 上游改一个字就失效，而且**静默失效**（表现成"退避策略看起来不灵"）。
 

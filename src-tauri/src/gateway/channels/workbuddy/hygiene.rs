@@ -56,6 +56,14 @@ pub fn build_chat_body(model: &str, request: &CanonicalRequest) -> Value {
         // 私有标记键（下划线开头）是网关内部用的，不该发给上游。
         map.retain(|key, _| !key.starts_with('_'));
         map.remove("max_completion_tokens");
+        // **客户端协议的顶层提示词字段必须删掉**：Anthropic 的 `system`、
+        // Responses 的 `instructions` / `input` 是各自协议的顶层字段，
+        // 而我们已经把提示词重建进 `messages`（且**经过指纹清洗**）。
+        // 留着它们等于把客户端的原文（未清洗）再发一遍 ——
+        // 既让上游看到两份提示词，也把清洗直接绕过。
+        map.remove("system");
+        map.remove("instructions");
+        map.remove("input");
     }
 
     body["model"] = json!(model);
@@ -576,6 +584,36 @@ mod tests {
         assert_eq!(body["temperature"], 0.3, "透传字段要保留");
     }
 
+    /// 客户端协议的**顶层提示词字段**不能跟着 raw 透传出去：
+    /// 提示词已经清洗过并重建进 messages，留着原文等于把清洗整个绕过
+    /// （Anthropic 的 `system` / Responses 的 `instructions`、`input`）。
+    #[test]
+    fn top_level_prompt_fields_do_not_leak_through_raw() {
+        let mut req = request();
+        req.system = vec![Block::text("You are Claude Code, Anthropic's official CLI tool for Claude")];
+        req.messages.push(user("hi"));
+        // 模拟 Anthropic 解码后的 raw：顶层还带着未清洗的 system。
+        req.raw = json!({
+            "model": "glm-5.3",
+            "system": "You are Claude Code, Anthropic's official CLI tool for Claude",
+            "max_tokens": 64,
+        });
+        let body = build_chat_body("glm-5.3", &req);
+        assert!(body.get("system").is_none(), "顶层 system 必须删除：提示词走清洗后的 messages");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !system.contains("Anthropic's official CLI"),
+            "messages 里的提示词必须是清洗后的：{system}"
+        );
+        // Responses 协议同理。
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.raw = json!({"instructions": "secret prompt", "input": "raw input"});
+        let body = build_chat_body("glm-5.3", &req);
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("input").is_none());
+    }
+
     #[test]
     fn tools_are_emitted_in_openai_shape() {
         let mut req = request();
@@ -610,5 +648,117 @@ mod tests {
         let body = build_chat_body("glm-5v-turbo", &req);
         assert_eq!(body["messages"][1]["content"][0]["type"], "text");
         assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+    }
+}
+
+
+/// 真机 A/B 探针：11-128 到底由**哪段文字**触发，以及改写后是否放行。
+///
+/// 用途：指纹表不能靠猜。参考实现的 A/B 结论（大小写不敏感、容忍前后缀、
+/// 改掉句子结构就不再匹配）需要在本机上复核一遍 —— 尤其"改成什么才放行"。
+///
+/// ```text
+/// cargo test --lib probe_fingerprint_ab -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod probe {
+    use serde_json::json;
+
+    use crate::agent::secrets::OsCredentialStore;
+    use crate::gateway::channels::{workbuddy::identity, AccountSnapshot};
+    use crate::gateway::storage::Storage;
+    use crate::gateway::transport::{self, UpstreamRequest};
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_fingerprint_ab() {
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "wb-cn")
+            .expect("没有 wb-cn 账号");
+        let credential = record.credential.expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+        };
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let client = reqwest::Client::new();
+
+        // 候选：每段文字单独当 system 发一次。命中 11-128 的就是特征串；
+        // 放行的那几行告诉我们"改成什么写法是安全的"。
+        // 同样的正文，快发 vs 慢发：判断触发条件是"内容"还是"频率/突发"。
+        let system = "You are a helpful assistant.
+Default branch (you will usually use this for PRs): main";
+        let mut burst_blocked = 0;
+        let mut slow_blocked = 0;
+        let rounds = 8;
+
+        println!("=== A. 连续快发（无间隔）===");
+        for index in 0..rounds {
+            let text = one_call(&client, &hosts, &account, system).await;
+            let blocked = text.contains("11-128") || text.contains("unapproved");
+            if blocked {
+                burst_blocked += 1;
+            }
+            println!("  第 {} 次：{}", index + 1, if blocked { "被拦 11-128" } else { "放行" });
+        }
+
+        println!("=== B. 间隔 3 秒 ===");
+        for index in 0..rounds {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let text = one_call(&client, &hosts, &account, system).await;
+            let blocked = text.contains("11-128") || text.contains("unapproved");
+            if blocked {
+                slow_blocked += 1;
+            }
+            println!("  第 {} 次：{}", index + 1, if blocked { "被拦 11-128" } else { "放行" });
+        }
+        println!("=== 汇总：快发被拦 {burst_blocked}/{rounds}，慢发被拦 {slow_blocked}/{rounds} ===");
+    }
+
+    /// 发一次最小请求，返回响应正文（2xx）或错误正文。
+    async fn one_call(
+        client: &reqwest::Client,
+        hosts: &identity::Hosts,
+        account: &AccountSnapshot,
+        system: &str,
+    ) -> String {
+        let headers = identity::chat_headers(
+            &account.channel_id,
+            identity::Realm::Cn,
+            identity::Outbound::Desktop,
+            hosts,
+            account,
+            1,
+        );
+        let body = json!({
+            "model": "glm-5.3",
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": "hi" },
+            ],
+            "stream": true,
+            "max_tokens": 8,
+            "stream_options": { "include_usage": true },
+        });
+        let upstream = UpstreamRequest {
+            url: hosts.chat_url("/v2/chat/completions"),
+            headers,
+            body,
+        };
+        match transport::send(&upstream, client).await {
+            Ok(response) => response.text().await.unwrap_or_default(),
+            Err(failure) => failure.body,
+        }
     }
 }

@@ -215,6 +215,9 @@ impl PoolAccount {
                     }
                 }
             }
+            // 上游渠道校验拦截：随机出现、重试即可 —— 不动任何冷却，
+            // 否则"随机拦一次"会把一个健康账号白停十分钟。
+            ErrorKind::ChannelBlocked => {}
             ErrorKind::QuotaExhausted => {
                 self.runtime
                     .balance_until
