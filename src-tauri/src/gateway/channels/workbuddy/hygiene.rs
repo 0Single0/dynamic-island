@@ -66,6 +66,13 @@ pub fn build_chat_body(model: &str, request: &CanonicalRequest) -> Value {
         map.remove("input");
     }
 
+    // 工具选择语义也要重建：Anthropic 的 `{type: any}` 解码成了 OpenAI 的
+    // `required`，但它躺在 CIR 里 —— 不写出去的话，raw 透传的原始值（Anthropic
+    // 形状）反而成了生效配置，上游解析不了就会误判。
+    if let Some(choice) = &request.tool_choice {
+        body["tool_choice"] = choice.clone();
+    }
+
     body["model"] = json!(model);
     let mut messages = build_messages(request);
     repair_tool_pairing(&mut messages);
@@ -587,6 +594,26 @@ mod tests {
     /// 客户端协议的**顶层提示词字段**不能跟着 raw 透传出去：
     /// 提示词已经清洗过并重建进 messages，留着原文等于把清洗整个绕过
     /// （Anthropic 的 `system` / Responses 的 `instructions`、`input`）。
+    /// 工具选择语义走 CIR 重建，不吃 raw 透传的 Anthropic 原始形状。
+    #[test]
+    fn tool_choice_is_rebuilt_not_passed_through() {
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.tools.push(ToolSpec {
+            name: "shell".into(),
+            description: None,
+            parameters: Some(json!({"type": "object"})),
+        });
+        req.tool_choice = Some(json!({"type": "function", "function": {"name": "shell"}}));
+        // raw 里带着 Anthropic 形状的旧值 —— 重建值必须覆盖它。
+        req.raw = json!({"tool_choice": {"type": "any"}});
+        let body = build_chat_body("glm-5.3", &req);
+        assert_eq!(
+            body["tool_choice"]["function"]["name"], "shell",
+            "以 CIR 解码结果为准，raw 的 Anthropic 形状不能漏出去"
+        );
+    }
+
     #[test]
     fn top_level_prompt_fields_do_not_leak_through_raw() {
         let mut req = request();
