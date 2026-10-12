@@ -735,6 +735,21 @@ mod probe {
         }
     }
 
+    /// 每日动作的真实返回（国内版：签到状态 + 猫猫旅行状态）。
+    #[tokio::test]
+    #[ignore]
+    async fn probe_daily_actions() {
+        let f = Fixture::load();
+        let actions =
+            super::super::daily::actions(&f.client, &f.hosts, Realm::Cn, &f.account).await;
+        for action in &actions {
+            println!(
+                "{:10} 今天已做={:5} 动作={:8} 说明={}",
+                action.code, action.done_today, action.action, action.note
+            );
+        }
+    }
+
     /// 每个任务的 accept_status + progress（确认"已领取"由哪个字段表达）。
     #[tokio::test]
     #[ignore]

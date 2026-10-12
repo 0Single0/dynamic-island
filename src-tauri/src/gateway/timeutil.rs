@@ -6,6 +6,29 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 当前纪元毫秒（UTC）。全仓统一用它，避免各处自己 `SystemTime::now()` 后比较口径不同。
+/// 本地日期与小时 `(年, 月, 日, 时)` —— 每日动作要按**本地**日期判断"今天做没做"。
+#[cfg(windows)]
+pub fn local_date_hour() -> (i32, u32, u32, u32) {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: GetLocalTime 只读系统时间，无指针参数。
+    let local = unsafe { GetLocalTime() };
+    (
+        local.wYear as i32,
+        local.wMonth as u32,
+        local.wDay as u32,
+        local.wHour as u32,
+    )
+}
+
+#[cfg(not(windows))]
+pub fn local_date_hour() -> (i32, u32, u32, u32) {
+    // 非 Windows：用 UTC 天数换算，够定时器判断日期用。
+    let days = (now_ms() / 86_400_000) as i64;
+    let (year, month, day) = civil_from_days(days);
+    let hour = ((now_ms() / 3_600_000) % 24) as u32;
+    (year as i32, month as u32, day as u32, hour)
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

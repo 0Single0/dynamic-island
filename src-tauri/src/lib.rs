@@ -185,6 +185,8 @@ pub fn run() {
             gateway::commands::gateway_run_tasks,
             gateway::commands::gateway_task_progress,
             gateway::commands::gateway_claim_task,
+            gateway::commands::gateway_list_daily,
+            gateway::commands::gateway_run_daily,
             gateway::commands::gateway_add_account,
             gateway::commands::gateway_upsert_account_config,
             gateway::commands::gateway_list_routes,

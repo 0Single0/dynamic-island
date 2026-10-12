@@ -473,12 +473,20 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
   // 执行状态来自模块级 store：切走再回来不会丢，也不会看起来像"被重置"。
   const runState = useTaskRunState(key);
   const [tasks, setTasks] = useState<api.GatewayTask[] | null>(null);
+  /** 每日动作（签到 / 猫猫旅行 / 每日对话）：与任务分开列，语义不同。 */
+  const [daily, setDaily] = useState<api.GatewayDailyAction[] | null>(null);
   const [claiming, setClaiming] = useState<string | null>(null);
+  const [dailyBusy, setDailyBusy] = useState<string | null>(null);
   const [openNote, setOpenNote] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setTasks(await api.listTasks(channelId));
+      const [nextTasks, nextDaily] = await Promise.all([
+        api.listTasks(channelId),
+        api.listDaily(channelId, uid).catch(() => null),
+      ]);
+      setTasks(nextTasks);
+      setDaily(nextDaily);
       writeTaskRun(key, { error: null });
     } catch (reason) {
       setTasks(null);
@@ -486,7 +494,7 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
         error: errorText(reason, "读取任务失败"),
       });
     }
-  }, [channelId, key]);
+  }, [channelId, uid, key]);
 
   useEffect(() => {
     void load();
@@ -563,9 +571,35 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
     }
   };
 
+  /** 执行一个每日动作：单次请求，结果并进同一份 results（行内显示）。 */
+  const runDailyAction = async (action: api.GatewayDailyAction) => {
+    if (dailyBusy) return;
+    setDailyBusy(action.code);
+    try {
+      const result = await api.runDaily(channelId, uid, action.code);
+      const kept = (runState.results ?? []).filter((item) => item.code !== action.code);
+      writeTaskRun(key, { results: [...kept, result] });
+      if (result.status === "done" && result.earned > 0) {
+        toast.success(`${action.name}：+${result.earned} 积分`);
+      } else if (result.status === "done") {
+        toast.info(`${action.name}：${result.message}`);
+      } else {
+        toast.error(`${action.name}：${result.message}`);
+      }
+      void load();
+      // 签到/领奖会改积分：顺手刷一次额度，别等后端 5 分钟那轮。
+      void api.fetchQuota(channelId, uid).catch(() => null);
+    } catch (reason) {
+      toast.error(errorText(reason, `${action.name}失败`));
+    } finally {
+      setDailyBusy(null);
+    }
+  };
+
   const { running, results, error } = runState;
   // 本轮结果按任务编号归位：每行只认自己那一条。
   const byCode = new Map((results ?? []).map((result) => [result.code, result]));
+  const byCodeDaily = byCode;
   const automatable = (tasks ?? []).filter((task) => task.automatable).length;
   const claimable = (tasks ?? []).filter((task) => task.status === "claimable").length;
 
@@ -611,6 +645,49 @@ function AccountTasks({ channelId, uid }: { channelId: string; uid: string }) {
       </div>
 
       {error && <div className="mt-1 text-[10px] text-amber-200">{error}</div>}
+
+      {/* 每日动作：每天都要再做一次，所以**不混进任务清单**（那里是"做完就消失"）。
+          清单由渠道按版本给：国内版签到+猫猫旅行，国际版每日活跃对话。 */}
+      {daily !== null && daily.length > 0 && (
+        <div className="mt-1 flex flex-col gap-0.5 rounded-md border border-white/8 bg-white/[0.02] px-1 py-0.5">
+          <span className="px-0.5 text-[9px] uppercase tracking-wide text-zinc-600">每日</span>
+          {daily.map((action) => {
+            const outcome = byCodeDaily.get(action.code);
+            return (
+              <div key={action.code} className="flex items-center gap-2 text-[10px]">
+                <span className="w-44 truncate text-zinc-200" title={action.name}>
+                  {action.name}
+                </span>
+                <span
+                  className={`w-20 ${outcome ? outcomeColor(outcome.status) : "text-zinc-400"}`}
+                >
+                  {outcome ? outcomeLabel(outcome.status) : action.done_today ? "今天已做" : "待做"}
+                </span>
+                <span
+                  className="min-w-0 flex-1 truncate text-zinc-500"
+                  title={outcome ? outcome.message : action.note}
+                >
+                  {outcome ? outcome.message : action.note}
+                  {outcome && outcome.earned > 0 && (
+                    <span className="text-emerald-300"> +{outcome.earned}</span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void runDailyAction(action);
+                  }}
+                  disabled={dailyBusy !== null || action.done_today}
+                  className="shrink-0 rounded-md bg-white/8 px-2 py-0.5 text-[10px] text-zinc-300 hover:bg-white/16 disabled:opacity-40"
+                >
+                  {dailyBusy === action.code ? "执行中…" : action.action}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {tasks !== null && tasks.length > 0 && (
         <div className="mt-1 flex flex-col gap-0.5">

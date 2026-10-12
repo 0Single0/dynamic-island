@@ -120,6 +120,26 @@ pub struct TaskRunResult {
     pub earned: u32,
 }
 
+/// 一个**每日动作**（签到 / 猫猫旅行 / 每日活跃对话…）。
+///
+/// 为什么单独一层而不是并进任务清单：任务是"一次性、做完消失"，
+/// 每日动作是"每天都要再做一次"。混在一起就会出现"签完显示已完成"——
+/// 明天明明还得签。所以面板把它们分开列，契约也分开。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DailyAction {
+    /// 渠道内部编号（执行时回传）。
+    pub code: String,
+    pub name: String,
+    /// 用户能做的动作名（"签到" / "领取" / "派出旅行" / "去对话"…）。
+    pub action: String,
+    /// 今天是否已经做过（true 时按钮置灰）。
+    pub done_today: bool,
+    /// 不能自动完成时的原因 / 补充说明（连续天数、剩余次数…）。
+    pub note: String,
+    /// 动作是否可自动执行。
+    pub automatable: bool,
+}
+
 /// 渠道无关的额度快照。
 ///
 /// 各渠道口径天然不同（workbuddy 是积分/资源包，将来 qoder 可能是额度、
@@ -296,7 +316,32 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// 该账号今天有哪些每日动作、各自做完了没有。
+    ///
+    /// `Ok(None)` = 该渠道没有每日动作概念。**只列这个账号真实拥有的动作**：
+    /// 国内版有签到/猫猫旅行、国际版有每日活跃对话，两边不重叠 ——
+    /// 由渠道自己判断 realm，面板不认识任何具体渠道。
+    async fn daily_actions(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<Option<Vec<DailyAction>>, GatewayError> {
+        Ok(None)
+    }
+
+    /// 执行一个每日动作，返回这一条的结果（成功/失败原因、拿到的积分）。
+    async fn run_daily_action(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _code: &str,
+    ) -> Result<TaskRunResult, GatewayError> {
+        Err(GatewayError::unsupported("该渠道不支持每日动作"))
+    }
+
     /// 运营类动作：每日签到（国内版积分）。返回是否算成功（含幂等）。
+    ///
+    /// 保留这个薄封装：登录流程里会签一次（新号马上拿分）。
     async fn sign_in(
         &self,
         _client: &reqwest::Client,

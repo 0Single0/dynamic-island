@@ -281,6 +281,32 @@ export function runTasks(channelId: string, uid: string) {
   });
 }
 
+/**
+ * 每日动作（签到 / 猫猫旅行 / 每日活跃对话）。
+ *
+ * 与任务分开：任务是"一次性、做完消失"，每日动作每天都要再做一次 ——
+ * 动作清单由**渠道按版本**给出（国内版签到+猫猫、国际版每日对话），前端不认识具体渠道。
+ */
+export interface GatewayDailyAction {
+  code: string;
+  name: string;
+  /** 用户能做的动作名（"签到" / "领取奖励" / "派出旅行" / "去对话"）。 */
+  action: string;
+  done_today: boolean;
+  note: string;
+  automatable: boolean;
+}
+
+/** 该账号今天的每日动作清单（查状态，不做任何写操作）。 */
+export function listDaily(channelId: string, uid: string) {
+  return invoke<GatewayDailyAction[] | null>("gateway_list_daily", { channelId, uid });
+}
+
+/** 执行一个每日动作（单次请求，同步返回结果）。 */
+export function runDaily(channelId: string, uid: string, code: string) {
+  return invoke<GatewayTaskRunResult>("gateway_run_daily", { channelId, uid, code });
+}
+
 export interface GatewayTaskProgress {
   running: boolean;
   started_at?: number;

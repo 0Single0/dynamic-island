@@ -444,6 +444,53 @@ pub async fn gateway_task_progress(
     Ok(state.task_progress(&channel_id, &uid))
 }
 
+/// 该账号今天有哪些每日动作（签到 / 猫猫旅行 / 每日活跃对话）。
+///
+/// 动作清单由**渠道**按 realm 给出：国内版有签到与猫猫旅行、国际版有每日活跃对话，
+/// 两边不重叠 —— 面板不认识任何具体渠道，只按清单渲染。
+#[tauri::command]
+pub async fn gateway_list_daily(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+) -> Result<Value, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let actions = adapter
+        .daily_actions(&state.client, &account.snapshot())
+        .await
+        .map_err(|error| error.describe())?;
+    Ok(json!(actions))
+}
+
+/// 执行一个每日动作（签到 / 派出旅行 / 领奖 / 每日活跃对话）。
+///
+/// 同步返回：这几个动作都是单次请求，不像任务中心那样要几十秒 ——
+/// 不需要后台跑 + 轮询那一套。
+#[tauri::command]
+pub async fn gateway_run_daily(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    code: String,
+) -> Result<Value, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let outcome = adapter
+        .run_daily_action(&state.client, &account.snapshot(), &code)
+        .await
+        .map_err(|error| error.describe())?;
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
 /// 领取**单项**已达标任务的奖励（任务行上的「领取」）。
 ///
 /// 与 `gateway_run_tasks` 的区别：这里不上报任何事件，只调领奖接口 ——

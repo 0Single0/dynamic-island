@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod billing;
+pub mod daily;
 pub mod tasks;
 pub mod catalog;
 pub mod hygiene;
@@ -202,6 +203,26 @@ impl ChannelAdapter for WorkbuddyChannel {
         account: &AccountSnapshot,
     ) -> Result<Option<crate::gateway::channels::QuotaSnapshot>, GatewayError> {
         billing::fetch(client, &self.hosts, account).await
+    }
+
+    async fn daily_actions(
+        &self,
+        client: &reqwest::Client,
+        account: &AccountSnapshot,
+    ) -> Result<Option<Vec<crate::gateway::channels::DailyAction>>, GatewayError> {
+        // 动作按 realm 分开（CN：签到 + 猫猫旅行；Intl：每日活跃对话）。
+        Ok(Some(
+            daily::actions(client, &self.hosts, self.realm, account).await,
+        ))
+    }
+
+    async fn run_daily_action(
+        &self,
+        client: &reqwest::Client,
+        account: &AccountSnapshot,
+        code: &str,
+    ) -> Result<crate::gateway::channels::TaskRunResult, GatewayError> {
+        Ok(daily::run(client, &self.hosts, self.realm, account, code).await)
     }
 
     async fn sign_in(
