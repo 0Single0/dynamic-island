@@ -48,8 +48,9 @@ pub fn router(state: SharedGateway) -> Router {
 
 /// 起服务：绑定失败只写状态，不 panic —— 网关挂了岛还得能用。
 pub async fn run(state: SharedGateway) {
-    let preferred = state.config().port;
-    let listener = match bind_with_fallback(preferred).await {
+    let config = state.config();
+    let (preferred, allow_lan) = (config.port, config.allow_lan);
+    let listener = match bind_with_fallback(preferred, allow_lan).await {
         Ok(listener) => listener,
         Err(error) => {
             let message = format!("监听 127.0.0.1:{preferred} 失败：{error}");
@@ -96,10 +97,13 @@ pub async fn serve(listener: tokio::net::TcpListener, state: SharedGateway) {
     }
 }
 
-async fn bind_with_fallback(port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+async fn bind_with_fallback(port: u16, allow_lan: bool) -> Result<tokio::net::TcpListener, std::io::Error> {
+    // 允许局域网访问时绑 0.0.0.0（IPv4 全网卡）；否则只绑回环。
+    // 回环绑定的监听器拿不到 0.0.0.0 地址，所以分两条路径。
+    let host = if allow_lan { "0.0.0.0" } else { "127.0.0.1" };
     let mut last_error = None;
     for candidate in port..port.saturating_add(PORT_SCAN_RANGE) {
-        match tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+        match tokio::net::TcpListener::bind((host, candidate)).await {
             Ok(listener) => return Ok(listener),
             Err(error) => last_error = Some(error),
         }
@@ -445,7 +449,7 @@ mod tests {
             .expect("占住一个端口");
         let taken = occupied.local_addr().expect("本地地址").port();
 
-        let listener = bind_with_fallback(taken).await.expect("回退绑定");
+        let listener = bind_with_fallback(taken, false).await.expect("回退绑定");
         let port = listener.local_addr().expect("本地地址").port();
         assert_ne!(port, taken, "首选端口被占用时必须顺序回退");
 

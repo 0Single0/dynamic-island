@@ -12,7 +12,10 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  Cell,
   Legend,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -20,6 +23,7 @@ import {
 } from "recharts";
 import * as api from "@/api/gateway";
 import type { GatewaySeriesPoint, GatewayUsage } from "@/api/gateway";
+import { DateRangePicker } from "@/components/common/DateRangePicker";
 import { Select } from "@/components/common/Select";
 import { formatTokens } from "./shared";
 
@@ -31,6 +35,8 @@ import { formatTokens } from "./shared";
  */
 export function UsageView() {
   const [hours, setHours] = useState(24);
+  /** 自定义日期区间（本地毫秒）。选中后优先于快捷档。 */
+  const [dayRange, setDayRange] = useState<{ start: number; end: number } | null>(null);
   const [model, setModel] = useState("");
   const [usage, setUsage] = useState<GatewayUsage | null>(null);
   const [series, setSeries] = useState<GatewaySeriesPoint[]>([]);
@@ -40,8 +46,12 @@ export function UsageView() {
     const load = async () => {
       try {
         const [summary, points] = await Promise.all([
-          api.usageSummary(hours),
-          api.usageSeries(hours, model || undefined),
+          dayRange
+            ? api.usageSummaryRange(dayRange.start, dayRange.end)
+            : api.usageSummary(hours),
+          dayRange
+            ? api.usageSeriesRange(dayRange.start, dayRange.end, model || undefined)
+            : api.usageSeries(hours, model || undefined),
         ]);
         if (cancelled) return;
         setUsage(summary);
@@ -56,7 +66,7 @@ export function UsageView() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [hours, model]);
+  }, [hours, dayRange, model]);
 
   const prompt = usage?.prompt_tokens ?? 0;
   const cached = usage?.cached_tokens ?? 0;
@@ -66,6 +76,7 @@ export function UsageView() {
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-1.5">
         {[
+          { value: 0, label: "今日" },
           { value: 24, label: "近 24 小时" },
           { value: 168, label: "近 7 天" },
           { value: 720, label: "近 30 天" },
@@ -84,6 +95,11 @@ export function UsageView() {
             {entry.label}
           </button>
         ))}
+        <DateRangePicker
+          value={dayRange}
+          onChange={setDayRange}
+          onClear={() => setDayRange(null)}
+        />
         <Select
           value={model}
           options={[
@@ -317,13 +333,10 @@ function TrendTooltip({
 }) {
   if (!active || !payload || payload.length === 0 || label === undefined) return null;
   const rows = payload.filter((entry) => entry.dataKey !== "ts");
-  const total = rows.reduce((sum, entry) => sum + (entry.value ?? 0), 0);
-
+  
   return (
     <div className="rounded-lg border border-white/12 bg-zinc-900/95 px-2.5 py-2 shadow-xl">
-      <div className="text-[10px] font-medium text-zinc-200">
-        {tooltipLabel(label, hours)} · {formatTokens(total)} tokens
-      </div>
+      <div className="text-[10px] font-medium text-zinc-200">{tooltipLabel(label, hours)}</div>
       <div className="mt-1 flex flex-col gap-0.5">
         {rows.map((entry) => (
           <div key={String(entry.dataKey)} className="flex items-center gap-2 text-[10px]">
@@ -348,7 +361,7 @@ const PIE_COLORS = [
   "rgb(248 113 113)",
 ];
 
-/** 分布饼图（环形）：占比一眼可见，右侧配图例与数值。 */
+/** 分布饼图（recharts 环形）：悬浮显示该项的请求数与 token 明细。 */
 function Donut({
   rows,
 }: {
@@ -360,49 +373,42 @@ function Donut({
   }
 
   const top = rows.slice(0, 6);
-  const radius = 42;
-  const circumference = 2 * Math.PI * radius;
-  let offset = 0;
+  const data = top.map((row, index) => ({
+    ...row,
+    share: Math.round((row.total_tokens / total) * 100),
+    fill: PIE_COLORS[index % PIE_COLORS.length],
+  }));
 
   return (
-    <div className="flex items-center gap-4">
-      <svg viewBox="0 0 120 120" className="h-32 w-32 shrink-0 -rotate-90">
-        {top.map((row, index) => {
-          const share = row.total_tokens / total;
-          const segment = (
-            <circle
-              key={row.key}
-              cx="60"
-              cy="60"
-              r={radius}
-              fill="none"
-              stroke={PIE_COLORS[index % PIE_COLORS.length]}
-              strokeWidth="18"
-              strokeDasharray={`${share * circumference} ${circumference}`}
-              strokeDashoffset={-offset * circumference}
+    <div className="flex items-center gap-3">
+      <div className="h-36 w-36 shrink-0">
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie
+              data={data}
+              dataKey="total_tokens"
+              nameKey="key"
+              innerRadius={30}
+              outerRadius={62}
+              paddingAngle={2}
+              stroke="none"
+              isAnimationActive={false}
             >
-              <title>
-                {row.key}：{formatTokens(row.total_tokens)}（{Math.round(share * 100)}%）
-              </title>
-            </circle>
-          );
-          offset += share;
-          return segment;
-        })}
-        <circle cx="60" cy="60" r="28" fill="rgb(9 9 11)" />
-      </svg>
+              {data.map((entry) => (
+                <Cell key={entry.key} fill={entry.fill} />
+              ))}
+            </Pie>
+            <Tooltip content={<DonutTooltip total={total} />} />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
 
       <div className="flex min-w-0 flex-1 flex-col gap-1">
-        {top.map((row, index) => (
+        {data.map((row) => (
           <div key={row.key} className="flex items-center gap-2 text-[10px]">
-            <span
-              className="h-2 w-2 shrink-0 rounded-sm"
-              style={{ background: PIE_COLORS[index % PIE_COLORS.length] }}
-            />
+            <span className="h-2 w-2 shrink-0 rounded-sm" style={{ background: row.fill }} />
             <span className="min-w-0 flex-1 truncate text-zinc-300">{row.key}</span>
-            <span className="shrink-0 text-zinc-500">
-              {Math.round((row.total_tokens / total) * 100)}%
-            </span>
+            <span className="shrink-0 text-zinc-500">{row.share}%</span>
             <span className="w-14 shrink-0 text-right text-zinc-400">
               {formatTokens(row.total_tokens)}
             </span>
@@ -413,6 +419,39 @@ function Donut({
             其余 {rows.length - top.length} 个渠道/模型未显示
           </span>
         )}
+      </div>
+    </div>
+  );
+}
+
+interface DonutEntry {
+  name?: string;
+  value?: number;
+  payload?: { requests: number; total_tokens: number; cached_tokens: number };
+}
+
+/** 饼图悬浮卡：名称 + token + 占比 + 请求数。 */
+function DonutTooltip({
+  active,
+  payload,
+  total,
+}: {
+  active?: boolean;
+  payload?: DonutEntry[];
+  total: number;
+}) {
+  if (!active || !payload || payload.length === 0) return null;
+  const entry = payload[0];
+  const share = total > 0 ? Math.round(((entry.value ?? 0) / total) * 100) : 0;
+  return (
+    <div className="rounded-lg border border-white/12 bg-zinc-900/95 px-2.5 py-2 shadow-xl">
+      <div className="text-[10px] font-medium text-zinc-200">{entry.name}</div>
+      <div className="mt-1 flex flex-col gap-0.5 text-[10px] text-zinc-400">
+        <span>
+          Tokens {formatTokens(entry.value ?? 0)}（{share}%）
+        </span>
+        <span>请求 {entry.payload?.requests ?? 0} 次</span>
+        <span>缓存命中 {formatTokens(entry.payload?.cached_tokens ?? 0)}</span>
       </div>
     </div>
   );

@@ -20,6 +20,9 @@ pub struct Config {
     /// 是否随岛启动 HTTP 服务（关掉后只有面板可用）。
     pub enabled: bool,
     pub port: u16,
+    /// 是否允许局域网访问（绑 0.0.0.0）。默认关：只绑 127.0.0.1。
+    /// 开了之后建议配 api_keys —— 内网里任何人都能调到号池。
+    pub allow_lan: bool,
     /// 下游 API Key；留空表示不校验（只绑回环，等价于"本机免鉴权"）。
     pub api_keys: Vec<String>,
     pub channels: Vec<ChannelConfig>,
@@ -68,6 +71,7 @@ impl Default for Config {
         Self {
             enabled: true,
             port: DEFAULT_PORT,
+            allow_lan: false,
             api_keys: Vec::new(),
             channels: default_channels(),
             accounts: Vec::new(),

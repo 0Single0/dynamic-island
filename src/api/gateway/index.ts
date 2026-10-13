@@ -60,6 +60,12 @@ export interface GatewayStatus {
   error: string | null;
   enabled: boolean;
   port: number;
+  /** 实际监听端口（配置端口被占用回退后，与 port 可能不同）。 */
+  actual_port: number | null;
+  /** 是否允许局域网访问（绑 0.0.0.0）。 */
+  allow_lan: boolean;
+  /** 内网访问地址（allow_lan 开着才给）。 */
+  lan_addr: string | null;
   auth: "open" | "api_key";
   api_keys: string[];
   affinity: {
@@ -169,8 +175,15 @@ export function status() {
   return invoke<GatewayStatus>("gateway_status");
 }
 
-export function setRuntime(patch: { enabled?: boolean; apiKeys?: string[] }) {
-  return invoke<{ enabled: boolean; api_keys: number }>("gateway_set_runtime", patch);
+export function setRuntime(patch: {
+  enabled?: boolean;
+  apiKeys?: string[];
+  allowLan?: boolean;
+}) {
+  return invoke<{ enabled: boolean; allow_lan: boolean; api_keys: number }>(
+    "gateway_set_runtime",
+    patch,
+  );
 }
 
 export function refreshMatrix() {
@@ -388,11 +401,22 @@ export interface GatewaySeriesPoint {
 }
 
 /** 请求明细（日志表格）。 */
-export function recentUsage(limit = 200) {
+/** 请求日志：limit 省略（或 0）= 全量。 */
+export function recentUsage(limit = 0) {
   return invoke<GatewayUsageRow[]>("gateway_recent_usage", { limit });
 }
 
 /** 按小时分桶的时间序列（折线图）。 */
+/** 指定毫秒区间的汇总（日期选择器用）。 */
+export function usageSummaryRange(fromMs: number, toMs: number) {
+  return invoke<GatewayUsage>("gateway_usage_summary_range", { fromMs, toMs });
+}
+
+/** 指定毫秒区间的趋势序列（桶宽自适应）。 */
+export function usageSeriesRange(fromMs: number, toMs: number, model?: string) {
+  return invoke<GatewaySeriesPoint[]>("gateway_usage_series_range", { fromMs, toMs, model });
+}
+
 export function usageSeries(hours: number, model?: string) {
   return invoke<GatewaySeriesPoint[]>("gateway_usage_series", {
     hours,

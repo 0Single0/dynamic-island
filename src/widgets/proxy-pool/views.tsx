@@ -28,7 +28,7 @@ export function RequestLogView() {
     let cancelled = false;
     const load = async () => {
       try {
-        const next = await api.recentUsage(200);
+        const next = await api.recentUsage(0);
         if (!cancelled) setRows(next);
       } catch {
         /* 浏览器预览模式忽略 */
@@ -72,7 +72,6 @@ export function RequestLogView() {
     { key: "cache", width: "w-12", label: "缓存" },
     { key: "total", width: "w-16", label: "总 token" },
     { key: "credit", width: "w-12", label: "积分" },
-    { key: "detail", width: "w-8", label: "?" },
   ];
 
   /** 单元格渲染：key 对齐列定义，样式统一（等宽数字用 font-mono）。 */
@@ -100,8 +99,27 @@ export function RequestLogView() {
         return <span className="text-zinc-500">{row.stream ? "流式" : "非流"}</span>;
       case "status":
         return (
-          <span className={failed ? "text-rose-300" : "text-emerald-300"}>
+          <span className={`flex items-center justify-center gap-0.5 ${failed ? "text-rose-300" : "text-emerald-300"}`}>
             {failed ? statusLabel(row.status) : "完成"}
+            {failed && row.error_detail && (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setOpened(opened === `${row.ts}-${row.account_uid}` ? null : `${row.ts}-${row.account_uid}`);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    setOpened(opened === `${row.ts}-${row.account_uid}` ? null : `${row.ts}-${row.account_uid}`);
+                  }
+                }}
+                title="查看上游返回"
+                className="flex h-3.5 w-3.5 cursor-pointer items-center justify-center rounded-full bg-rose-400/25 text-[8px] text-rose-100 hover:bg-rose-400/45"
+              >
+                ?
+              </span>
+            )}
           </span>
         );
       case "total_ms":
@@ -150,20 +168,6 @@ export function RequestLogView() {
             {row.credit === null ? (row.estimated ? "估" : "-") : row.credit.toFixed(2)}
           </span>
         );
-      case "detail":
-        return row.error_detail ? (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              setOpened(opened === `${row.ts}-${row.account_uid}` ? null : `${row.ts}-${row.account_uid}`);
-            }}
-            title="查看上游返回"
-            className="mx-auto flex h-4 w-4 items-center justify-center rounded-full bg-rose-400/25 text-[9px] text-rose-100 hover:bg-rose-400/45"
-          >
-            ?
-          </button>
-        ) : null;
       default:
         return null;
     }
@@ -212,6 +216,7 @@ export function RequestLogView() {
       </div>
 
       <div className="mt-1 flex shrink-0 items-center justify-end gap-2 px-1 text-[10px] text-zinc-500">
+        <span className="mr-auto ml-1">共 {rows.length} 条</span>
         <span>
           共 {rows.length} 条 · 第 {safePage}/{pageCount} 页
         </span>
@@ -305,27 +310,122 @@ export function SettingsView({
       </Panel>
 
       <Panel title="HTTP 服务">
-        <div className="flex items-center gap-2 text-[11px]">
-          <span className="text-zinc-300">{status?.addr ?? "-"}</span>
-          <span className="text-zinc-500">
-            {status?.enabled ? "随岛启动" : "已关闭"} · 端口 {status?.port ?? "-"}
-          </span>
-          <button
-            type="button"
-            onClick={async (event) => {
-              event.stopPropagation();
-              await api.setRuntime({ enabled: !status?.enabled });
-              toast.success("已保存，重启岛后生效");
-              onChange();
-            }}
-            className="ml-auto shrink-0 rounded-md bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/16"
-          >
-            {status?.enabled ? "关闭服务" : "开启服务"}
-          </button>
-        </div>
-        <p className="mt-1.5 text-[10px] text-zinc-500">
-          客户端 base URL 指过来即可：`/v1/chat/completions`、`/v1/messages`、`/v1/responses`。
-        </p>
+        {/* 地址显示**实际监听**的（端口被占用会回退，配置端口≠实际端口）；
+            点击即复制。内网开关开着时再给一行局域网地址。 */}
+        {(() => {
+          const addr = status?.addr ?? "-";
+          return (
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-2 text-[11px]">
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void navigator.clipboard?.writeText(addr);
+                    toast.success(`已复制 ${addr}`);
+                  }}
+                  title="点击复制"
+                  className="min-w-0 flex-1 truncate rounded-md bg-white/[0.04] px-2 py-1 text-left font-mono text-[11px] text-zinc-100 hover:bg-white/10"
+                >
+                  {addr}
+                </button>
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void navigator.clipboard?.writeText(addr);
+                    toast.success(`已复制 ${addr}`);
+                  }}
+                  className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-[10px] text-zinc-300 hover:bg-white/16"
+                >
+                  复制
+                </button>
+                <button
+                  type="button"
+                  onClick={async (event) => {
+                    event.stopPropagation();
+                    await api.setRuntime({ enabled: !status?.enabled });
+                    toast.success("已保存，重启岛后生效");
+                    onChange();
+                  }}
+                  className="shrink-0 rounded-md bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/16"
+                >
+                  {status?.enabled ? "关闭服务" : "开启服务"}
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2 text-[10px] text-zinc-500">
+                <span>
+                  {status?.enabled ? "随岛启动" : "已关闭"} · 实际端口{" "}
+                  {status?.actual_port ?? status?.port ?? "-"}
+                  {(status?.actual_port ?? status?.port) !== status?.port &&
+                    status?.port !== undefined &&
+                    `（配置的 ${status.port} 被占用，已回退）`}
+                </span>
+              </div>
+
+              {/* 内网访问：绑 0.0.0.0，给出可复制的局域网地址 */}
+              <div className="flex items-center gap-2 text-[10px]">
+                <button
+                  type="button"
+                  onClick={async (event) => {
+                    event.stopPropagation();
+                    await api.setRuntime({ allowLan: !status?.allow_lan });
+                    toast.success(
+                      status?.allow_lan ? "已关闭内网访问，重启岛后生效" : "已开启内网访问，重启岛后生效",
+                    );
+                    onChange();
+                  }}
+                  className={`shrink-0 rounded-md px-2 py-0.5 text-[10px] transition-colors ${
+                    status?.allow_lan
+                      ? "bg-emerald-400/20 text-emerald-200 hover:bg-emerald-400/30"
+                      : "bg-white/8 text-zinc-400 hover:bg-white/14"
+                  }`}
+                >
+                  {status?.allow_lan ? "内网访问：开" : "内网访问：关"}
+                </button>
+                {status?.allow_lan && status?.lan_addr && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void navigator.clipboard?.writeText(status.lan_addr ?? "");
+                        toast.success(`已复制 ${status.lan_addr}`);
+                      }}
+                      title="点击复制"
+                      className="min-w-0 flex-1 truncate rounded-md bg-white/[0.04] px-2 py-1 text-left font-mono text-sky-200/90 hover:bg-white/10"
+                    >
+                      {status.lan_addr}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void navigator.clipboard?.writeText(status.lan_addr ?? "");
+                        toast.success(`已复制 ${status.lan_addr}`);
+                      }}
+                      className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-zinc-300 hover:bg-white/16"
+                    >
+                      复制
+                    </button>
+                  </>
+                )}
+                {status?.allow_lan && !status?.lan_addr && (
+                  <span className="text-amber-200/80">重启岛后显示内网地址</span>
+                )}
+              </div>
+              {status?.allow_lan && (status?.api_keys ?? []).length === 0 && (
+                <p className="text-[10px] text-amber-200/80">
+                  内网开放时建议在下方配置 API Key —— 否则同一局域网内的任何人都能调用号池。
+                </p>
+              )}
+              <p className="text-[10px] text-zinc-500">
+                客户端 base URL 指过来即可：`/v1/chat/completions`、`/v1/messages`、`/v1/responses`。
+              </p>
+            </div>
+          );
+        })()}
       </Panel>
 
       <Panel title="下游 API Key">

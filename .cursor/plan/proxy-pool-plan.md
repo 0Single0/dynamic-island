@@ -32,7 +32,7 @@
 | 第二渠道（qoder） | ⬜ | 等 qoder 的接入资料；扩展机制与配置已就绪（写适配器 + registry + 配置，核心零改动） |
 | 硬化（压测 / 故障演练 / 面板在真机上的视觉验收） | ⬜ | — |
 
-当前验证：`cargo test --lib` 213 通过（gateway 150 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+当前验证：`cargo test --lib` 215 通过（gateway 150 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
 
 **探针的组织方式（2026-10-10）**：真实账号探针集中在 `gateway/channels/workbuddy/tasks.rs` 底部的 `mod probe`，共用一份 `Fixture`（从应用自己的库里读 wb-cn 账号）—— 早先 6 个探针各抄一份装配样板，光样板就 300 行，把文件顶到 1000 行上限以上。探针**刻意不写断言**：它们的用途是观察上游真实字段（accept_status 取值、claim 幂等返回），断言写死了反而会掩盖上游变化。铁律不变：**枚举值/字段名一律先探针看真的，再写进代码** —— `accept_status` 与 `already_claimed` 都是这么定的。
 

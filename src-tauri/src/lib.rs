@@ -195,6 +195,8 @@ pub fn run() {
             gateway::commands::gateway_recent_decisions,
             gateway::commands::gateway_recent_usage,
             gateway::commands::gateway_usage_series,
+            gateway::commands::gateway_usage_series_range,
+            gateway::commands::gateway_usage_summary_range,
             gateway::commands::gateway_usage_summary,
             gateway::commands::gateway_paths,
             gateway::commands::gateway_scheduler_snapshot,
