@@ -112,6 +112,12 @@ impl GatewayState {
             // 只设连接超时：流式响应是长连接，任何总超时都会把长回答掐断。
             .pool_max_idle_per_host(8)
             .user_agent("dynamic-island-gateway/0.1")
+            // **禁用系统/环境代理**：上游（腾讯系）在国内，直连本来就能到；
+            // reqwest 默认会读 Windows 系统代理 —— 开梯子时请求全走
+            // 127.0.0.1:10809，梯子一关连接立刻全断（表现为
+            // "[Network] error sending request"，关梯子后网关就"用不了"）。
+            // 需要走代理的渠道将来可通过渠道配置显式指定 proxy_slot。
+            .no_proxy()
             .build()
             .map_err(|error| GatewayError::internal(format!("HTTP 客户端构建失败：{error}")))?;
 
