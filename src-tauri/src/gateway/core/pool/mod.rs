@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::gateway::{config::CooldownConfig, timeutil::now_ms};
 
-pub use account::{AccountKey, AccountView, InflightGuard, PoolAccount};
+pub use account::{humanize, AccountKey, AccountView, InflightGuard, PoolAccount};
 
 pub struct AccountPool {
     accounts: RwLock<Vec<Arc<PoolAccount>>>,
@@ -89,7 +89,7 @@ mod tests {
                 let mut account = PoolAccount::new(*channel, *uid);
                 account.nickname = (*uid).to_string();
                 account.requires_credential = false;
-                account.max_inflight = 1;
+                account.set_max_inflight(1);
                 Arc::new(account)
             })
             .collect();

@@ -410,12 +410,14 @@ fn perform(targets: &mut Targets, call: Call, stop: &AtomicBool) -> Result<Value
 }
 
 pub async fn execute(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     targets: Arc<Mutex<Targets>>,
     call: Call,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> ToolExecutionResult {
-    let approval = {
+    // 执行前不再请求用户确认：目标合法性由 `guard` 的窗口/进程校验保证，
+    // 这里只确认目标仍属于本次运行，失效时返回 STALE_TARGET。
+    {
         let locked = match targets.try_lock() {
             Ok(v) => v,
             Err(_) => {
@@ -427,20 +429,14 @@ pub async fn execute(
             }
         };
         let target = match &call {
-            Call::Inspect(args) => locked.window(&args.window_id).map(|w| format!("读取窗口控件：{}", w.title)),
-            Call::Text(args) => locked.element(&args.element_id).map(|e| format!("读取控件文本：{} / {}", e.window.title, e.name)),
-            Call::Invoke(args) => locked.element(&args.element_id).map(|e| format!("操作控件：{} / {}\n\n动作：Invoke（点击/执行）。此动作可能提交、删除或发送，请核对目标。", e.window.title, e.name)),
-            Call::SetValue(args) => locked.element(&args.element_id).map(|e| format!("修改输入值：{} / {}\n\n内容预览：{}", e.window.title, e.name, args.value.chars().take(1000).collect::<String>())),
-            Call::List => Ok(String::new()),
+            Call::Inspect(args) => locked.window(&args.window_id).map(|_| ()),
+            Call::Text(args) => locked.element(&args.element_id).map(|_| ()),
+            Call::Invoke(args) => locked.element(&args.element_id).map(|_| ()),
+            Call::SetValue(args) => locked.element(&args.element_id).map(|_| ()),
+            Call::List => Ok(()),
         };
-        match target {
-            Ok(v) => v,
-            Err(e) => return ToolExecutionResult::failure("STALE_TARGET", e, false),
-        }
-    };
-    if !approval.is_empty() {
-        if let Err(error) = native_dialog::confirm(app, approval, cancelled).await {
-            return error;
+        if let Err(e) = target {
+            return ToolExecutionResult::failure("STALE_TARGET", e, false);
         }
     }
     if cancelled() {

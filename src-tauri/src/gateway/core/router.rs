@@ -98,10 +98,12 @@ fn matrix_model_matches(route: &ModelRoute, public_model: &str) -> bool {
 /// 分层 + 层内打分加权随机。
 ///
 /// 分层在前：priority 表达成本/质量档（免费档 > 付费档），跨档不做"偶尔选便宜的"。
+/// 选号。可用性检查一律用**候选自己的 upstream 模型名** —— 模型级冷却就是按
+/// upstream 名记的（写进池子的也是它），拿对外名去查会永远查不到，
+/// 结果就是"明明限流了却还在选它、一直吃 429"。
 pub fn pick(
     candidates: &[Candidate],
     tried: &HashSet<AccountKey>,
-    model: &str,
     hint: Option<&AccountKey>,
     scoring: &ScoringConfig,
     seed: u64,
@@ -111,7 +113,9 @@ pub fn pick(
         .iter()
         .filter(|candidate| {
             !tried.contains(&candidate.account.key)
-                && candidate.account.is_ready(model, now)
+                && candidate
+                    .account
+                    .is_ready(&candidate.route.upstream_model, now)
                 && !candidate.account.inflight_full()
         })
         .collect();
@@ -141,7 +145,7 @@ pub fn score(candidate: &Candidate, hint: Option<&AccountKey>, scoring: &Scoring
     let mut value = candidate.route.weight.max(1) as f64;
 
     // 负载：在飞占满的账号要被推后，避免把同一账号打满。
-    let limit = candidate.account.max_inflight.max(1) as f64;
+    let limit = candidate.account.max_inflight().max(1) as f64;
     value -= (candidate.account.inflight() as f64 / limit) * scoring.load_weight;
 
     // 缓存亲和：同账号 > 同渠道 > 换渠道（换渠道必丢缓存，代价最高）。
@@ -217,6 +221,7 @@ mod tests {
         channels::ModelCapabilities,
         config::{AffinityConfig, CooldownConfig},
         core::matrix::{ChannelCatalog, ModelLimits},
+        errors::{ErrorKind, ErrorScope, GatewayError},
     };
 
     fn account(channel: &str, uid: &str, priority: u32, weight: u32) -> Arc<PoolAccount> {
@@ -224,7 +229,7 @@ mod tests {
         account.requires_credential = false;
         account.priority = priority;
         account.weight = weight;
-        account.max_inflight = 2;
+        account.set_max_inflight(2);
         Arc::new(account)
     }
 
@@ -402,14 +407,7 @@ mod tests {
         let scoring = ScoringConfig::default();
 
         for seed in 0..20u64 {
-            let (picked, guard) = pick(
-                &candidates,
-                &HashSet::new(),
-                "glm-5.3",
-                None,
-                &scoring,
-                seed * 7919,
-            )
+            let (picked, guard) = pick(&candidates, &HashSet::new(), None, &scoring, seed * 7919)
             .expect("有候选");
             assert_eq!(picked.route.priority, 100, "不该跨档选到付费渠道");
             drop(guard);
@@ -418,8 +416,42 @@ mod tests {
         // 已试过最高档 → 落到下一档，而不是返回 None。
         let mut tried = HashSet::new();
         tried.insert(free.account.key.clone());
-        let (picked, _guard) = pick(&candidates, &tried, "glm-5.3", None, &scoring, 1).expect("下一档");
+        let (picked, _guard) = pick(&candidates, &tried, None, &scoring, 1).expect("下一档");
         assert_eq!(picked.route.priority, 50);
+    }
+
+    /// 模型级限流必须真的影响选号：写冷却用 upstream 名，查的时候也得用同一个名字。
+    /// （早先一边用对外名、一边用 upstream 名，冷却记了却查不到，账号继续吃 429。）
+    #[test]
+    fn model_park_hides_that_model_but_not_siblings() {
+        let account = account("wb-cn", "u1", 100, 1);
+        account.apply_error(
+            &GatewayError::new(
+                ErrorKind::RateLimited,
+                ErrorScope::AccountModel("glm-5.3-upstream".into()),
+                429,
+                "该模型被上游限流",
+                true,
+            ),
+            &CooldownConfig::default(),
+            now_ms(),
+        );
+        let parked = candidate(
+            Arc::clone(&account),
+            "glm-5.3",
+            "glm-5.3-upstream",
+            100,
+        );
+        let sibling = candidate(Arc::clone(&account), "deepseek-v4.1-flash", "ds-upstream", 100);
+        let scoring = ScoringConfig::default();
+
+        assert!(
+            pick(&[parked], &HashSet::new(), None, &scoring, 1).is_none(),
+            "被限流的模型不能再被选中"
+        );
+        let (picked, _guard) = pick(&[sibling], &HashSet::new(), None, &scoring, 1)
+            .expect("同账号的其他模型照常可用");
+        assert_eq!(picked.route.upstream_model, "ds-upstream");
     }
 
     #[test]
@@ -482,7 +514,6 @@ mod tests {
         assert!(pick(
             &candidates,
             &HashSet::new(),
-            "glm-5.3",
             None,
             &ScoringConfig::default(),
             1

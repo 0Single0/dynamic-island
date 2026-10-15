@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState, type Dispatch, type InputHTMLAttributes, type ReactNode, type SetStateAction } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
-import { Bot, Database, Keyboard, LockKeyhole, MonitorCog, Network, Palette, Pencil, Plug, Plus, Save, ShieldCheck, SlidersHorizontal, Trash2, X } from "lucide-react";
-import { tauriInvoke, type ModelRecord, type ProviderRecord } from "@/agent/api";
-import { Select } from "@/components/common/Select";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { listen } from "@tauri-apps/api/event";
+import { Bot, Database, Keyboard, LockKeyhole, MonitorCog, Network, Palette, Plug, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { SearchSettings } from "./components/SearchSettings";
 import { PluginCatalog } from "./components/PluginCatalog";
-import { forgetIslandPanel } from "@/components/island/panelState";
+import { ModelSettings } from "./components/ModelSettings";
+import { SETTINGS_SECTION_EVENT, SETTINGS_WINDOW_LABEL, currentWindowLabel } from "@/api/window";
+import { WindowControls, useOpaqueWindowBackground } from "@/components/common/WindowChrome";
 
 const sections = [
   { id: "general", label: "通用", icon: SlidersHorizontal }, { id: "ai-models", label: "AI 与模型", icon: Bot },
@@ -14,66 +15,121 @@ const sections = [
   { id: "network", label: "网络与代理", icon: Network }, { id: "privacy", label: "数据与隐私", icon: LockKeyhole },
   { id: "appearance", label: "外观", icon: Palette }, { id: "about", label: "关于", icon: MonitorCog },
 ];
-const protocolOptions = [
-  { value: "chat-completions", label: "OpenAI Chat Completions", description: "/v1/chat/completions" },
-  { value: "responses", label: "OpenAI Responses", description: "/v1/responses" },
-  { value: "anthropic-messages", label: "Anthropic Messages", description: "/v1/messages" },
-];
-const blankProvider = { name: "", protocol: "chat-completions", baseUrl: "https://api.openai.com/v1", apiKey: "" };
-const blankModel = { id: undefined as string | undefined, modelId: "", displayName: "", contextWindow: "128000" };
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return <label className="grid gap-1.5 text-xs text-zinc-400"><span>{label}</span>{children}</label>;
-}
-function TextInput(props: InputHTMLAttributes<HTMLInputElement>) {
-  return <input {...props} className={`w-full rounded-lg border border-white/[0.1] bg-white/[0.025] px-3 py-2.5 text-sm text-zinc-200 outline-none transition placeholder:text-zinc-600 focus:border-sky-300/45 ${props.className ?? ""}`} />;
-}
-
-function ModelModal({ form, setForm, onClose, onSave }: { form: typeof blankModel; setForm: Dispatch<SetStateAction<typeof blankModel>>; onClose: () => void; onSave: () => void }) {
-  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/65 p-6 backdrop-blur-sm"><div className="w-full max-w-xl rounded-2xl border border-white/[0.12] bg-[#252629] p-5 shadow-2xl shadow-black/50">
-    <div className="flex items-center justify-between"><h2 className="text-base font-semibold text-zinc-100">{form.id ? "编辑模型" : "添加模型"}</h2><button type="button" onClick={onClose} className="rounded-lg p-1.5 text-zinc-500 hover:bg-white/[0.08] hover:text-zinc-200"><X className="h-4 w-4" /></button></div>
-    <div className="mt-5 grid gap-4"><Field label="模型 ID"><TextInput autoFocus value={form.modelId} onChange={(event) => setForm((current) => ({ ...current, modelId: event.target.value }))} placeholder="例如 deepseek-v4.1-flash" /></Field><Field label="显示名称"><TextInput value={form.displayName} onChange={(event) => setForm((current) => ({ ...current, displayName: event.target.value }))} placeholder="留空则使用模型 ID" /></Field><Field label="上下文窗口"><TextInput inputMode="numeric" value={form.contextWindow} onChange={(event) => setForm((current) => ({ ...current, contextWindow: event.target.value }))} placeholder="128000" /></Field><div className="rounded-lg border border-white/[0.08] bg-white/[0.025] px-3 py-2.5 text-xs text-zinc-400">输入类型：文本　·　输出类型：文本</div></div>
-    <div className="mt-6 flex justify-end gap-2"><button type="button" onClick={onClose} className="rounded-lg border border-white/[0.1] px-3 py-2 text-xs text-zinc-400 hover:bg-white/[0.06]">取消</button><button type="button" onClick={onSave} className="rounded-lg bg-zinc-100 px-3 py-2 text-xs font-medium text-zinc-900 hover:bg-white"><Save className="mr-1.5 inline h-3.5 w-3.5" />保存</button></div>
-  </div></div>;
-}
-
+/**
+ * 设置中心（`#/settings`）。
+ *
+ * 这是**独立窗口**页面，不是岛体窗口里的一条路由：
+ * 岛体窗口被钉死成 812×512 的透明无边框矩形（置顶、不可缩放、不在任务栏），
+ * 多栏表单挤进去只能靠压缩字号和行高，且打开设置会卸载整个岛体。
+ * 独立窗口有正常尺寸、进任务栏、可被别的窗口盖住，岛体也不受影响。
+ */
 export default function SettingsPage() {
-  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   // 分类以 URL 为准：切分类即一次站内导航，返回键才能逐个退回上一个分类。
   const requestedSection = searchParams.get("section") ?? "";
   const active = sections.some((section) => section.id === requestedSection) ? requestedSection : "general";
-  const [providers, setProviders] = useState<ProviderRecord[]>([]);
-  const [models, setModels] = useState<ModelRecord[]>([]);
-  const [activeProviderId, setActiveProviderId] = useState("");
-  const [providerForm, setProviderForm] = useState(blankProvider);
-  const [modelForm, setModelForm] = useState(blankModel);
-  const [notice, setNotice] = useState("");
-  const [modelModalOpen, setModelModalOpen] = useState(false);
   const activeSection = sections.find((section) => section.id === active) ?? sections[0];
-  const activeProvider = providers.find((provider) => provider.id === activeProviderId);
-  const providerModels = useMemo(() => models.filter((model) => model.providerId === activeProviderId), [models, activeProviderId]);
+  const [pushedSection, setPushedSection] = useState<string | null>(null);
 
-  useEffect(() => { void Promise.all([tauriInvoke<ProviderRecord[]>("agent_list_provider_configs"), tauriInvoke<ModelRecord[]>("agent_list_model_configs")]).then(([nextProviders, nextModels]) => { setProviders(nextProviders); setModels(nextModels); setActiveProviderId(nextProviders[0]?.id ?? ""); }).catch(() => undefined); }, []);
-  useEffect(() => { if (activeProvider) setProviderForm({ name: activeProvider.name, protocol: activeProvider.protocol, baseUrl: activeProvider.baseUrl, apiKey: "" }); }, [activeProviderId, activeProvider]);
+  useOpaqueWindowBackground();
 
-  const saveProvider = async () => { setNotice(""); try { const provider = await tauriInvoke<ProviderRecord>("agent_save_provider_config", { input: { ...providerForm, id: activeProvider?.id, enabled: true } }); setProviders((current) => [...current.filter((item) => item.id !== provider.id), provider]); setActiveProviderId(provider.id); setProviderForm((current) => ({ ...current, apiKey: "" })); setNotice("供应商已保存，API Key 仅写入系统凭据库。"); } catch (error) { setNotice(error instanceof Error ? error.message : "保存供应商失败"); } };
-  const saveModel = async () => { if (!activeProviderId || !modelForm.modelId.trim()) return; try { const model = await tauriInvoke<ModelRecord>("agent_save_model_config", { input: { ...modelForm, providerId: activeProviderId, contextWindow: Number(modelForm.contextWindow) || null, enabled: true } }); setModels((current) => [...current.filter((item) => item.id !== model.id), model]); setModelForm(blankModel); setModelModalOpen(false); } catch (error) { setNotice(error instanceof Error ? error.message : "保存模型失败"); } };
-  const editModel = (model: ModelRecord) => { setModelForm({ id: model.id, modelId: model.modelId, displayName: model.displayName, contextWindow: model.contextWindow?.toString() ?? "" }); setModelModalOpen(true); };
-  const deleteModel = async (model: ModelRecord) => { try { await tauriInvoke<void>("agent_delete_model_config", { modelId: model.id }); setModels((current) => current.filter((item) => item.id !== model.id)); } catch (error) { setNotice(error instanceof Error ? error.message : "删除模型失败"); } };
-  const addProvider = () => { setActiveProviderId(""); setProviderForm(blankProvider); setNotice(""); };
+  // 设置窗口是单例：从岛体再点“打开模型设置”时不会重建窗口，
+  // 只会发这个事件，由这里把分类切过去。
+  useEffect(() => {
+    if (currentWindowLabel() !== SETTINGS_WINDOW_LABEL) return;
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void listen<string>(SETTINGS_SECTION_EVENT, ({ payload }) => {
+      if (sections.some((section) => section.id === payload)) setPushedSection(payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, []);
 
-  // 关闭设置：清掉岛体面板记忆，回首页是收起的胶囊。
-  const closeSettings = () => { forgetIslandPanel(); navigate("/"); };
+  useEffect(() => {
+    if (!pushedSection) return;
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      next.set("section", pushedSection);
+      return next;
+    });
+    setPushedSection(null);
+  }, [pushedSection, setSearchParams]);
+
   // 分类以 URL 为准（深链进入、刷新都保持当前位置），每次切换压入一条历史记录；重复点当前分类不再压栈。
-  const openSection = (id: string) => { if (id === active) return; const next = new URLSearchParams(searchParams); next.set("section", id); setSearchParams(next); };
+  const openSection = (id: string) => {
+    if (id === active) return;
+    const next = new URLSearchParams(searchParams);
+    next.set("section", id);
+    setSearchParams(next);
+  };
 
-  return <div data-settings-page className="m-2 flex h-[calc(100%-1rem)] w-[calc(100%-1rem)] overflow-hidden rounded-2xl border border-white/[0.12] bg-[#151516] text-zinc-100 shadow-2xl shadow-black/40">
-    <aside className="flex w-44 shrink-0 flex-col border-r border-white/[0.08] bg-black/15 p-2.5"><div className="mb-4 flex items-center gap-2 px-1.5 pt-1"><div className="flex h-7 w-7 items-center justify-center rounded-lg bg-sky-300/12 text-sky-200"><Bot className="h-4 w-4" /></div><div><div className="text-sm font-semibold">设置中心</div><div className="text-[10px] text-zinc-500">Dynamic Island</div></div></div><nav className="space-y-1">{sections.map((section) => { const Icon = section.icon; return <button key={section.id} type="button" onClick={() => openSection(section.id)} className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition ${active === section.id ? "bg-white/[0.09] text-white" : "text-zinc-500 hover:bg-white/[0.045] hover:text-zinc-200"}`}><Icon className="h-3.5 w-3.5" />{section.label}</button>; })}</nav></aside>
-    <main className="flex min-w-0 flex-1 flex-col overflow-hidden [scrollbar-color:rgba(255,255,255,.18)_transparent]">{active === "ai-models" ? <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col px-7 pb-7 pt-6"><header className="mb-5 flex shrink-0 items-start justify-between"><div><div className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Settings / AI</div><h1 className="mt-1 text-2xl font-semibold">模型设置</h1><p className="mt-1 text-xs text-zinc-500">管理自定义模型供应商，配置后可在输入框的模型菜单中选择使用。</p></div><div className="flex items-center gap-1"><button type="button" onClick={closeSettings} title="关闭设置" aria-label="关闭设置" className="grid h-8 w-8 place-items-center rounded-lg text-zinc-400 hover:bg-white/[0.08] hover:text-white"><X className="h-4 w-4" /></button></div></header>
-      <div className="grid min-h-0 flex-1 grid-cols-[150px_minmax(0,1fr)] overflow-hidden rounded-xl border border-white/[0.12] bg-[#242425] shadow-2xl shadow-black/20"><aside className="overflow-y-auto border-r border-white/[0.1] p-2"><div className="px-2 py-1.5 text-xs font-medium text-zinc-500">供应商</div>{providers.map((provider) => <button key={provider.id} type="button" onClick={() => setActiveProviderId(provider.id)} className={`flex h-10 w-full items-center gap-2 rounded-lg px-2 text-left text-xs transition ${activeProviderId === provider.id ? "bg-white/[0.09] text-zinc-100" : "text-zinc-400 hover:bg-white/[0.05] hover:text-zinc-200"}`}><span className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-white/[0.08] text-[11px] text-zinc-300">◇</span><span className="min-w-0 flex-1 truncate">{provider.name}</span><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${provider.hasApiKey ? "bg-emerald-400" : "bg-zinc-600"}`} /></button>)}<button type="button" onClick={addProvider} className={`mt-1 flex h-10 w-full items-center gap-2 rounded-lg border border-white/[0.14] px-2 text-xs text-zinc-300 hover:bg-white/[0.06] ${!activeProviderId ? "bg-white/[0.06]" : ""}`}><Plus className="h-3.5 w-3.5" />添加</button></aside>
-        <section className="min-h-0 overflow-y-auto p-4"><div className="mb-4"><h2 className="text-base font-semibold">{activeProviderId ? "编辑模型供应商" : "添加模型供应商"}</h2><p className="mt-1 text-xs text-zinc-500">配置一个完全自定义的 API 端点和初始模型。</p></div><div className="grid max-w-2xl gap-2"><Field label="名称"><TextInput value={providerForm.name} onChange={(event) => setProviderForm((current) => ({ ...current, name: event.target.value }))} placeholder="例如：智谱 GLM" /></Field><Field label="Base URL"><TextInput value={providerForm.baseUrl} onChange={(event) => setProviderForm((current) => ({ ...current, baseUrl: event.target.value }))} placeholder="https://api.example.com/v1" /></Field><Field label="API Key"><TextInput type="password" value={providerForm.apiKey} onChange={(event) => setProviderForm((current) => ({ ...current, apiKey: event.target.value }))} placeholder={activeProvider?.hasApiKey ? "已配置，留空则保持不变" : "输入 API Key"} /></Field><Field label="API 格式"><Select value={providerForm.protocol} options={protocolOptions} onChange={(value) => setProviderForm((current) => ({ ...current, protocol: value }))} /></Field></div><div className="mt-4 flex max-w-2xl items-center justify-between"><div><h3 className="text-sm font-medium text-zinc-300">模型列表</h3><p className="mt-0.5 text-xs text-zinc-500">添加模型后即可在聊天页底部选择。</p></div><button type="button" disabled={!activeProviderId} onClick={() => { setModelForm(blankModel); setModelModalOpen(true); }} className="rounded-lg bg-white/[0.09] px-2.5 py-1.5 text-xs text-zinc-200 hover:bg-white/[0.14] disabled:cursor-not-allowed disabled:opacity-40"><Plus className="mr-1 inline h-3.5 w-3.5" />添加模型</button></div><div className="mt-2 grid max-w-2xl gap-1">{providerModels.length ? providerModels.map((model) => <div key={model.id} className="flex h-10 items-center gap-2 rounded-lg border border-white/[0.08] bg-black/10 px-2.5"><div className="min-w-0 flex-1 truncate text-xs text-zinc-200">{model.displayName || model.modelId}</div><button type="button" onClick={() => editModel(model)} title="编辑模型" aria-label={`编辑 ${model.displayName || model.modelId}`} className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 hover:bg-white/[0.08] hover:text-zinc-100"><Pencil className="h-3.5 w-3.5" /></button><button type="button" onClick={() => void deleteModel(model)} title="删除模型" aria-label={`删除 ${model.displayName || model.modelId}`} className="grid h-7 w-7 place-items-center rounded-md text-zinc-500 hover:bg-red-400/10 hover:text-red-300"><Trash2 className="h-3.5 w-3.5" /></button><span className={`h-1.5 w-1.5 rounded-full ${model.enabled ? "bg-emerald-400" : "bg-zinc-600"}`} title={model.enabled ? "可用" : "已停用"} /></div>) : <div className="rounded-lg border border-dashed border-white/[0.12] px-3 py-5 text-center text-xs text-zinc-500">当前没有配置模型，添加模型后可在聊天页使用。</div>}</div>{notice && <div className="mt-3 max-w-2xl rounded-lg border border-sky-300/15 bg-sky-300/8 px-3 py-2 text-xs text-sky-100">{notice}</div>}<div className="mt-4 flex max-w-2xl justify-end"><button type="button" onClick={() => void saveProvider()} className="rounded-lg bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-900 hover:bg-white"><Save className="mr-1.5 inline h-3.5 w-3.5" />保存供应商</button></div></section></div>
-    </div> : <div className="mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col overflow-y-auto p-8"><header className="mb-7 flex shrink-0 items-start justify-between"><div><div className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Settings</div><h1 className="mt-1 text-xl font-semibold">{activeSection.label}</h1><p className="mt-1 text-xs text-zinc-500">全局设置中心，后续 Agent、插件和数据策略都从这里管理。</p></div><div className="flex items-center gap-1"><button type="button" onClick={closeSettings} title="关闭设置" aria-label="关闭设置" className="grid h-8 w-8 place-items-center rounded-lg text-zinc-400 hover:bg-white/[0.08] hover:text-white"><X className="h-4 w-4" /></button></div></header>{active === "network" ? <SearchSettings /> : active === "plugins" ? <PluginCatalog /> : <section className="rounded-xl border border-white/[0.08] bg-white/[0.035] p-5"><h2 className="text-sm font-medium">{activeSection.label}</h2><p className="mt-2 text-xs leading-5 text-zinc-500">这一分类的详细配置将在对应阶段接入。当前页面已经预留完整设置中心结构。</p></section>}</div>}</main>
-    {modelModalOpen && <ModelModal form={modelForm} setForm={setModelForm} onClose={() => setModelModalOpen(false)} onSave={() => void saveModel()} />}
-  </div>;
+  return (
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-[#131315] text-zinc-100">
+      {/* 无边框窗口：这一条既是标题栏也是拖拽手柄。 */}
+      <div
+        data-tauri-drag-region
+        className="flex h-10 shrink-0 cursor-grab items-center gap-2 border-b border-white/8 px-3 active:cursor-grabbing"
+      >
+        <span className="grid h-5 w-5 place-items-center rounded bg-sky-300/15 text-sky-200"><Bot className="h-3 w-3" /></span>
+        <span className="text-[12px] font-medium text-zinc-200">设置中心</span>
+        <span className="text-[11px] text-zinc-600">·</span>
+        <span className="text-[11px] text-zinc-500">{activeSection.label}</span>
+        <span className="ml-auto">
+          <WindowControls />
+        </span>
+      </div>
+
+      <div className="flex min-h-0 flex-1">
+        <aside className="flex w-52 shrink-0 flex-col overflow-y-auto border-r border-white/8 bg-black/20 p-2.5">
+          <nav className="space-y-0.5">
+            {sections.map((section) => {
+              const Icon = section.icon;
+              return (
+                <button
+                  key={section.id}
+                  type="button"
+                  onClick={() => openSection(section.id)}
+                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition ${active === section.id ? "bg-white/[0.09] text-white" : "text-zinc-500 hover:bg-white/[0.045] hover:text-zinc-200"}`}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  {section.label}
+                </button>
+              );
+            })}
+          </nav>
+        </aside>
+
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden p-7">
+          {active === "ai-models" ? (
+            <ModelSettings />
+          ) : (
+            <div className="mx-auto min-h-0 w-full max-w-4xl flex-1 overflow-y-auto">
+              <header className="mb-6">
+                <div className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Settings</div>
+                <h1 className="mt-1 text-xl font-semibold">{activeSection.label}</h1>
+                <p className="mt-1 text-xs text-zinc-500">全局设置中心，后续 Agent、插件和数据策略都从这里管理。</p>
+              </header>
+              {active === "network" ? (
+                <SearchSettings />
+              ) : active === "plugins" ? (
+                <PluginCatalog />
+              ) : (
+                <section className="rounded-xl border border-white/[0.08] bg-white/[0.035] p-5">
+                  <h2 className="text-sm font-medium">{activeSection.label}</h2>
+                  <p className="mt-2 text-xs leading-5 text-zinc-500">这一分类的详细配置将在对应阶段接入。当前页面已经预留完整设置中心结构。</p>
+                </section>
+              )}
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
 }

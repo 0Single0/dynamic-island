@@ -57,10 +57,49 @@ pub async fn fetch(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    // 上游把每个资源包的容量直接放在 summary 的 Packages[] 里：
+    // CycleTotalCapacity / CycleRemainCapacity / CycleUsedCapacity（字符串数字）。
+    // 这是**唯一可靠的来源** —— 明细接口（free/paid-packages）才用 CycleCapacity* 那套命名，
+    // 而且没有 PackageCode 时根本不返回明细。早期版本只看明细，于是积分永远是 0。
     let mut total = 0.0f64;
     let mut remaining = 0.0f64;
     let mut used = 0.0f64;
+    let mut summary_packages = 0usize;
     let mut unit = String::new();
+    for package in data
+        .get("Packages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let pick = |key: &str| -> f64 {
+            package
+                .get(key)
+                .map(|value| match value {
+                    Value::Number(number) => number.as_f64().unwrap_or(0.0),
+                    Value::String(text) => text.parse::<f64>().unwrap_or(0.0),
+                    _ => 0.0,
+                })
+                .unwrap_or(0.0)
+        };
+        let size = pick("CycleTotalCapacity");
+        let remain = pick("CycleRemainCapacity");
+        let spent = pick("CycleUsedCapacity");
+        if size <= 0.0 && remain <= 0.0 && spent <= 0.0 {
+            continue;
+        }
+        summary_packages += 1;
+        total += size;
+        remaining += remain;
+        used += spent;
+        if unit.is_empty() {
+            if let Some(value) = package.get("CapacityUnit").and_then(Value::as_str) {
+                if !value.is_empty() {
+                    unit = value.to_string();
+                }
+            }
+        }
+    }
     let mut free_count = 0usize;
     let mut paid_count = 0usize;
 
@@ -104,13 +143,14 @@ pub async fn fetch(
     }
 
     let mut details = vec![
-        ("免费资源包".to_string(), format!("{free_count} 个")),
-        ("付费资源包".to_string(), format!("{paid_count} 个")),
+        ("资源包".to_string(), format!("{summary_packages} 个")),
+        ("免费包明细".to_string(), format!("{free_count} 个")),
+        ("付费包明细".to_string(), format!("{paid_count} 个")),
     ];
     if paid_user {
         details.push(("账号类型".to_string(), "付费用户".to_string()));
     }
-    if free_count == 0 && paid_count == 0 {
+    if summary_packages == 0 {
         details.push((
             "说明".to_string(),
             "个人计费接口没有资源包；企业账号请在企业用量里查看".to_string(),
@@ -231,6 +271,47 @@ mod tests {
     }
 
     #[test]
+    fn summary_package_capacities_are_read_from_the_real_shape() {
+        // 上游真实响应（2026-10-10 实测）：容量在 data.Packages[] 的
+        // CycleTotalCapacity / CycleRemainCapacity / CycleUsedCapacity 上，
+        // 值是**字符串数字**。早期版本只看明细接口 → 积分永远是 0。
+        let data = json!({
+            "IsPaidUser": false,
+            "Packages": [
+                {"CapacityUnit": "credits", "CycleTotalCapacity": "2200",
+                 "CycleRemainCapacity": "847.79000074", "CycleUsedCapacity": "1352.20999926",
+                 "PackageCode": "TCACA_code_007_x"},
+                {"CapacityUnit": "credits", "CycleTotalCapacity": "500",
+                 "CycleRemainCapacity": "500", "CycleUsedCapacity": "0",
+                 "PackageCode": "TCACA_code_008_y"}
+            ]
+        });
+        let mut total = 0.0;
+        let mut remaining = 0.0;
+        let mut used = 0.0;
+        for package in data["Packages"].as_array().unwrap() {
+            let pick = |key: &str| -> f64 {
+                package
+                    .get(key)
+                    .map(|value| match value {
+                        Value::Number(number) => number.as_f64().unwrap_or(0.0),
+                        Value::String(text) => text.parse::<f64>().unwrap_or(0.0),
+                        _ => 0.0,
+                    })
+                    .unwrap_or(0.0)
+            };
+            total += pick("CycleTotalCapacity");
+            remaining += pick("CycleRemainCapacity");
+            used += pick("CycleUsedCapacity");
+        }
+        assert!((total - 2700.0).abs() < 0.01, "总量应为 2700，实际 {total}");
+        assert!((remaining - 1347.79).abs() < 0.01, "剩余应为 1347.79，实际 {remaining}");
+        assert!((used - 1352.21).abs() < 0.01, "已用应为 1352.21，实际 {used}");
+        // 关键：这三个字段名一旦写错（如写成 CycleCapacitySize），这里就会失败。
+        assert!(remaining > 0.0, "剩余为 0 说明字段名对不上上游");
+    }
+
+    #[test]
     fn packages_are_found_at_any_depth() {
         let payload = json!({
             "code": 0,
@@ -245,5 +326,74 @@ mod tests {
         // 容器换成 Packages 也一样能找到。
         let payload = json!({"data": {"Packages": [{"PackageCode": "p2", "CapacitySize": 5}]}});
         assert_eq!(collect_packages(&payload).len(), 1);
+    }
+}
+
+/// 手动运行的探针：用本机真实账号打一次上游计费接口，打印原始响应。
+///
+/// 用途：排查"积分一直是 0"这类问题——只有看到上游真实键名才能确认解析对不对。
+/// 运行：`cargo test --lib probe_real_summary -- --ignored --nocapture`
+#[cfg(test)]
+mod probe {
+    use crate::agent::secrets::OsCredentialStore;
+    use crate::gateway::{
+        channels::AccountSnapshot,
+        storage::Storage,
+        timeutil::now_ms,
+    };
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_real_summary() {
+        let dir = dirs_gateway();
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("打开库");
+        let records = storage.list_accounts().expect("读账号");
+        let Some(record) = records.into_iter().find(|r| r.channel_id == "wb-cn") else {
+            panic!("库里没有 wb-cn 账号");
+        };
+        let credential = record.credential.expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+        };
+        let hosts = super::super::identity::hosts(
+            super::super::identity::Realm::Cn,
+            super::super::identity::Outbound::Desktop,
+        );
+        let headers = super::super::identity::billing_headers(&hosts, &account, Some("web"));
+        let client = reqwest::Client::new();
+        let payload = crate::gateway::transport::post_json(
+            &client,
+            &hosts.billing_url("/billing/meter/get-user-resource-summary"),
+            &headers,
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("summary 请求");
+        println!("=== summary 原始响应 ===");
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        let _ = now_ms();
+
+        // 再走完整解析链路，看最终快照。
+        let snapshot = super::fetch(&client, &hosts, &account)
+            .await
+            .expect("额度查询");
+        println!("=== 解析后的额度快照 ===");
+        println!("{}", serde_json::to_string_pretty(&snapshot).unwrap_or_default());
+        let snapshot = snapshot.expect("应有快照");
+        assert!(
+            snapshot.remaining.unwrap_or(0.0) > 0.0,
+            "剩余积分不该是 0（字段名与上游不符时会失败）"
+        );
+    }
+
+    fn dirs_gateway() -> std::path::PathBuf {
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway")
     }
 }

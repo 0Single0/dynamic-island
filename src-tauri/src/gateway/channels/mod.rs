@@ -87,6 +87,59 @@ pub struct ModelCapabilities {
     pub reasoning: bool,
 }
 
+/// 渠道无关的"运营任务"视图：面板的「任务」表格按它渲染。
+///
+/// 各渠道口径不同（workbuddy 是成长任务/签到/猫猫旅行，将来的渠道可能完全不同），
+/// 所以只归一通用字段；渠道特有的说明放 `note` 原样透出。
+/// 自动化做不了的任务也要列出（`automatable=false` + 原因），诚实比假装能做重要。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskInfo {
+    /// 渠道内部的任务编号（accept/claim 用）。
+    pub code: String,
+    pub name: String,
+    /// not_accepted / in_progress / claimable / done / unsupported
+    pub status: String,
+    /// 进度 "2/5"；拿不到就给空串。
+    pub progress: String,
+    /// 奖励积分（0 = 未标注）。
+    pub reward: u32,
+    pub automatable: bool,
+    /// 不能自动化时的原因 / 需要的动作（如"需在桌面端打开资料库"）。
+    pub note: String,
+}
+
+/// 一次任务执行的结果行（面板的执行记录）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskRunResult {
+    pub code: String,
+    pub name: String,
+    /// done / skipped / failed / not_in_window
+    pub status: String,
+    pub message: String,
+    /// 本轮拿到的积分（未领到为 0）。
+    pub earned: u32,
+}
+
+/// 一个**每日动作**（签到 / 猫猫旅行 / 每日活跃对话…）。
+///
+/// 为什么单独一层而不是并进任务清单：任务是"一次性、做完消失"，
+/// 每日动作是"每天都要再做一次"。混在一起就会出现"签完显示已完成"——
+/// 明天明明还得签。所以面板把它们分开列，契约也分开。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DailyAction {
+    /// 渠道内部编号（执行时回传）。
+    pub code: String,
+    pub name: String,
+    /// 用户能做的动作名（"签到" / "领取" / "派出旅行" / "去对话"…）。
+    pub action: String,
+    /// 今天是否已经做过（true 时按钮置灰）。
+    pub done_today: bool,
+    /// 不能自动完成时的原因 / 补充说明（连续天数、剩余次数…）。
+    pub note: String,
+    /// 动作是否可自动执行。
+    pub automatable: bool,
+}
+
 /// 渠道无关的额度快照。
 ///
 /// 各渠道口径天然不同（workbuddy 是积分/资源包，将来 qoder 可能是额度、
@@ -152,7 +205,14 @@ pub trait ChannelAdapter: Send + Sync {
     fn parse_event(&self, frame: &str) -> Vec<CanonicalEvent>;
 
     /// 把上游状态码/错误码翻译成统一语义。调度器只认 [`GatewayError::kind`] 与 `scope`。
-    fn classify_error(&self, status: u16, body: &str) -> GatewayError;
+    ///
+    /// `upstream_model` 是这次实际发出去的模型名 —— 调度器在构建报文前已经把
+    /// [`CanonicalRequest::model`] 改写成了路由的 upstream 名，所以这里拿到的是真名。
+    ///
+    /// 为什么要传模型名：**限流粒度是渠道自己的事**。workbuddy 的 6004 只限一个模型
+    /// （同账号其他模型照用），这个语义只有该渠道知道，所以由它在分类时落到
+    /// [`ErrorScope::AccountModel`]；核心调度器不认识任何具体渠道。
+    fn classify_error(&self, status: u16, body: &str, upstream_model: &str) -> GatewayError;
 
     /// 拉模型目录。`Ok(None)` 表示"拉取失败，请回落快照"，**不是**"这个渠道没有模型"。
     async fn list_models(
@@ -174,8 +234,9 @@ pub trait ChannelAdapter: Send + Sync {
             Err(transport::UpstreamFailure { status: 0, body }) => {
                 Err(GatewayError::network(body))
             }
+            // 这里的 request.model 已被调度器改写为路由的 upstream 模型名。
             Err(transport::UpstreamFailure { status, body }) => {
-                Err(self.classify_error(status, &body))
+                Err(self.classify_error(status, &body, &request.model))
             }
         }
     }
@@ -209,6 +270,41 @@ pub trait ChannelAdapter: Send + Sync {
         Err(GatewayError::unsupported("该渠道不支持登录流程"))
     }
 
+    /// 运营任务清单（面板「任务」表格）。`Ok(None)` = 该渠道没有任务体系。
+    async fn list_tasks(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<Option<Vec<TaskInfo>>, GatewayError> {
+        Ok(None)
+    }
+
+    /// 一键执行可自动化的任务，逐条结果**实时**推到 `progress`，末尾返回全量。
+    ///
+    /// 走通道而不是只返回 Vec：任务执行是长任务（几十秒到几分钟），
+    /// 面板要能一条条看到进展，而不是等全部跑完才弹一个框。
+    async fn run_tasks(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _progress: tokio::sync::mpsc::UnboundedSender<TaskRunResult>,
+    ) -> Result<Vec<TaskRunResult>, GatewayError> {
+        Ok(Vec::new())
+    }
+
+    /// 单独领取一项**已达标**任务的奖励（面板任务行上的「领取」）。
+    ///
+    /// 与 `run_tasks` 分开：进度已经达标、只是没领过的任务（比如你在官方端手动做完了），
+    /// 不该为了领一次奖把事件再上报一遍。
+    async fn claim_task(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _code: &str,
+    ) -> Result<TaskRunResult, GatewayError> {
+        Err(GatewayError::unsupported("该渠道不支持单独领取任务奖励"))
+    }
+
     /// 额度/余额快照。`Ok(None)` = 该渠道没有额度概念，或这次没查到。
     ///
     /// 面板只消费归一后的 [`QuotaSnapshot`]，所以新渠道接额度不需要动界面。
@@ -220,7 +316,32 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// 该账号今天有哪些每日动作、各自做完了没有。
+    ///
+    /// `Ok(None)` = 该渠道没有每日动作概念。**只列这个账号真实拥有的动作**：
+    /// 国内版有签到/猫猫旅行、国际版有每日活跃对话，两边不重叠 ——
+    /// 由渠道自己判断 realm，面板不认识任何具体渠道。
+    async fn daily_actions(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<Option<Vec<DailyAction>>, GatewayError> {
+        Ok(None)
+    }
+
+    /// 执行一个每日动作，返回这一条的结果（成功/失败原因、拿到的积分）。
+    async fn run_daily_action(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _code: &str,
+    ) -> Result<TaskRunResult, GatewayError> {
+        Err(GatewayError::unsupported("该渠道不支持每日动作"))
+    }
+
     /// 运营类动作：每日签到（国内版积分）。返回是否算成功（含幂等）。
+    ///
+    /// 保留这个薄封装：登录流程里会签一次（新号马上拿分）。
     async fn sign_in(
         &self,
         _client: &reqwest::Client,

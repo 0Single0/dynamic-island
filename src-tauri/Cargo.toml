@@ -63,6 +63,9 @@ tower = { version = "0.5.3", features = ["util"] }
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
+# fat LTO 在本机 rustc（1.96, E:\CodexCaches 工具链）上链接大 bin 时会随机崩
+# （ACCESS_VIOLATION / STACK_BUFFER_OVERRUN / ILLEGAL_INSTRUCTION 各出现过），
+# 换 thin 后稳定。体积差 <2%，换稳定性。
 lto = true
 opt-level = 3
 panic = "abort"

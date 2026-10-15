@@ -44,6 +44,8 @@ export interface GatewayAccount {
   cooldown_until_ms: number;
   /** 不可用原因（冷却 / 熔断 / 额度停放 / 没凭据 / 停用），供状态旁的 tooltip。 */
   blocked_reasons: string[];
+  /** 模型级限流：账号可用，但这几个模型在等到期（上游按模型限额）。 */
+  model_limits: Array<{ model: string; until_ms: number }>;
   inflight: number;
   max_inflight: number;
   priority: number;
@@ -58,6 +60,12 @@ export interface GatewayStatus {
   error: string | null;
   enabled: boolean;
   port: number;
+  /** 实际监听端口（配置端口被占用回退后，与 port 可能不同）。 */
+  actual_port: number | null;
+  /** 是否允许局域网访问（绑 0.0.0.0）。 */
+  allow_lan: boolean;
+  /** 内网访问地址（allow_lan 开着才给）。 */
+  lan_addr: string | null;
   auth: "open" | "api_key";
   api_keys: string[];
   affinity: {
@@ -167,8 +175,15 @@ export function status() {
   return invoke<GatewayStatus>("gateway_status");
 }
 
-export function setRuntime(patch: { enabled?: boolean; apiKeys?: string[] }) {
-  return invoke<{ enabled: boolean; api_keys: number }>("gateway_set_runtime", patch);
+export function setRuntime(patch: {
+  enabled?: boolean;
+  apiKeys?: string[];
+  allowLan?: boolean;
+}) {
+  return invoke<{ enabled: boolean; allow_lan: boolean; api_keys: number }>(
+    "gateway_set_runtime",
+    patch,
+  );
 }
 
 export function refreshMatrix() {
@@ -222,6 +237,123 @@ export function resetAccountState(channelId: string, uid: string) {
   return invoke<{ ok: boolean; ready: boolean }>("gateway_reset_account_state", {
     channelId,
     uid,
+  });
+}
+
+export interface GatewayTask {
+  code: string;
+  name: string;
+  status: string;
+  progress: string;
+  reward: number;
+  automatable: boolean;
+  note: string;
+}
+
+export interface GatewayTaskRunResult {
+  code: string;
+  name: string;
+  status: string;
+  message: string;
+  earned: number;
+}
+
+export interface GatewayProbeOutcome {
+  model: string;
+  upstream_model: string;
+  reply: string;
+  latency_ms: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 单账号真实探针：发一条最小请求，验证这个账号能不能用。 */
+export function probeAccount(channelId: string, uid: string, model?: string) {
+  return invoke<GatewayProbeOutcome>("gateway_probe_account", {
+    channelId,
+    uid,
+    model: model || null,
+  });
+}
+
+/** 该渠道可用于探针的模型列表。 */
+export function probeModels(channelId: string) {
+  return invoke<string[]>("gateway_probe_models", { channelId });
+}
+
+/** 渠道任务清单（渠道没有任务体系时返回 null）。 */
+export function listTasks(channelId: string) {
+  return invoke<GatewayTask[] | null>("gateway_list_tasks", { channelId });
+}
+
+/** 启动该账号的任务执行（后台跑，立即返回；已在执行则 started=false）。 */
+export function runTasks(channelId: string, uid: string) {
+  return invoke<{ started: boolean; reason?: string }>("gateway_run_tasks", {
+    channelId,
+    uid,
+  });
+}
+
+/**
+ * 每日动作（签到 / 猫猫旅行 / 每日活跃对话）。
+ *
+ * 与任务分开：任务是"一次性、做完消失"，每日动作每天都要再做一次 ——
+ * 动作清单由**渠道按版本**给出（国内版签到+猫猫、国际版每日对话），前端不认识具体渠道。
+ */
+export interface GatewayDailyAction {
+  code: string;
+  name: string;
+  /** 用户能做的动作名（"签到" / "领取奖励" / "派出旅行" / "去对话"）。 */
+  action: string;
+  done_today: boolean;
+  note: string;
+  automatable: boolean;
+}
+
+/** 该账号今天的每日动作清单（查状态，不做任何写操作）。 */
+export function listDaily(channelId: string, uid: string) {
+  return invoke<GatewayDailyAction[] | null>("gateway_list_daily", { channelId, uid });
+}
+
+/** 执行一个每日动作（单次请求，同步返回结果）。 */
+export function runDaily(channelId: string, uid: string, code: string) {
+  return invoke<GatewayTaskRunResult>("gateway_run_daily", { channelId, uid, code });
+}
+
+export interface GatewayTaskProgress {
+  running: boolean;
+  started_at?: number;
+  finished_at?: number;
+  results: GatewayTaskRunResult[];
+  done: number;
+  earned: number;
+  error?: string;
+}
+
+/** 任务执行进度（前端轮询，逐条实时显示）。 */
+export function taskProgress(channelId: string, uid: string) {
+  return invoke<GatewayTaskProgress>("gateway_task_progress", { channelId, uid });
+}
+
+/**
+ * 领取单项已达标任务的奖励（任务行上的「领取」）。
+ *
+ * 只调领奖接口，不上报任何事件 —— 用于"进度早就达标、只是没领过"的任务。
+ * 失败原因（未达标 / 已领过）在返回的 message 里，不当异常抛。
+ */
+export function claimTask(channelId: string, uid: string, code: string) {
+  return invoke<GatewayTaskRunResult>("gateway_claim_task", { channelId, uid, code });
+}
+
+/**
+ * 设置单个账号的并发上限（"请求中"列点开改）。`null` = 回落渠道/全局默认。
+ * 立即生效；重启后保留（写在账号配置里）。
+ */
+export function setAccountMaxInflight(channelId: string, uid: string, maxInflight: number | null) {
+  return invoke<{ ok: boolean; max_inflight: number }>("gateway_set_account_max_inflight", {
+    channelId,
+    uid,
+    maxInflight,
   });
 }
 
@@ -281,11 +413,22 @@ export interface GatewaySeriesPoint {
 }
 
 /** 请求明细（日志表格）。 */
-export function recentUsage(limit = 200) {
+/** 请求日志：limit 省略（或 0）= 全量。 */
+export function recentUsage(limit = 0) {
   return invoke<GatewayUsageRow[]>("gateway_recent_usage", { limit });
 }
 
 /** 按小时分桶的时间序列（折线图）。 */
+/** 指定毫秒区间的汇总（日期选择器用）。 */
+export function usageSummaryRange(fromMs: number, toMs: number) {
+  return invoke<GatewayUsage>("gateway_usage_summary_range", { fromMs, toMs });
+}
+
+/** 指定毫秒区间的趋势序列（桶宽自适应）。 */
+export function usageSeriesRange(fromMs: number, toMs: number, model?: string) {
+  return invoke<GatewaySeriesPoint[]>("gateway_usage_series_range", { fromMs, toMs, model });
+}
+
 export function usageSeries(hours: number, model?: string) {
   return invoke<GatewaySeriesPoint[]>("gateway_usage_series", {
     hours,

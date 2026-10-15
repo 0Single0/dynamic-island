@@ -24,18 +24,35 @@
 | Anthropic 入口（`/v1/messages`、`count_tokens`） | ✅ | 解码（system/tool_use/tool_result/image/document/thinking、`tool_choice.any`→required、服务端工具降级）；有状态 SSE 编码器（message_start → content_block_start/delta/stop → message_delta → message_stop，文本块与工具块显式开合）；非流式折叠；Anthropic 错误信封；`count_tokens` 用本地 CJK 估算 |
 | Responses 入口（`/v1/responses`） | ✅ | 解码（`input` 字符串/item 数组、`instructions`→system、`function_call`/`function_call_output`→tool 序列（相邻 call 自动合并）、`max_output_tokens`、`reasoning.effort`、服务端工具剔除、**`previous_response_id` 本地 400**）；有状态 SSE 编码器（`response.created` → `output_item.added/delta/done` → `response.completed`，reasoning/message/function_call 三类 item）；非流式折叠成 `object:"response"`；`finish_reason=length` → `status:"incomplete"` |
 | 账号额度展示 | ✅ | 渠道无关的 `QuotaSnapshot`（label/unit/remaining/total/used/details/fetched_at）+ `ChannelAdapter::fetch_quota` 契约 + 账号行"额度"列（悬停看明细与抓取时间）+ 金币按钮手动刷新 + 登录成功后自动抓一次；workbuddy 接国内版计费接口（资源包汇总 → 免费/付费包明细 → 容量汇总，兼容 Precise 变体与 Size/Remain/Used 缺项修正） |
-| 定时器（保活 / 定时签到 / 目录预热 / 探针） | ⬜ | 目前只有手动刷新与手动签到 |
+| 任务中心（账号行「任务」列） | ✅ | 任务清单挂在**账号**上（同一渠道不同账号进度不同）；事件族逐字对齐参考实现（canvas / playbook / expert / team / skill / automation / skin / chat / buddy / heartbeat，团队与专家按轮次换 id —— 上游按 `(eventCode, id)` 去重）；接取后**必须重读**清单（未接取时 progress 为 null）；上报 200 ≠ 计分（回读进度才认）；一键执行在 **Rust 后台**跑并逐条推进度表（`gateway_run_tasks`/`gateway_task_progress`），面板 1 秒轮询 —— 切页面/切账号都不丢 |
+| 每日动作（按版本分开） | ✅ | **与任务分开**：任务是"一次性、做完消失"，每日动作"每天都要再做一次"，混在一起会出现"签完显示已完成"（明天还得签）。契约 `DailyAction` + `daily_actions`/`run_daily_action` 两个 hook，动作清单由**渠道按 realm** 给出：国内版 = 每日签到（`/v2/billing/meter/daily-checkin`，幂等码 10001；状态查 `/v2/billing/meter/checkin-activity-status` → `today_checked_in`/`streak_days`/`today_credit`）+ 猫猫旅行（`activity/growth/buddy/travel/{status,config,depart,claim}`，`state: idle/arrived/traveling`，depart **必须带 location_id** 否则 400）；国际版 = 每日活跃对话（发一条最简对话，送 30/50 积分）。后端 `ops.rs` 常驻定时：启动后补一次 + 09:00/21:00 给失败项补跑（参考实现的整点口径），只做"今天还没做"的 |
+| 任务领取 | ✅ | 领取走 **Web 域** `/activity/growth/tasks/{code}/claim`；幂等语义实测：已领过 → `code:0 / already_claimed:true / credit:0`，未达标 → 400 `task not completed`。抽成 `claim_one`，`run()` 与行内「领取」共用；「已领取」只认 `accept_status == "claimed"`（早先读 `progress.claimed`/`claim_status` 都不存在，导致领过的显示"可领取"+每轮重复领） |
+| 定时器（保活 / 定时签到 / 目录预热 / 探针） | ⬜ | **额度自动刷新已落地**：`gateway/ops.rs` 常驻任务，启动 20s 后每 60s 扫一遍，只刷超过 5 分钟未更新的账号（**不依赖面板打开**）；其余（签到/预热/探针）待做 |
 | 额度守卫（保留积分 / 每日 Token / 每日积分 / 单模型） | ⬜ | 需要额度查询接口一起做 |
 | 第二渠道（qoder） | ⬜ | 等 qoder 的接入资料；扩展机制与配置已就绪（写适配器 + registry + 配置，核心零改动） |
 | 硬化（压测 / 故障演练 / 面板在真机上的视觉验收） | ⬜ | — |
 
-当前验证：`cargo test --lib` 187 通过（gateway 130 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、Anthropic 与 Responses 两条协议的事件序列与状态映射）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+当前验证：`cargo test --lib` 215 通过（gateway 150 条：真 socket 端到端、端口回退、凭据加密往返、矩阵候选与覆盖、亲和续期与降级、冷却策略、卫生管道、错误码翻译、任务字段与事件族、Anthropic 与 Responses 两条协议的事件序列与状态映射）；另有 12 条 `#[ignore]` 的**真实账号探针**（任务/额度/领取/账单，需要显式 `--ignored` 跑）；`cargo check --all-targets` 无 gateway 告警；`pnpm typecheck` / `pnpm build` 通过。
+
+**探针的组织方式（2026-10-10）**：真实账号探针集中在 `gateway/channels/workbuddy/tasks.rs` 底部的 `mod probe`，共用一份 `Fixture`（从应用自己的库里读 wb-cn 账号）—— 早先 6 个探针各抄一份装配样板，光样板就 300 行，把文件顶到 1000 行上限以上。探针**刻意不写断言**：它们的用途是观察上游真实字段（accept_status 取值、claim 幂等返回），断言写死了反而会掩盖上游变化。铁律不变：**枚举值/字段名一律先探针看真的，再写进代码** —— `accept_status` 与 `already_claimed` 都是这么定的。
 
 **新增渠道时额度怎么接**：实现 `ChannelAdapter::fetch_quota` 即可，把上游口径翻译成 `QuotaSnapshot`（`label` 写"积分 / 额度 / 试用期"，`unit` 写"点 / 元 / 天"）。面板只按这两个字段展示，**不认识任何具体渠道** —— 所以 qoder 接额度、kiro 接试用期都不需要动界面。查不到时返回 `Ok(None)`，界面显示"—"，不编造数字。
 
 **实战排障记录（2026-10-09）**：ZCode 接网关报 `Cannot read properties of undefined (reading 'summaryParts')`——不是模型/账号问题，是 **Responses 流缺收尾事件**：AI SDK 要求 reasoning item 带 `reasoning_summary_part.added/.done`（它在 part 上维护 `summaryParts`），message item 带 `output_text.done`，且所有 `output_item.done` 按顺序配对。已照参考实现的协议形态补全并加回归测试锁死事件顺序。教训：**协议适配的对照物是"真实客户端消费的流"，不是文档**——同一个客户端走官方端点正常、走网关崩溃，第一件事就是逐事件 diff 两条流。
 
 **已知偏差（与计划不同但有意为之）**：面板用 Tauri 命令轮询（2s，收起即停）而非事件推送 —— 省掉 Rust 侧为面板维护事件通道；若将来要看板常驻再换事件。
+
+**号池表格的列宽策略（2026-10-10，试错后定型）**：**比例权重（`flex-[权重]`，操作列 `shrink-0` 定宽 168px）**。窗口多宽表格就多宽，**永不溢出**；窄了每列都窄一点（文字截断），宽了每列都宽一点。
+
+试过并否掉的三版，记下来免得再走一遍：
+- **按比例伸缩但操作列没定宽**：窄窗口时 5 个 32px 图标被 flex 压成 23px（"操作栏太挤"）。
+- **固定宽度 + 表格内横向滚动 + 操作列 sticky 钉右侧**：sticky 本身生效（真 DOM 实测：未滚动时操作列就已被拉到可视右缘），但操作列 176px 钉住后会**盖住它左边那几列** —— 表格 1066px / 可视区 674px 时，"请求中~测试" 全被压在操作列底下。
+- **最小宽度（min-w-*）**：硬下限，窗口比它们之和窄时整行照样溢出 —— 账号列被挤出可视区 + 底部多一条横向滚动条（"溢出就不管了？"）。
+- 验证方式：真实组件在 1040/1200/1280/1440/1920 五档宽度下量 `scrollWidth == clientWidth`（溢出必须为 0）。
+- 账号列宽度按**最长昵称**算（下限 96、上限 160），现在体现为**权重** 0.96..1.60：短昵称不浪费宽度，超长昵称也不会把整行顶变形。
+- 凭据只显示天数（"26 天"）；额度进度条**不把比例夹到 1**：剩余超过总量（赠送/加包）时填满 + 百分比带 "+"（如 115%+），否则溢出了也看不见。
+
+工具窗口默认尺寸从 1040×720 调到 1280×780（列多了，给足宽度更舒服；窗口再窄也不会溢出，只是每列更窄）。
 
 ## 1. 目标一句话
 
@@ -218,16 +235,32 @@ routes = matrix.routes(public_model)                     // 别名解析 → 候
 | ErrorKind | Scope | 动作 |
 |---|---|---|
 | `AuthExpired`(401) | Account | 冷却 60s（池内仅 1 个可用账号时 3s），换号；**不触发刷新** |
-| `RateLimited` 带 reset | AccountModel(model) | 只冷该模型到 reset 时刻，同账号其他模型照用 |
+| `RateLimited` 模型级 + reset | AccountModel(model) | 只冷该模型到 reset 时刻，同账号其他模型照用 |
+| `RateLimited` 模型级无 reset | AccountModel(model) | 只冷该模型：`600s·2^(n-1)` ≤ 7200s（**按模型各自的 streak**），账号不连坐 |
 | `RateLimited` 无 reset | Account | 软限流：`600s·2^(n-1)` ≤ 7200s，解绑亲和并换号 |
+| `RateLimited` 账号级带 reset | Account | 停整个账号到那个时刻（上游没说哪个模型时的保守处理） |
 | `QuotaExhausted`(402) | Account | 停放到次日本地 04:00 |
 | `ContentPolicy`(403) | Request | **不换账号**；提示词降级后原号重试一次 |
 | `Upstream5xx` | Account | 连续 3 次 → 熔断 `1800s·2^(n-3)` ≤ 21600s |
 | `Network` | Account | 短睡指数退避重试（300ms 起），计入降级窗口（连续 5 次 → 600s 窗口） |
 | `InvalidRequest`(400/413/422) | Request | 不重试、不改账号状态、直接透传 |
-| 任一次成功 | — | 清空模型冷却、软限流计数、失败计数、熔断与降级窗口 |
+| 任一次成功 | — | 清空**该模型**的冷却与 streak、软限流计数、失败计数、熔断与降级窗口 |
 
 尝试次数 `max(2, 该模型候选可用账号数) + 1`；全池失败按最后一次错误映射（OpenAI：`{"error":{...}}`；Anthropic：`{"type":"error",...}` 且 400/422→invalid_request_error、401→authentication_error、403→permission_error、429→rate_limit_error、503/529→overloaded_error）。
+
+**限流粒度是渠道自己的事（2026-10-10 实现）**：`classify_error(status, body, upstream_model)` 会把**实际发出去的 upstream 模型名**交给渠道，由渠道决定落到哪个 `ErrorScope`；核心调度器不认识任何具体渠道。workbuddy 的落地：
+
+- **6004 = 模型级限额**（参考实现原文 "usage exceeds frequency limit"）。正文会给 `your usage will reset at 2026-09-19 18:29:03 UTC+8`，我们解析成时刻 → 只停这个模型到那一刻；解析不出来也保持模型级（按模型退避），**绝不因为一个模型限额把整个账号拉黑**。裸 429（没有 6004）仍按参考实现当账号级软限流处理。
+- **模型级冷却的 key 必须用 upstream 名**：写的时候（`narrow_scope`）和读的时候（`router::pick` / 亲和检查 / `on_success`）都用 `route.upstream_model`。早先写用对外名、读用 upstream 名 —— 结果是"明明记了冷却，调度器却查不到"，账号继续被选中、继续吃 429（这类 bug 不会报错，只会表现成"限流好像没用"）。
+- 面板会把它显示出来：账号仍算可用（`is_ready("")`），但状态列的 `?` 与"限流等待"列会给出**模型级**限流（"模型 1" + 悬停看到是哪个模型、还有多久），避免把"某个模型限额"误判成"号废了"。
+
+**11-128 是随机拦截，不是内容指纹（2026-10-12 真机 A/B 定性）**：Claude Code 打 `/v1/messages` 偶发 `{"code":"11-128","msg":"Illegal API invocation from an unapproved channel"}`。逐段 A/B（Claude Code 完整声明/短句/billing 头/anthropics 域名都放行；`Default branch (...)` 一次放行一次被拦；随后同文 16 连发 0 拦）证明**触发与正文、频率都无关，是上游侧随机/状态性判定**。处理：新 `ErrorKind::ChannelBlocked`（Request 范围、retryable=true、重试/换号即可），池子对它**不做任何冷却**；识别用字符串码（带连字符，数值扫描认不到）。教训：指纹表"哪些串触发拦截"的老结论不能照抄 —— 上游风控会变，**定性必须本机 A/B**。
+
+顺带修掉一个真泄漏：`build_chat_body` 以客户端原始报文为基底透传渠道特有字段，但 Anthropic 的顶层 `system`、Responses 的 `instructions`/`input` 也跟着漏出去 —— 提示词明明清洗过并重建进了 `messages`，原文却原样再发一遍，把清洗整个绕过。现已删除这三个顶层字段。
+
+**上游文案会本地化 —— 别认句子，认时间戳（2026-10-10 真机教训）**：6004 的恢复时刻在正文里，但**语种跟着请求头变**。我们发 `Accept-Language: zh-CN`，上游回的是中文「您的使用量已超出频率限制，将在 2026-10-11 14:46:40 UTC+8 重置，您也可以切换其他模型继续使用。」；参考实现（英文客户端）看到的是 `your usage will reset at ...`。早先只找英文 `reset at`，中文文案就解析不出来 → 退成"恢复时刻未知" + 10m/20m 翻倍退避，而**真实恢复在约 21 小时后**（那是按天重置的模型额度预算，不是短窗限流）。现在改成：扫描正文里第一个 `YYYY-MM-DD[ T]HH:MM:SS`（配 `UTC±N`，缺省 +8），中英俄任何措辞都能解析。同类"认措辞"的坑要引以为戒 —— 上游改一个字就失效，而且**静默失效**（表现成"退避策略看起来不灵"）。
+
+另一个相关教训：**错误里必须留着上游原文**（`GatewayError::upstream` + `describe()`）。早先只留一句人话提示（"该模型被上游限流"），于是"上游到底说了什么、什么时候恢复"这些线索在网关内部就丢了 —— 面板只能显示"探针失败"。同时发现前端把所有 Tauri 命令错误都当 `Error` 处理，而它实际是**字符串**，`instanceof Error` 恒假 → 兜底文案吃掉后端消息（探针一直只显示"探针失败"）。现在统一走 `errorText()`。
 
 ### 6.5 并发与生命周期（Rust 特有）
 

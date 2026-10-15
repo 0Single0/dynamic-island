@@ -14,6 +14,7 @@ pub mod commands;
 pub mod config;
 pub mod core;
 pub mod errors;
+pub mod ops;
 pub mod protocol;
 pub mod security;
 pub mod server;
@@ -40,5 +41,7 @@ pub fn setup(app: &AppHandle) -> Result<SharedGateway, Box<dyn std::error::Error
     if state.config().enabled {
         tauri::async_runtime::spawn(server::run(Arc::clone(&state)));
     }
+    // 常驻定时任务（额度刷新等）不依赖服务是否开启，也不依赖面板是否打开。
+    ops::spawn(Arc::clone(&state));
     Ok(state)
 }

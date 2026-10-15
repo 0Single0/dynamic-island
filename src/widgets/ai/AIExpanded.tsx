@@ -3,10 +3,11 @@ import { createPortal } from "react-dom";
 import { Bot, Loader2, Square, PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { Composer, type AgentComposerItem } from "@/components/agent/Composer";
 import { AgentIcon, toAgentIconId } from "@/components/agent/AgentIcons";
+import { ModelPicker } from "@/components/agent/ModelPicker";
 import { useBuiltinPlugins } from "@/agent/plugins";
-import { Select } from "@/components/common/Select";
 import { cn } from "@/lib/utils";
 import { tauriInvoke } from "@/agent/api";
+import { openSettingsWindow } from "@/api/window";
 import { HistorySidebar } from "./HistorySidebar";
 import { ErrorRow, MarkdownBody, ReasoningRow, ToolRow } from "./ConversationRows";
 import { useAgentConversation } from "./useAgentConversation";
@@ -15,7 +16,7 @@ import type { WidgetExpandedRenderProps } from "@/widgets/types";
 import type { ConversationEntry } from "@/agent/trace";
 
 export function AIExpanded({ headerSlot }: WidgetExpandedRenderProps = {}) {
-  const { entries, sessions, sessionId, isLoading, models, selectedModelId, setSelectedModelId, isSending, activeRunId, viewportRef, followTailRef, loadSession, createNewSession, deleteSession, sendMessage } = useAgentConversation();
+  const { entries, sessions, sessionId, isLoading, models, providers, selectedModelId, setSelectedModelId, isSending, activeRunId, viewportRef, followTailRef, loadSession, createNewSession, deleteSession, sendMessage } = useAgentConversation();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const draft = useSyncExternalStore(subscribeDrafts, () => getDraft(sessionId));
   const toggleSidebar = <button type="button" onClick={() => setSidebarCollapsed(value => !value)} title={sidebarCollapsed ? "展开历史对话" : "折叠历史对话"} aria-label={sidebarCollapsed ? "展开历史对话" : "折叠历史对话"} aria-expanded={!sidebarCollapsed} className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-white/50 transition hover:bg-white/[0.08] hover:text-white">{sidebarCollapsed ? <PanelLeftOpen className="h-3.5 w-3.5" /> : <PanelLeftClose className="h-3.5 w-3.5" />}</button>;
@@ -89,7 +90,7 @@ export function AIExpanded({ headerSlot }: WidgetExpandedRenderProps = {}) {
             placeholder="输入消息，使用 @ 选择插件"
             footer={(
               <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-zinc-500">
-                <Select value={selectedModelId} variant="text" menuTitle="选择模型" options={models.map((model) => ({ value: model.id, label: model.displayName || model.modelId }))} onChange={setSelectedModelId} placeholder="未配置模型" className="max-w-[220px] py-1 text-[11px]" aria-label="选择模型" />
+                <ModelPicker providers={providers} models={models} value={selectedModelId} onChange={setSelectedModelId} onManage={() => void openSettingsWindow("ai-models")} className="max-w-[240px] py-1 text-[11px]" aria-label="选择模型" />
                 {activeRunId && <button type="button" onClick={() => void tauriInvoke("agent_cancel_run", { runId: activeRunId })} className="ml-2 flex items-center gap-1 rounded-md px-2 py-1 text-[10px] text-zinc-400 hover:bg-white/[0.07] hover:text-zinc-200"><Square className="h-3 w-3 fill-current" /> 停止</button>}
               </div>
             )}

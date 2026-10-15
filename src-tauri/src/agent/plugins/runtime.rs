@@ -278,7 +278,6 @@ impl PluginRuntime {
                             description: tool.description.clone(),
                             capability_id: tool.capability_id.clone(),
                             risk_level: tool.risk_level,
-                            requires_confirmation: tool.requires_confirmation,
                             legacy_names: tool.legacy_names.clone(),
                             available: capability_available(&state, &tool.capability_id),
                         })
@@ -592,7 +591,6 @@ fn to_definition(manifest: &PluginManifest, tool: &ToolExposure) -> ToolDefiniti
         description: tool.description.clone(),
         input_schema: tool.input_schema.clone(),
         risk_level: tool.risk_level,
-        requires_confirmation: tool.requires_confirmation,
         supports_cancellation: true,
         supports_parallel: false,
         side_effects: tool.side_effects.clone(),
@@ -634,7 +632,6 @@ mod tests {
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
             capability_id: capability_id.into(),
             risk_level: L::L0,
-            requires_confirmation: false,
             side_effects: vec![],
             legacy_names: legacy.iter().map(|v| (*v).into()).collect(),
             timeout_ms,

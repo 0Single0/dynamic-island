@@ -25,6 +25,12 @@ use crate::gateway::{
 };
 
 pub fn router(state: SharedGateway) -> Router {
+    use axum::extract::DefaultBodyLimit;
+    // 请求体大小**完全不限制**（axum 默认 2MB 会把长上下文的请求在网关就 413 掉）。
+    // 上限交给上游：超了上游会自己报错，我们原样透传 —— 网关不做第二道闸。
+    // 注意 layer 的顺序：axum 的 .layer() 包装的是**在此之前**定义的路由，
+    // 所以 DefaultBodyLimit 必须放在 .route() 之后调用才能作用到它们身上
+    // （放前面 = 作用在空 Router 上 = 完全不生效，这正是 413 一直阴魂不散的原因）。
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(openai::list_models))
@@ -36,13 +42,15 @@ pub fn router(state: SharedGateway) -> Router {
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         // OpenAI Responses：Codex 等客户端；无状态网关，previous_response_id 会被拒绝。
         .route("/v1/responses", post(responses::create))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 
 /// 起服务：绑定失败只写状态，不 panic —— 网关挂了岛还得能用。
 pub async fn run(state: SharedGateway) {
-    let preferred = state.config().port;
-    let listener = match bind_with_fallback(preferred).await {
+    let config = state.config();
+    let (preferred, allow_lan) = (config.port, config.allow_lan);
+    let listener = match bind_with_fallback(preferred, allow_lan).await {
         Ok(listener) => listener,
         Err(error) => {
             let message = format!("监听 127.0.0.1:{preferred} 失败：{error}");
@@ -89,10 +97,13 @@ pub async fn serve(listener: tokio::net::TcpListener, state: SharedGateway) {
     }
 }
 
-async fn bind_with_fallback(port: u16) -> Result<tokio::net::TcpListener, std::io::Error> {
+async fn bind_with_fallback(port: u16, allow_lan: bool) -> Result<tokio::net::TcpListener, std::io::Error> {
+    // 允许局域网访问时绑 0.0.0.0（IPv4 全网卡）；否则只绑回环。
+    // 回环绑定的监听器拿不到 0.0.0.0 地址，所以分两条路径。
+    let host = if allow_lan { "0.0.0.0" } else { "127.0.0.1" };
     let mut last_error = None;
     for candidate in port..port.saturating_add(PORT_SCAN_RANGE) {
-        match tokio::net::TcpListener::bind(("127.0.0.1", candidate)).await {
+        match tokio::net::TcpListener::bind((host, candidate)).await {
             Ok(listener) => return Ok(listener),
             Err(error) => last_error = Some(error),
         }
@@ -126,7 +137,7 @@ pub(super) fn record_rejection(
             total_ms: 0,
             effort: None,
             upstream_model: None,
-            error_detail: Some(format!("[{:?}] {}", error.kind, error.message)),
+            error_detail: Some(format!("[{:?}] {}", error.kind, error.describe())),
         });
 }
 
@@ -438,7 +449,7 @@ mod tests {
             .expect("占住一个端口");
         let taken = occupied.local_addr().expect("本地地址").port();
 
-        let listener = bind_with_fallback(taken).await.expect("回退绑定");
+        let listener = bind_with_fallback(taken, false).await.expect("回退绑定");
         let port = listener.local_addr().expect("本地地址").port();
         assert_ne!(port, taken, "首选端口被占用时必须顺序回退");
 
@@ -476,5 +487,61 @@ mod tests {
 
         server.abort();
         drop(occupied);
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    //! 端到端验证请求体限制确实被解除：发一个 >2MB（axum 旧默认）的请求体，
+    //! 断言不会得到 413 / "length limit exceeded"。
+    use super::*;
+    use crate::gateway::{config::{AccountConfig, ChannelConfig, Config}, GatewayState};
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn large_request_body_is_not_rejected() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut config = Config::default();
+        // 没有账号：请求会走到"无可用账号"503，但**不应该**在 body 层就被 413 拦掉。
+        config.channels.push(ChannelConfig {
+            id: "wb-cn".into(),
+            adapter: "workbuddy".into(),
+            ..ChannelConfig::default()
+        });
+        config.accounts.push(AccountConfig {
+            channel_id: "wb-cn".into(),
+            uid: "u1".into(),
+            ..AccountConfig::default()
+        });
+        let state = GatewayState::initialize_with_secrets(
+            config,
+            dir.path().to_path_buf(),
+            crate::gateway::security::tests_support::memory_store().as_ref(),
+        )
+        .expect("状态初始化");
+
+        // 5MB 请求体：超过 axum 旧默认 2MB。
+        let big = "x".repeat(5 * 1024 * 1024);
+        let body = format!(
+            r#"{{"model":"glm-5.3-flash","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            big
+        );
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("请求构造"),
+            )
+            .await
+            .expect("路由命中");
+        let status = response.status().as_u16();
+        // 413 = body 层限制还在（要修的是这个）；
+        // 400/503 = body 已经完整进入了业务层（模型/账号层面被拒），这正是我们要的。
+        assert_ne!(status, 413, "大请求体不该在网关层被 413");
+        assert_ne!(status, 500, "也不该是内部错误");
     }
 }

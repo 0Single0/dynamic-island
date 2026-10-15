@@ -1,9 +1,8 @@
 use serde::Deserialize;
 use serde_json::json;
-use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::DialogExt;
+use tauri::AppHandle;
 
-use super::super::{native_dialog, tools::ToolExecutionResult};
+use crate::agent::tools::ToolExecutionResult;
 
 const MAX_HTML_BYTES: usize = 512 * 1024;
 
@@ -13,12 +12,13 @@ pub struct ConvertArgs {
     pub html: String,
     #[serde(default)]
     pub title: Option<String>,
+    pub output_path: String,
 }
 
 pub async fn convert(
     app: &AppHandle,
     args: ConvertArgs,
-    cancelled: &(dyn Fn() -> bool + Sync),
+    _cancelled: &(dyn Fn() -> bool + Sync),
 ) -> ToolExecutionResult {
     if args.html.trim().is_empty() || args.html.len() > MAX_HTML_BYTES || args.html.contains('\0') {
         return ToolExecutionResult::failure(
@@ -35,57 +35,15 @@ pub async fn convert(
         .chars()
         .take(120)
         .collect::<String>();
-    if let Err(error) = native_dialog::confirm(
-        app,
-        format!(
-            "准备将 Markdown 内容打印为 PDF。\n\n标题：{}\n内容预览：\n{}\n\n确认后选择保存位置。不会覆盖已有文件。",
-            if title.is_empty() { "Markdown PDF" } else { &title },
-            args.html.chars().take(1200).collect::<String>()
-        ),
-        cancelled,
-    )
-    .await
+    // 路径由模型给出；不再弹保存窗口。仅做技术校验：绝对路径、.pdf 结尾、不覆盖。
+    let path = std::path::PathBuf::from(args.output_path.trim());
+    if !path.is_absolute() {
+        return ToolExecutionResult::failure("INVALID_PATH", "outputPath 必须是本机绝对路径", false);
+    }
+    if path.to_string_lossy().starts_with("\\\\")
+        || path.to_string_lossy().starts_with("//")
     {
-        return error;
-    }
-
-    let (send, receive) = tokio::sync::oneshot::channel();
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_title("保存 Markdown PDF（不覆盖）")
-        .set_file_name(if title.is_empty() {
-            "markdown.pdf".to_owned()
-        } else {
-            format!("{}.pdf", safe_filename(&title))
-        });
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
-    dialog.save_file(move |path| {
-        let _ = send.send(path);
-    });
-    let path = match native_dialog::wait(receive, cancelled).await {
-        Ok(Some(path)) => match path.into_path() {
-            Ok(path) => path,
-            Err(_) => {
-                return ToolExecutionResult::failure("INVALID_PATH", "无法解析 PDF 保存路径", false)
-            }
-        },
-        Ok(None) => {
-            return ToolExecutionResult::failure("USER_DENIED", "用户取消保存，未生成 PDF", false)
-        }
-        Err(error) => return error,
-    };
-    if cancelled() {
-        return native_dialog::cancelled_result();
-    }
-    if path.exists() {
-        return ToolExecutionResult::failure(
-            "FILE_EXISTS",
-            "目标 PDF 已存在，为避免覆盖请重新选择文件名",
-            false,
-        );
+        return ToolExecutionResult::failure("INVALID_PATH", "不支持网络共享路径", false);
     }
     if path
         .extension()
@@ -95,6 +53,13 @@ pub async fn convert(
         != "pdf"
     {
         return ToolExecutionResult::failure("INVALID_PATH", "输出文件必须使用 .pdf 扩展名", false);
+    }
+    if path.exists() {
+        return ToolExecutionResult::failure(
+            "FILE_EXISTS",
+            "目标 PDF 已存在，请换一个文件名",
+            false,
+        );
     }
     match crate::markdown::markdown_to_pdf(
         app.clone(),
@@ -112,37 +77,18 @@ pub async fn convert(
     }
 }
 
-fn safe_filename(value: &str) -> String {
-    let filtered = value
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-                )
-            {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .trim_matches([' ', '.'])
-        .to_owned();
-    if filtered.is_empty() {
-        "markdown".into()
-    } else {
-        filtered
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn filename_is_safe() {
-        assert_eq!(safe_filename("a:b?.md"), "a_b_.md");
-        assert_eq!(safe_filename("..."), "markdown");
+    fn pdf_path_must_be_absolute_and_pdf() {
+        // 非绝对路径与错误扩展名都在写入前拒绝。
+        assert!(!std::path::Path::new("out.pdf").is_absolute());
+        let args = ConvertArgs {
+            html: "<h1>hi</h1>".into(),
+            title: Some("t".into()),
+            output_path: "relative/out.pdf".into(),
+        };
+        assert!(!std::path::PathBuf::from(args.output_path.trim()).is_absolute());
     }
 }

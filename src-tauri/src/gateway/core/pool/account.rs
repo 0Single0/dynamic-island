@@ -52,8 +52,10 @@ pub struct AccountRuntime {
     soft_streak: AtomicU32,
     /// 在飞请求数。
     inflight: AtomicU32,
-    /// 模型级冷却：同账号其他模型照用。
+    /// 模型级冷却（key = **上游**模型名）：同账号其他模型照用。
     model_cooldowns: RwLock<HashMap<String, u64>>,
+    /// 模型级软限流连续次数（上游没给恢复时刻时，按模型各自退避）。
+    model_streaks: RwLock<HashMap<String, u32>>,
     /// 刷新串行锁：上游会轮换 refresh_token，并发刷新互相作废。
     pub refresh_lock: tokio::sync::Mutex<()>,
 }
@@ -72,7 +74,8 @@ pub struct PoolAccount {
     pub priority: u32,
     /// 同档内的容量份额。
     pub weight: u32,
-    pub max_inflight: u32,
+    /// 并发上限（面板可调）。原子：PoolAccount 常在 Arc 后面共享，&self 也要能改。
+    max_inflight: AtomicU32,
     pub proxy_slot: Option<String>,
     pub runtime: AccountRuntime,
 }
@@ -88,7 +91,7 @@ impl PoolAccount {
             quota: RwLock::new(None),
             priority: 100,
             weight: 1,
-            max_inflight: 1,
+            max_inflight: AtomicU32::new(1),
             proxy_slot: None,
             runtime: AccountRuntime::default(),
         }
@@ -159,11 +162,11 @@ impl PoolAccount {
 
     /// 取一个在飞槽位。返回 None = 该账号并发已满（调度器应换号或让请求排队）。
     pub fn try_acquire(self: &Arc<Self>) -> Option<InflightGuard> {
-        if self.runtime.inflight.load(Ordering::SeqCst) >= self.max_inflight {
+        if self.runtime.inflight.load(Ordering::SeqCst) >= self.max_inflight() {
             return None;
         }
         // 先加再看：避免并发下两个请求同时通过上限判断。
-        if self.runtime.inflight.fetch_add(1, Ordering::SeqCst) >= self.max_inflight {
+        if self.runtime.inflight.fetch_add(1, Ordering::SeqCst) >= self.max_inflight() {
             self.runtime.inflight.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
@@ -179,21 +182,43 @@ impl PoolAccount {
                 self.raise_cooldown(&self.runtime.cooldown_until, now, policy.auth_secs);
             }
             ErrorKind::RateLimited => {
-                if let Some(reset_at) = error.reset_at_ms {
-                    // 带 reset 时刻 = 上游只限制这个模型，别把整个账号拉黑。
-                    let model = match &error.scope {
-                        ErrorScope::AccountModel(model) => model.clone(),
-                        _ => String::new(),
-                    };
-                    if let Ok(mut map) = self.runtime.model_cooldowns.write() {
-                        map.insert(model, reset_at);
+                // 三种形态，区别只在**范围**与**停多久**：
+                // · 渠道说是模型级（AccountModel）：只停那个模型，同账号其他模型照用 ——
+                //   上游给了恢复时刻就停到那一刻，没给就按模型各自的退避（不牵连账号）；
+                // · 账号级但给了恢复时刻：停整个账号到那一刻；
+                // · 账号级没给时刻：账号级指数退避（软限流，最保守）。
+                let model = match &error.scope {
+                    ErrorScope::AccountModel(model) => Some(model.clone()),
+                    _ => None,
+                };
+                match (model, error.reset_at_ms) {
+                    (Some(model), Some(reset_at)) => self.park_model(&model, reset_at),
+                    (Some(model), None) => {
+                        let streak = self.bump_model_streak(&model);
+                        let wait = backoff_secs(
+                            policy.soft_base_secs,
+                            streak - 1,
+                            policy.soft_cap_secs,
+                        );
+                        self.park_model(&model, now.saturating_add(wait * 1000));
                     }
-                } else {
-                    let streak = self.runtime.soft_streak.fetch_add(1, Ordering::SeqCst) + 1;
-                    let wait = backoff_secs(policy.soft_base_secs, streak - 1, policy.soft_cap_secs);
-                    self.raise_cooldown(&self.runtime.cooldown_until, now, wait);
+                    (None, Some(reset_at)) => {
+                        // 上游说了恢复时刻但没说哪个模型：按它停整个账号。
+                        if reset_at > self.runtime.cooldown_until.load(Ordering::SeqCst) {
+                            self.runtime.cooldown_until.store(reset_at, Ordering::SeqCst);
+                        }
+                    }
+                    (None, None) => {
+                        let streak = self.runtime.soft_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                        let wait =
+                            backoff_secs(policy.soft_base_secs, streak - 1, policy.soft_cap_secs);
+                        self.raise_cooldown(&self.runtime.cooldown_until, now, wait);
+                    }
                 }
             }
+            // 上游渠道校验拦截：随机出现、重试即可 —— 不动任何冷却，
+            // 否则"随机拦一次"会把一个健康账号白停十分钟。
+            ErrorKind::ChannelBlocked => {}
             ErrorKind::QuotaExhausted => {
                 self.runtime
                     .balance_until
@@ -255,6 +280,13 @@ impl PoolAccount {
         ) {
             *target = source.clone();
         }
+        if let (Ok(source), Ok(mut target)) = (
+            previous.runtime.model_streaks.read(),
+            self.runtime.model_streaks.write(),
+        ) {
+            *target = source.clone();
+        }
+        self.max_inflight.store(previous.max_inflight(), Ordering::SeqCst);
         if let Some(quota) = previous.quota() {
             self.set_quota(Some(quota));
         }
@@ -263,6 +295,15 @@ impl PoolAccount {
     /// 清空全部惩罚状态（面板"重置状态"按钮）。
     ///
     /// 只清运行态：凭据、额度、启停都不动。
+    /// 调整并发上限（面板可改）。不低于 1；在飞中的请求不受影响（只影响新请求）。
+    pub fn set_max_inflight(&self, value: u32) {
+        self.max_inflight.store(value.max(1), Ordering::SeqCst);
+    }
+
+    pub fn max_inflight(&self) -> u32 {
+        self.max_inflight.load(Ordering::SeqCst)
+    }
+
     pub fn reset_runtime(&self) {
         self.runtime.cooldown_until.store(0, Ordering::SeqCst);
         self.runtime.balance_until.store(0, Ordering::SeqCst);
@@ -271,6 +312,9 @@ impl PoolAccount {
         self.runtime.soft_streak.store(0, Ordering::SeqCst);
         if let Ok(mut map) = self.runtime.model_cooldowns.write() {
             map.clear();
+        }
+        if let Ok(mut streaks) = self.runtime.model_streaks.write() {
+            streaks.clear();
         }
     }
 
@@ -283,6 +327,31 @@ impl PoolAccount {
         if let Ok(mut map) = self.runtime.model_cooldowns.write() {
             map.remove(model);
         }
+        if let Ok(mut streaks) = self.runtime.model_streaks.write() {
+            streaks.remove(model);
+        }
+    }
+
+    /// 记住"某个模型被限流到什么时候"（同账号其他模型不受影响）。
+    fn park_model(&self, model: &str, until: u64) {
+        if let Ok(mut map) = self.runtime.model_cooldowns.write() {
+            let entry = map.entry(model.to_string()).or_insert(0);
+            // 只延长不缩短：并发下短冷却不能把长冷却覆盖掉。
+            if until > *entry {
+                *entry = until;
+            }
+        }
+    }
+
+    /// 模型级软限流计数 +1，返回当前值（决定退避倍数）。
+    fn bump_model_streak(&self, model: &str) -> u32 {
+        let mut streaks = match self.runtime.model_streaks.write() {
+            Ok(streaks) => streaks,
+            Err(_) => return 1,
+        };
+        let streak = streaks.entry(model.to_string()).or_insert(0);
+        *streak = streak.saturating_add(1);
+        *streak
     }
 
     /// 该账号当前**为什么不可用**（面板状态旁 `?` 的 tooltip 内容）。
@@ -360,7 +429,7 @@ impl PoolAccount {
 
     /// 该账号在飞是否已达上限（调度器据此换号，而不是排队等它）。
     pub fn inflight_full(&self) -> bool {
-        self.inflight() >= self.max_inflight
+        self.inflight() >= self.max_inflight()
     }
 
     fn model_cooldowns(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, u64>> {
@@ -379,7 +448,7 @@ impl PoolAccount {
 }
 
 /// 把毫秒差说成人话：38s / 6m / 2h。
-fn humanize(delta_ms: u64) -> String {
+pub fn humanize(delta_ms: u64) -> String {
     let seconds = delta_ms / 1000;
     if seconds < 60 {
         return format!("{seconds} 秒");
@@ -408,6 +477,13 @@ impl Drop for InflightGuard {
     }
 }
 
+/// 单个模型的限流窗口（面板"限流等待"列 / 状态 `?` 用）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelLimit {
+    pub model: String,
+    pub until_ms: u64,
+}
+
 /// 供测试与面板使用的账号快照视图。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccountView {
@@ -421,6 +497,9 @@ pub struct AccountView {
     pub cooldown_until_ms: u64,
     /// 不可用原因（冷却 / 熔断 / 额度停放 / 没凭据 / 停用），供面板 tooltip。
     pub blocked_reasons: Vec<String>,
+    /// 模型级限流（key = 上游模型名）。账号本身还是可用的，只是这几个模型要等，
+    /// 所以单独给面板一份，别和"账号不可用"混在一起。
+    pub model_limits: Vec<ModelLimit>,
     /// 当前进行中的请求数。
     pub inflight: u32,
     /// 该账号的并发上限（面板显示"进行中 / 上限"）。
@@ -445,8 +524,21 @@ impl PoolAccount {
             credential_expires_at_ms: credentials.expires_at_ms,
             cooldown_until_ms: self.cooldown_until_ms(),
             blocked_reasons: self.blocked_reasons("", now),
+            model_limits: {
+                let mut limits: Vec<ModelLimit> = self
+                    .model_cooldowns()
+                    .iter()
+                    .filter(|(_, until)| **until > now)
+                    .map(|(model, until)| ModelLimit {
+                        model: model.clone(),
+                        until_ms: *until,
+                    })
+                    .collect();
+                limits.sort_by(|a, b| a.until_ms.cmp(&b.until_ms));
+                limits
+            },
             inflight: self.inflight(),
-            max_inflight: self.max_inflight,
+            max_inflight: self.max_inflight(),
             priority: self.priority,
             weight: self.weight,
             proxy_slot: self.proxy_slot.clone(),
@@ -464,7 +556,7 @@ mod tests {
         let mut account = PoolAccount::new("fake", "u1");
         account.nickname = "测试账号".into();
         account.requires_credential = false;
-        account.max_inflight = 1;
+        account.set_max_inflight(1);
         Arc::new(account)
     }
 
@@ -499,6 +591,72 @@ mod tests {
         );
         assert!(!account.is_ready("m", now));
         assert!(account.is_ready("m", now + (policy.auth_secs + 1) * 1000));
+    }
+
+    /// 模型限额是本渠道的常态（workbuddy 的 6004）：一个模型被限，账号必须照常服务其他模型。
+    #[test]
+    fn model_scoped_limit_leaves_sibling_models_serviceable() {
+        let account = account();
+        let policy = CooldownConfig::default();
+        let now = now_ms();
+        account.apply_error(
+            &GatewayError::new(
+                ErrorKind::RateLimited,
+                ErrorScope::AccountModel("deepseek-v4.1-flash".into()),
+                429,
+                "该模型被上游限流",
+                true,
+            ),
+            &policy,
+            now,
+        );
+        assert!(!account.is_ready("deepseek-v4.1-flash", now), "被限的模型不可用");
+        assert!(account.is_ready("glm-5.3", now), "同账号其他模型照常可用");
+        assert_eq!(account.cooldown_until_ms(), 0, "不该把整个账号拉黑");
+        let reasons = account.blocked_reasons("", now);
+        assert!(
+            reasons.iter().any(|reason| reason.contains("deepseek-v4.1-flash")),
+            "面板要能看到是哪个模型被限：{reasons:?}"
+        );
+    }
+
+    /// 拿不到恢复时刻也要停在**模型**上：不能因为解析不出时间就停整个账号。
+    #[test]
+    fn model_scoped_limit_without_reset_still_only_cools_that_model() {
+        let account = account();
+        let policy = CooldownConfig::default();
+        let now = now_ms();
+        account.apply_error(
+            &GatewayError::new(
+                ErrorKind::RateLimited,
+                ErrorScope::AccountModel("glm-5.3".into()),
+                429,
+                "该模型被上游限流",
+                true,
+            ),
+            &policy,
+            now,
+        );
+        assert!(!account.is_ready("glm-5.3", now));
+        assert!(account.is_ready("deepseek-v4.1-flash", now));
+        assert_eq!(account.cooldown_until_ms(), 0);
+        // 退避窗口有效：到点自己恢复。
+        assert!(account.is_ready("glm-5.3", now + (policy.soft_base_secs + 1) * 1000));
+    }
+
+    /// 上游说了恢复时刻但没说是哪个模型 → 按那个时刻停整个账号（旧行为是静默 no-op）。
+    #[test]
+    fn account_level_limit_with_reset_cools_until_that_moment() {
+        let account = account();
+        let now = now_ms();
+        account.apply_error(
+            &GatewayError::new(ErrorKind::RateLimited, ErrorScope::Account, 429, "x", true)
+                .with_reset_at(Some(now + 120_000)),
+            &CooldownConfig::default(),
+            now,
+        );
+        assert!(!account.is_ready("glm-5.3", now));
+        assert_eq!(account.cooldown_until_ms(), now + 120_000, "停到上游说的时刻");
     }
 
     #[test]

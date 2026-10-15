@@ -101,7 +101,10 @@ pub fn run() {
 
             // 反代号池网关：进程内嵌 HTTP 服务（外部客户端走 /v1/*，面板走 Tauri command）。
             // 端口被占用时自行回退，不阻塞岛启动。
-            gateway::setup(app.handle())?;
+            let gateway = gateway::setup(app.handle())?;
+            // 网关就绪后挂到 Agent 上：供应商列表里的内置「本机反代」由它实时提供。
+            app.state::<agent::AgentState>()
+                .attach_gateway(gateway);
 
             // 内置插件自动注册：业务模块只注册能力，插件清单只描述暴露关系。
             // 这里没有用户启停开关；`@` 只影响单次请求的工具范围。
@@ -130,7 +133,8 @@ pub fn run() {
             commands::window::set_always_on_top,
             commands::window::pin_to_top_center,
             commands::window::set_island_rect,
-            commands::window::set_window_interactive,
+            commands::window::set_island_dragging,
+            commands::window::dock_island,
             commands::window::quit_app,
             commands::window::hide_window,
             markdown::read_markdown_file,
@@ -144,7 +148,6 @@ pub fn run() {
             agent::agent_list_events,
             agent::agent_send_message,
             agent::agent_cancel_run,
-            agent::agent_preview_approval,
             agent::agent_execute_builtin_tool,
             agent::config::agent_list_provider_configs,
             agent::config::agent_list_model_configs,
@@ -174,11 +177,20 @@ pub fn run() {
             gateway::commands::gateway_login_start,
             gateway::commands::gateway_login_poll,
             gateway::commands::gateway_set_account_enabled,
+            gateway::commands::gateway_set_account_max_inflight,
             gateway::commands::gateway_delete_account,
             gateway::commands::gateway_refresh_account,
             gateway::commands::gateway_checkin_account,
             gateway::commands::gateway_fetch_quota,
             gateway::commands::gateway_reset_account_state,
+            gateway::commands::gateway_list_tasks,
+            gateway::commands::gateway_probe_account,
+            gateway::commands::gateway_probe_models,
+            gateway::commands::gateway_run_tasks,
+            gateway::commands::gateway_task_progress,
+            gateway::commands::gateway_claim_task,
+            gateway::commands::gateway_list_daily,
+            gateway::commands::gateway_run_daily,
             gateway::commands::gateway_add_account,
             gateway::commands::gateway_upsert_account_config,
             gateway::commands::gateway_list_routes,
@@ -187,10 +199,13 @@ pub fn run() {
             gateway::commands::gateway_recent_decisions,
             gateway::commands::gateway_recent_usage,
             gateway::commands::gateway_usage_series,
+            gateway::commands::gateway_usage_series_range,
+            gateway::commands::gateway_usage_summary_range,
             gateway::commands::gateway_usage_summary,
             gateway::commands::gateway_paths,
             gateway::commands::gateway_scheduler_snapshot,
             gateway::commands::open_tool_window,
+            commands::window::open_settings_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

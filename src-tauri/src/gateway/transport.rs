@@ -27,6 +27,22 @@ pub struct UpstreamFailure {
 /// 错误正文只留前 8KB：翻译错误码用不到更多，避免把大段 HTML 带进日志。
 const ERROR_BODY_LIMIT: usize = 8 * 1024;
 
+/// 截断上游正文到上限 —— **必须按 UTF-8 字符边界裁**。
+///
+/// `String::truncate` 在非字符边界上会 panic（中文正文超长时必现，
+/// 表现为整个请求线程崩掉）。这里向前回退到最近的字符边界。
+fn clip_body(mut text: String) -> String {
+    if text.len() <= ERROR_BODY_LIMIT {
+        return text;
+    }
+    let mut cut = ERROR_BODY_LIMIT;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text
+}
+
 /// 一次性 JSON 请求（授权 / 刷新 / 目录这类非流式接口）。
 pub async fn post_json(
     client: &reqwest::Client,
@@ -57,15 +73,19 @@ pub async fn get_json(
 
 async fn decode_json_response(response: reqwest::Response) -> Result<serde_json::Value, GatewayError> {
     let status = response.status();
-    let mut text = response.text().await.unwrap_or_default();
-    if text.len() > ERROR_BODY_LIMIT {
-        text.truncate(ERROR_BODY_LIMIT);
-    }
+    let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(GatewayError::upstream(status.as_u16(), text));
+        // 只有**错误正文**才截断（限制日志体积）；
+        // 成功响应必须完整 —— 任务清单/模型目录都可能远超 8KB，
+        // 早期版本在这里一并截断，导致"EOF while parsing a string at column 8191"。
+        return Err(GatewayError::upstream(status.as_u16(), clip_body(text)));
     }
-    serde_json::from_str(&text)
-        .map_err(|error| GatewayError::network(format!("上游返回的不是合法 JSON：{error}")))
+    serde_json::from_str(&text).map_err(|error| {
+        GatewayError::network(format!(
+            "上游返回的不是合法 JSON（{} 字节）：{error}",
+            text.len()
+        ))
+    })
 }
 
 pub async fn send(
@@ -89,10 +109,7 @@ pub async fn send(
     if status.is_success() {
         return Ok(response);
     }
-    let mut body = response.text().await.unwrap_or_default();
-    if body.len() > ERROR_BODY_LIMIT {
-        body.truncate(ERROR_BODY_LIMIT);
-    }
+    let body = clip_body(response.text().await.unwrap_or_default());
     Err(UpstreamFailure {
         status: status.as_u16(),
         body,
@@ -169,6 +186,22 @@ fn sse_payload(frame: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn body_clipping_respects_utf8_boundaries() {
+        // 中文正文超长时截断不能 panic（曾导致整个请求线程崩）。
+        let text = "中文内容".repeat(4000); // 48000 字节
+        let clipped = super::clip_body(text);
+        assert!(clipped.len() <= super::ERROR_BODY_LIMIT);
+        // 仍是合法 UTF-8 且能取字符数（不 panic 即通过）。
+        assert!(clipped.chars().count() > 0);
+    }
+
+    #[test]
+    fn short_bodies_are_untouched() {
+        assert_eq!(super::clip_body("短".to_string()), "短");
+    }
+
+
     use super::*;
 
     #[test]

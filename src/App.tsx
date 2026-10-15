@@ -2,7 +2,7 @@ import { useEffect, useMemo } from "react";
 import { Route, Routes, useLocation } from "react-router-dom";
 import { AppToaster } from "@/components/common/AppToaster";
 import { routes } from "@/routes";
-import { currentWindowLabel, setWindowInteractive } from "@/api/window";
+import { currentWindowLabel } from "@/api/window";
 
 /** 工具窗口的标签约定是 `tool-<id>`（见 src-tauri 的 open_tool_window）。 */
 const TOOL_WINDOW_PREFIX = "tool-";
@@ -22,15 +22,6 @@ function RoutedApp() {
       window.location.hash = `#/tool/${toolId}`;
     }
   }, [toolId, location.pathname]);
-
-  useEffect(() => {
-    // 点击穿透是**岛体那个窗口**的策略，且 Rust 侧是全局开关：
-    // 工具窗口绝不能去改它，否则岛体的穿透行为会被别的窗口随手关掉。
-    if (toolId) return;
-    // 设置中心是完整窗口页面，必须关闭灵动岛区域外的点击穿透；
-    // 回到首页后恢复透明窗口的局部命中策略。
-    void setWindowInteractive(location.pathname !== "/");
-  }, [location.pathname, toolId]);
 
   return (
     <>

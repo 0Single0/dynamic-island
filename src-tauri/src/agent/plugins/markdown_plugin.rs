@@ -21,7 +21,7 @@ pub fn manifest() -> PluginManifest {
         id: "markdown".into(),
         namespace: "markdown".into(),
         name: "Markdown 转 PDF".into(),
-        version: "0.1.0".into(),
+        version: "0.2.0".into(),
         description: "把 Markdown 文件转换为 PDF".into(),
         icon: "markdown".into(),
         default_scope: false,
@@ -35,12 +35,11 @@ pub fn manifest() -> PluginManifest {
         tools: vec![ToolExposure {
             name: "convert_to_pdf".into(),
             description:
-                "将模型整理出的 Markdown HTML 渲染并打印为 PDF。执行前展示内容并确认，然后通过原生另存为窗口选择输出路径；不覆盖已有文件。"
+                "将 Markdown HTML 渲染并打印为 PDF，写入绝对路径 outputPath。需绝对路径、.pdf 结尾且目标不存在；不覆盖已有文件。"
                     .into(),
-            input_schema: json!({"type":"object","required":["html"],"properties":{"html":{"type":"string","maxLength":524288},"title":{"type":"string","maxLength":120}},"additionalProperties":false}),
+            input_schema: json!({"type":"object","required":["html","outputPath"],"properties":{"html":{"type":"string","maxLength":524288},"title":{"type":"string","maxLength":120},"outputPath":{"type":"string","description":"本机绝对路径，以 .pdf 结尾"}},"additionalProperties":false}),
             capability_id: CAPABILITY_PDF.into(),
             risk_level: RiskLevel::L1,
-            requires_confirmation: true,
             side_effects: vec!["创建 PDF 文件".into()],
             legacy_names: vec!["markdown.convert_to_pdf".into(), "markdown_convert_to_pdf".into()],
             timeout_ms: INTERACTIVE_TIMEOUT_MS,

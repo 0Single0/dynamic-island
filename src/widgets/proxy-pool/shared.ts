@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import * as api from "@/api/gateway";
+import type { GatewayTaskRunResult } from "@/api/gateway";
 
 export interface ModelChip {
   id: string;
+  /** 上游真实模型名。模型级限流按它记，面板标"限流"也要按它对上。 */
+  upstream: string;
   credits: string | null;
   free: boolean;
   context_length: number | null;
@@ -30,6 +33,7 @@ export function useChannelModels() {
           if (!list.some((model) => model.id === entry.model)) {
             list.push({
               id: entry.model,
+              upstream: route.upstream_model,
               credits: route.credits,
               free: route.free,
               context_length: route.context,
@@ -60,15 +64,37 @@ export function useChannelModels() {
   return map;
 }
 
+/**
+ * 取错误的可读文本。
+ *
+ * **Tauri 命令失败时拒绝的是一个字符串**（`Err(String)`），不是 `Error` 实例 ——
+ * 所以 `reason instanceof Error ? reason.message : "失败"` 这种写法永远走兜底，
+ * 把后端带回来的上游原文丢掉（探针一直只显示"探针失败"就是这个原因）。
+ */
+export function errorText(reason: unknown, fallback: string): string {
+  if (typeof reason === "string" && reason.trim() !== "") return reason;
+  if (reason instanceof Error && reason.message.trim() !== "") return reason.message;
+  return fallback;
+}
+
 export function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
   return String(value);
 }
 
+/**
+ * 时长。冷却可能长到"第二天才恢复"（模型额度按天重置），
+ * 所以超过一小时要进位到小时/天 —— 别让人看到「1260m」这种东西。
+ */
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
-  return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${Math.round(hours)}h`;
+  return `${Math.round(hours / 24)}d`;
 }
 
 export function formatClock(ts: number): string {
@@ -103,4 +129,44 @@ export function errorLabel(kind: string): string {
     internal: "网关内部错误",
   };
   return labels[kind] ?? kind;
+}
+
+/**
+ * 任务执行状态：放在**模块级**而不是组件里。
+ *
+ * 为什么：任务执行是长任务（18 项 × 最多 10 轮 × 1.1 秒间隔），
+ * 存在组件 state 里的话，切到别的账号/页面会卸载组件 → 状态与结果全丢，
+ * 看起来就像"执行被重置了"（其实上游还在跑，只是界面忘了）。
+ */
+export interface TaskRunState {
+  running: boolean;
+  results: GatewayTaskRunResult[] | null;
+  summary: { done: number; earned: number } | null;
+  error: string | null;
+}
+
+const EMPTY_RUN: TaskRunState = { running: false, results: null, summary: null, error: null };
+const runStates = new Map<string, TaskRunState>();
+const runListeners = new Set<() => void>();
+
+export function readTaskRun(key: string): TaskRunState {
+  return runStates.get(key) ?? EMPTY_RUN;
+}
+
+export function writeTaskRun(key: string, patch: Partial<TaskRunState>) {
+  runStates.set(key, { ...readTaskRun(key), ...patch });
+  for (const listener of runListeners) listener();
+}
+
+/** 订阅任务执行状态（跨组件挂载存活）。 */
+export function useTaskRunState(key: string): TaskRunState {
+  const [, force] = useState(0);
+  useEffect(() => {
+    const listener = () => force((value) => value + 1);
+    runListeners.add(listener);
+    return () => {
+      runListeners.delete(listener);
+    };
+  }, []);
+  return readTaskRun(key);
 }

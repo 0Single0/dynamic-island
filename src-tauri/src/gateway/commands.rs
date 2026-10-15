@@ -37,6 +37,17 @@ pub async fn gateway_status(state: State<'_, SharedGateway>) -> Result<Value, St
         "error": status.error,
         "enabled": config.enabled,
         "port": config.port,
+        // 实际生效的端口：端口冲突时会回退，配置里的 port ≠ 实际监听端口。
+        "actual_port": status.addr.as_deref().and_then(|addr| {
+            addr.rsplit(':').next().and_then(|port| port.parse::<u16>().ok())
+        }),
+        "allow_lan": config.allow_lan,
+        // 内网访问地址（allow_lan 开着才给）：枚举本机网卡 IP，拼上实际端口。
+        "lan_addr": if config.allow_lan {
+            Some(format!("http://{}:{}", lan_ip().unwrap_or_else(|| "<内网IP>".into()), actual_port(&status)))
+        } else {
+            None
+        },
         "auth": if config.api_keys.is_empty() { "open" } else { "api_key" },
         // 只回短哈希：面板能识别"配了几把、是不是同一把"，但拿不到明文。
         "api_keys": config.api_keys
@@ -65,12 +76,31 @@ pub async fn gateway_status(state: State<'_, SharedGateway>) -> Result<Value, St
     }))
 }
 
-/// 开关 HTTP 服务（重启岛后生效）与写入 API Key。
+/// 实际监听端口（回退后可能与配置不同）。
+fn actual_port(status: &crate::gateway::state::ServerStatus) -> u16 {
+    status
+        .addr
+        .as_deref()
+        .and_then(|addr| addr.rsplit(':').next()?.parse::<u16>().ok())
+        .unwrap_or(0)
+}
+
+/// 本机 primary 内网 IP（发 UDP 包到外网地址、看本地 socket 绑到哪个 IP ——
+/// 不真正发包）。失败就给 None，面板显示占位符。
+fn lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("223.5.5.5:80").ok()?;
+    let local = socket.local_addr().ok()?;
+    Some(local.ip().to_string())
+}
+
+/// 开关 HTTP 服务（重启岛后生效）与写入 API Key / 内网访问开关。
 #[tauri::command]
 pub async fn gateway_set_runtime(
     state: State<'_, SharedGateway>,
     enabled: Option<bool>,
     api_keys: Option<Vec<String>>,
+    allow_lan: Option<bool>,
 ) -> Result<Value, String> {
     let config = state
         .edit_config(|config| {
@@ -80,9 +110,12 @@ pub async fn gateway_set_runtime(
             if let Some(api_keys) = api_keys {
                 config.api_keys = api_keys;
             }
+            if let Some(allow_lan) = allow_lan {
+                config.allow_lan = allow_lan;
+            }
         })
         .map_err(message)?;
-    Ok(json!({ "enabled": config.enabled, "api_keys": config.api_keys.len() }))
+    Ok(json!({ "enabled": config.enabled, "allow_lan": config.allow_lan, "api_keys": config.api_keys.len() }))
 }
 
 /// 立即重建模型矩阵（面板的"刷新目录"）。
@@ -257,6 +290,29 @@ pub async fn gateway_set_account_enabled(
     Ok(json!({ "ok": true }))
 }
 
+/// 设置单个账号的并发上限（面板"请求中"列点开改）。`None` = 回落默认。
+///
+/// 立即生效：写库后重建账号池（`replace` 会带上运行态，冷却/额度不丢）。
+#[tauri::command]
+pub async fn gateway_set_account_max_inflight(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    max_inflight: Option<u32>,
+) -> Result<Value, String> {
+    let Some(account) = state.account(&channel_id, &uid) else {
+        return Err(format!("账号 {channel_id}/{uid} 不存在"));
+    };
+    // 先在池子上生效（不用等重建），再落库持久化。
+    account.set_max_inflight(max_inflight.unwrap_or(state.config().concurrency.per_account.max(1)));
+    state
+        .storage
+        .set_account_max_inflight(&channel_id, &uid, max_inflight)
+        .map_err(message)?;
+    state.reload_accounts().map_err(message)?;
+    Ok(json!({ "ok": true, "max_inflight": account.max_inflight() }))
+}
+
 #[tauri::command]
 pub async fn gateway_delete_account(
     state: State<'_, SharedGateway>,
@@ -306,6 +362,212 @@ pub async fn gateway_fetch_quota(
         .map_err(message)?;
     account.set_quota(snapshot.clone());
     serde_json::to_value(snapshot).map_err(|error| error.to_string())
+}
+
+/// 单账号真实探针：发一条最小请求验证这个账号到底能不能用。
+///
+/// `model` 可指定（不指定就用该渠道第一个可用模型），
+/// 与参考实现的 `/accounts/test` 同口径：真实打上游、成功清错误、失败记冷却。
+#[tauri::command]
+pub async fn gateway_probe_account(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    model: Option<String>,
+) -> Result<Value, String> {
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let outcome =
+        crate::gateway::core::dispatch::probe_account(
+            &state,
+            &account,
+            model.as_deref(),
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        // 探针失败要把**上游原文**带回去：只报"失败"等于让人猜。
+        .map_err(|error| error.describe())?;
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+/// 该渠道可用于测试的模型列表（探针的下拉选项）。
+#[tauri::command]
+pub async fn gateway_probe_models(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+) -> Result<Value, String> {
+    let matrix = state.ensure_matrix(false).await;
+    let models: Vec<String> = matrix
+        .public_models()
+        .into_iter()
+        .filter(|model| {
+            matrix
+                .routes(model)
+                .iter()
+                .any(|route| route.channel_id == channel_id)
+        })
+        .collect();
+    Ok(json!(models))
+}
+
+/// 渠道任务清单（面板「任务」表格）。渠道没有任务体系时返回 null。
+#[tauri::command]
+pub async fn gateway_list_tasks(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+) -> Result<Value, String> {
+    let adapter = state.channel(&channel_id).ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .first_account_for(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 还没有账号，先登录一个"))?;
+    let tasks = adapter
+        .list_tasks(&state.client, &account)
+        .await
+        .map_err(message)?;
+    Ok(match tasks {
+        Some(tasks) => Value::Array(
+            tasks
+                .into_iter()
+                .map(|task| serde_json::to_value(task).unwrap_or(Value::Null))
+                .collect(),
+        ),
+        None => Value::Null,
+    })
+}
+
+/// 一键执行该账号的任务：**后台跑**，结果逐条进进度表，前端轮询即可实时看到。
+///
+/// 同一账号已在执行时直接返回 false（跳过），避免重复上报把任务搞乱。
+#[tauri::command]
+pub async fn gateway_run_tasks(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+) -> Result<Value, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    if !state.begin_task_run(&channel_id, &uid) {
+        return Ok(json!({ "started": false, "reason": "该账号的任务正在执行中" }));
+    }
+
+    let shared = std::sync::Arc::clone(&state);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    // 进度消费者：把每条结果写进状态表，前端轮询读到就能实时展示。
+    let consumer_state = std::sync::Arc::clone(&shared);
+    let consumer_channel = channel_id.clone();
+    let consumer_uid = uid.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(result) = receiver.recv().await {
+            consumer_state.push_task_result(&consumer_channel, &consumer_uid, result);
+        }
+    });
+
+    let runner_state = std::sync::Arc::clone(&shared);
+    let runner_channel = channel_id.clone();
+    let runner_uid = uid.clone();
+    let client = state.client.clone();
+    tauri::async_runtime::spawn(async move {
+        let snapshot = account.snapshot();
+        let outcome = adapter.run_tasks(&client, &snapshot, sender).await;
+        let (done, earned) = match &outcome {
+            Ok(results) => (
+                results.iter().filter(|r| r.status == "done").count() as u32,
+                results.iter().map(|r| r.earned).sum(),
+            ),
+            Err(error) => {
+                runner_state.fail_task_run(&runner_channel, &runner_uid, &error.message);
+                return;
+            }
+        };
+        runner_state.finish_task_run(&runner_channel, &runner_uid, done, earned);
+    });
+
+    Ok(json!({ "started": true }))
+}
+
+/// 任务执行进度（前端轮询）：running / 逐条结果 / 汇总。
+#[tauri::command]
+pub async fn gateway_task_progress(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+) -> Result<Value, String> {
+    Ok(state.task_progress(&channel_id, &uid))
+}
+
+/// 该账号今天有哪些每日动作（签到 / 猫猫旅行 / 每日活跃对话）。
+///
+/// 动作清单由**渠道**按 realm 给出：国内版有签到与猫猫旅行、国际版有每日活跃对话，
+/// 两边不重叠 —— 面板不认识任何具体渠道，只按清单渲染。
+#[tauri::command]
+pub async fn gateway_list_daily(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+) -> Result<Value, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let actions = adapter
+        .daily_actions(&state.client, &account.snapshot())
+        .await
+        .map_err(|error| error.describe())?;
+    Ok(json!(actions))
+}
+
+/// 执行一个每日动作（签到 / 派出旅行 / 领奖 / 每日活跃对话）。
+///
+/// 同步返回：这几个动作都是单次请求，不像任务中心那样要几十秒 ——
+/// 不需要后台跑 + 轮询那一套。
+#[tauri::command]
+pub async fn gateway_run_daily(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    code: String,
+) -> Result<Value, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let outcome = adapter
+        .run_daily_action(&state.client, &account.snapshot(), &code)
+        .await
+        .map_err(|error| error.describe())?;
+    Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
+}
+
+/// 领取**单项**已达标任务的奖励（任务行上的「领取」）。
+///
+/// 与 `gateway_run_tasks` 的区别：这里不上报任何事件，只调领奖接口 ——
+/// 用于"进度早就达标了、只是没领过"的情况（例如你在官方客户端手动做完的任务）。
+#[tauri::command]
+pub async fn gateway_claim_task(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    code: String,
+) -> Result<crate::gateway::channels::TaskRunResult, String> {
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    adapter
+        .claim_task(&state.client, &account.snapshot(), &code)
+        .await
+        .map_err(|error| error.message)
 }
 
 /// 重置账号的运行态：清冷却、熔断、失败计数、模型级限流。
@@ -479,6 +741,36 @@ pub async fn gateway_usage_series(
         .storage
         .usage_series(hours, model.as_deref(), bucket)
         .map(Value::Array)
+        .map_err(message)
+}
+
+/// 指定毫秒时间戳区间（日期选择器用）。桶宽按跨度自适应。
+#[tauri::command]
+pub async fn gateway_usage_series_range(
+    state: State<'_, SharedGateway>,
+    from_ms: i64,
+    to_ms: i64,
+    model: Option<String>,
+) -> Result<Value, String> {
+    let span_hours = ((to_ms - from_ms).max(1) / 3_600_000).max(1) as u64;
+    let bucket = if span_hours > 72 { 24 } else { 1 };
+    state
+        .storage
+        .usage_series_range(from_ms, to_ms, model.as_deref(), bucket)
+        .map(Value::Array)
+        .map_err(message)
+}
+
+/// 指定毫秒时间戳区间的汇总。
+#[tauri::command]
+pub async fn gateway_usage_summary_range(
+    state: State<'_, SharedGateway>,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Value, String> {
+    state
+        .storage
+        .usage_summary_range(from_ms, to_ms)
         .map_err(message)
 }
 

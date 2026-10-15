@@ -78,7 +78,6 @@ pub struct ToolExposure {
     pub input_schema: Value,
     pub capability_id: String,
     pub risk_level: RiskLevel,
-    pub requires_confirmation: bool,
     #[serde(default)]
     pub side_effects: Vec<String>,
     /// 历史模型工具名，例如 `computer.inspect_window`、`computer_inspect_window`。
@@ -189,7 +188,6 @@ pub struct ToolStatus {
     pub description: String,
     pub capability_id: String,
     pub risk_level: RiskLevel,
-    pub requires_confirmation: bool,
     pub legacy_names: Vec<String>,
     pub available: bool,
 }
@@ -217,7 +215,6 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
                 capability_id: "computer.inspect_window".into(),
                 risk_level: RiskLevel::L1,
-                requires_confirmation: true,
                 side_effects: vec![],
                 legacy_names: vec!["computer.inspect_window".into()],
                 timeout_ms: INTERACTIVE_TIMEOUT_MS,

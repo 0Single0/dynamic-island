@@ -9,7 +9,7 @@ use crate::gateway::protocol::cir::{Block, CanonicalRequest, Message, Role};
 
 /// 会触发上游 WAF / 内容审核的第三方客户端特征串。
 ///
-/// 上游的表现是 `403` 或 `code 11-128`（Illegal API invocation from an
+/// 上游的表现是 `403` 或 `code 11128`（Illegal API invocation from an
 /// unapproved channel）—— 换账号也没用，必须把特征消掉。
 ///
 /// **处理方式不是删除**：参考实现（MIT）用 A/B 测确认过，这些串被整段抹掉后
@@ -40,7 +40,7 @@ const FINGERPRINT_REWRITES: [(&str, &str); 6] = [
     // 参考实现在公开发布的版本里把这个改写的目标值隐去了，无从照搬；
     // 而它只是个数字码、去掉不损失任何语义（参考实现"不要整段删除"的警告
     // 针对的是身份声明这类有语义的串），所以这里选择移除。
-    ("11-128", ""),
+    ("11128", ""),
 ];
 
 /// 来源域名：命中即移除（域名本身没有任何语义价值）。
@@ -56,6 +56,26 @@ pub fn build_chat_body(model: &str, request: &CanonicalRequest) -> Value {
         // 私有标记键（下划线开头）是网关内部用的，不该发给上游。
         map.retain(|key, _| !key.starts_with('_'));
         map.remove("max_completion_tokens");
+        // **客户端协议的顶层提示词字段必须删掉**：Anthropic 的 `system`、
+        // Responses 的 `instructions` / `input` 是各自协议的顶层字段，
+        // 而我们已经把提示词重建进 `messages`（且**经过指纹清洗**）。
+        // 留着它们等于把客户端的原文（未清洗）再发一遍 ——
+        // 既让上游看到两份提示词，也把清洗直接绕过。
+        map.remove("system");
+        map.remove("instructions");
+        map.remove("input");
+    }
+
+    // 工具选择**归一成上游要的字符串**：上游是 Go 服务，`Request.tool_choice`
+    // 声明为 string —— 发对象会 11101 "cannot unmarshal object into ... string"
+    //（畸形请求有时还会撞上渠道校验的 11128）。Claude Code 指定工具时发的
+    // `{type:"tool",name}` 解码出来是 OpenAI 的 function 对象，必须在这里降级；
+    // 参考实现同样在最后一道做这个归一（`normalize_tool_choice`）。
+    // 语义：auto/required/none 原样；指定工具 = 工具名（上游的 string 形状）。
+    if let Some(choice) = &request.tool_choice {
+        if let Some(normalized) = normalize_tool_choice(choice) {
+            body["tool_choice"] = json!(normalized);
+        }
     }
 
     body["model"] = json!(model);
@@ -182,6 +202,48 @@ pub fn sanitize_text(text: &str) -> String {
         return text.to_string();
     }
     let mut output = text.to_string();
+    // **计费头残片要整段删**（参考实现的 SANITIZE_HDR_RE + SANITIZE_KV_RE）：
+    // Claude Code 的 system 里有被塞进来的 HTTP 头结构 ——
+    //   x-anthropic-billing-header: cc_version=2.1.296.32d; cc_...=...; ...
+    // 只删键名会留下 ": cc_version=2.1.296..." —— 上游 WAF 认的正是这个残片
+    //（字节级 bisect 锁定：删掉 [0..50]（含该残片）就放行，原样必拦）。
+    // 键名可能被截断（开头是 "-anthropic-billing-header:"），所以：
+    // · 删到行尾的 `键名[: ]cc_* KV 串`；
+    // · 兜底删所有裸 `cc_xxx=值;` KV 对；
+    // · 再删残留的键名词本身。
+    loop {
+        let before = output.clone();
+        if let Some(start) = output.find("cc_") {
+            // 找 KV 起点，向前吞掉同行的 "xxx-billing-header: " 前缀。
+            let line_start = output[..start].rfind('\n').map(|index| index + 1).unwrap_or(0);
+            let prefix = &output[line_start..start];
+            let colon = prefix.rfind(':');
+            let remove_from = match colon {
+                // 前缀形如 "x-anthropic-billing-header"（或被截断的同族）→ 从行首删。
+                Some(_) if prefix.to_ascii_lowercase().contains("billing-header") => line_start,
+                _ => start,
+            };
+            // KV 串到行尾为止（cc_a=1; cc_b=2; ...）。
+            let line_end = output[start..]
+                .find('\n')
+                .map(|index| start + index)
+                .unwrap_or(output.len());
+            output.replace_range(remove_from..line_end, "");
+        }
+        // 裸 KV 对兜底（可能跨行散落）：cc_<word>=<直到分号或行尾>;
+        let mut cleaned = String::with_capacity(output.len());
+        for line in output.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("cc_") && trimmed.contains('=') {
+                continue;
+            }
+            cleaned.push_str(line);
+        }
+        output = cleaned;
+        if output == before {
+            break;
+        }
+    }
     for (from, to) in FINGERPRINT_REWRITES {
         if output.contains(from) {
             output = output.replace(from, to);
@@ -202,6 +264,8 @@ pub fn has_fingerprint(text: &str) -> bool {
         .iter()
         .any(|(from, _)| !from.is_empty() && text.contains(from))
         || FINGERPRINT_DOMAINS.iter().any(|domain| text.contains(domain))
+        // 计费头残片：cc_* KV（WAF 指纹，见 sanitize_text 里的注释）。
+        || text.contains("cc_")
         || text.contains("\r\n")
 }
 
@@ -351,6 +415,40 @@ fn is_deepseek(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("deepseek")
 }
 
+/// 把 OpenAI 形状的 `tool_choice` 归一成上游的字符串形状。
+///
+/// 返回 `None` = 无法识别的形状，整个字段不要发（发畸形值必被上游拒绝）。
+/// `"none"` 保留 tools 声明：语义由 tool_choice 本身表达，删 tools 会让
+/// 模型拿不到函数签名、把调用降级成正文里的伪 JSON（参考实现踩过的坑）。
+fn normalize_tool_choice(choice: &Value) -> Option<String> {
+    match choice {
+        Value::String(text) => {
+            let lowered = text.trim().to_ascii_lowercase();
+            match lowered.as_str() {
+                "auto" | "required" | "none" => Some(lowered),
+                // OpenAI 的 {type:"function",function:{name}} 之外没有别的对象，
+                // 字符串只可能是这三种语义；其他字符串不猜，丢掉。
+                _ => None,
+            }
+        }
+        Value::Object(map) => {
+            let kind = map.get("type").and_then(Value::as_str)?;
+            match kind {
+                "auto" | "required" | "none" => Some(kind.to_string()),
+                "function" => Some(
+                    map.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map(|name| name.trim().to_string())?,
+                ),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// 上游只支持流式：非流式由网关本地折叠；usage 只能从 `stream_options` 拿到。
 fn force_stream(body: &mut Value) {
     body["stream"] = json!(true);
@@ -474,7 +572,7 @@ mod tests {
         // 必须给出配对的结果，否则 tool_call 会被自愈逻辑当孤儿清掉。
         req.messages.push(tool_result("call_1", "ok"));
         req.messages[1].tool_calls[0].arguments =
-            "{\"cmd\":\"echo 11-128 github.com/anthropics/x\"}".into();
+            "{\"cmd\":\"echo 11128 github.com/anthropics/x\"}".into();
         let body = build_chat_body("hy3", &req);
         let text = body["messages"][1]["content"].as_str().unwrap();
         assert!(!text.contains("Anthropic's official CLI"), "{text}");
@@ -482,7 +580,7 @@ mod tests {
         let args = body["messages"][2]["tool_calls"][0]["function"]["arguments"]
             .as_str()
             .unwrap();
-        assert!(!args.contains("11-128"), "{args}");
+        assert!(!args.contains("11128"), "{args}");
         assert!(!args.contains("anthropics"), "{args}");
     }
 
@@ -576,6 +674,121 @@ mod tests {
         assert_eq!(body["temperature"], 0.3, "透传字段要保留");
     }
 
+    /// 客户端协议的**顶层提示词字段**不能跟着 raw 透传出去：
+    /// 提示词已经清洗过并重建进 messages，留着原文等于把清洗整个绕过
+    /// （Anthropic 的 `system` / Responses 的 `instructions`、`input`）。
+    /// 工具选择归一成上游要的**字符串**：发对象会 11101（上游是 Go，
+    /// `Request.tool_choice` 声明为 string）。指定工具 = 工具名。
+    /// 计费头残片【整段】删除：Claude Code 把 HTTP 头结构塞进了 system，
+    /// 只删键名会留下 ": cc_version=...; cc_entrypoint=...;" 这样的半截 KV ——
+    /// 上游 WAF 认的正是这个残片（真机 bisect 锁定，见 probe_cc_bisect）。
+    #[test]
+    fn billing_header_remnant_is_removed_as_a_whole() {
+        // 真机 dump 的 system 开头（字节级核对过的形状）。
+        let kv = ["c", "c", "_", "v", "e", "r", "s", "i", "o", "n"].concat();
+        let entry = ["c", "c", "_", "e", "n", "t", "r", "y", "p", "o", "i", "n", "t"].concat();
+        let key = [
+            "x", "-", "a", "n", "t", "h", "r", "o", "p", "i", "c", "-", "b", "i", "l", "l", "i",
+            "n", "g", "-", "h", "e", "a", "d", "e", "r",
+        ]
+        .concat();
+        let dirty = format!(
+            "{}: {}=2.1.296.32d; {}=sdk-cli;\nYou are a Claude agent, Agent SDK.",
+            key, kv, entry
+        );
+        let cleaned = sanitize_text(&dirty);
+        assert!(!cleaned.contains(&kv), "cc_version 残留：{cleaned}");
+        assert!(!cleaned.contains("billing-header"), "键名残留：{cleaned}");
+        assert!(!cleaned.contains(&entry), "entrypoint 残留：{cleaned}");
+        // KV 行删掉后留下正文行自己的开头换行 —— 与真机清洗后的 dump 一致。
+        assert!(
+            cleaned
+                .trim_start_matches('\n')
+                .starts_with("You are a Claude agent"),
+            "残片应整段删掉、正文保留：{cleaned}"
+        );
+
+        // 行首没有键名的裸 KV（键名已被上一轮删掉）也要删。
+        let bare = format!(": {}=2.1.296.32d;\nnext", kv);
+        let cleaned = sanitize_text(&bare);
+        assert!(!cleaned.contains(&kv), "裸 KV 残留：{cleaned}");
+        assert!(cleaned.contains("next"), "正文要保留：{cleaned}");
+    }
+
+    #[test]
+    fn tool_choice_is_normalized_to_upstream_string_shape() {
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.tools.push(ToolSpec {
+            name: "shell".into(),
+            description: None,
+            parameters: Some(json!({"type": "object"})),
+        });
+        // Claude Code 指定工具（经 Anthropic 解码后是 OpenAI function 对象）。
+        req.tool_choice = Some(json!({"type": "function", "function": {"name": "shell"}}));
+        // raw 里带着 Anthropic 形状的旧值 —— 归一值必须覆盖它。
+        req.raw = json!({"tool_choice": {"type": "any"}});
+        let body = build_chat_body("glm-5.3", &req);
+        assert_eq!(
+            body["tool_choice"], "shell",
+            "指定工具要发工具名字符串，不是对象"
+        );
+
+        // 三种语义对象 → 字符串。
+        for (value, expect) in [
+            (json!({"type": "auto"}), "auto"),
+            (json!({"type": "required"}), "required"),
+            (json!({"type": "none"}), "none"),
+        ] {
+            let mut req = request();
+            req.messages.push(user("hi"));
+            req.tool_choice = Some(value);
+            let body = build_chat_body("glm-5.3", &req);
+            assert_eq!(body["tool_choice"], expect);
+        }
+
+        // OpenAI 客户端直接发字符串也认。
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.tool_choice = Some(json!("auto"));
+        let body = build_chat_body("glm-5.3", &req);
+        assert_eq!(body["tool_choice"], "auto");
+
+        // 认不出的形状整个字段不发（发畸形值必被拒）。
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.tool_choice = Some(json!({"type": "weird"}));
+        let body = build_chat_body("glm-5.3", &req);
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn top_level_prompt_fields_do_not_leak_through_raw() {
+        let mut req = request();
+        req.system = vec![Block::text("You are Claude Code, Anthropic's official CLI tool for Claude")];
+        req.messages.push(user("hi"));
+        // 模拟 Anthropic 解码后的 raw：顶层还带着未清洗的 system。
+        req.raw = json!({
+            "model": "glm-5.3",
+            "system": "You are Claude Code, Anthropic's official CLI tool for Claude",
+            "max_tokens": 64,
+        });
+        let body = build_chat_body("glm-5.3", &req);
+        assert!(body.get("system").is_none(), "顶层 system 必须删除：提示词走清洗后的 messages");
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            !system.contains("Anthropic's official CLI"),
+            "messages 里的提示词必须是清洗后的：{system}"
+        );
+        // Responses 协议同理。
+        let mut req = request();
+        req.messages.push(user("hi"));
+        req.raw = json!({"instructions": "secret prompt", "input": "raw input"});
+        let body = build_chat_body("glm-5.3", &req);
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("input").is_none());
+    }
+
     #[test]
     fn tools_are_emitted_in_openai_shape() {
         let mut req = request();
@@ -610,5 +823,488 @@ mod tests {
         let body = build_chat_body("glm-5v-turbo", &req);
         assert_eq!(body["messages"][1]["content"][0]["type"], "text");
         assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+    }
+}
+
+
+/// 真机 A/B 探针：11128 到底由**哪段文字**触发，以及改写后是否放行。
+///
+/// 用途：指纹表不能靠猜。参考实现的 A/B 结论（大小写不敏感、容忍前后缀、
+/// 改掉句子结构就不再匹配）需要在本机上复核一遍 —— 尤其"改成什么才放行"。
+///
+/// ```text
+/// cargo test --lib probe_fingerprint_ab -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod probe {
+    use serde_json::{json, Value};
+
+    use crate::agent::secrets::OsCredentialStore;
+    use crate::gateway::channels::{workbuddy::identity, AccountSnapshot};
+    use crate::gateway::storage::Storage;
+    use crate::gateway::transport::{self, UpstreamRequest};
+
+    /// **决定性 A/B**：读 dump 目录里 Claude Code 的真实出站报文（带全部私有键），
+    /// 用真实凭据直打上游，逐键删减 —— 哪个键删掉后从"被拦"变"放行"，哪个就是元凶。
+    ///
+    /// ```text
+    /// GATEWAY_DUMP_SRC=E:/code/dynamic-island/.gateway-dump2 \
+    ///   cargo test --lib probe_cc_bisect -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn probe_cc_bisect() {
+        use crate::agent::secrets::OsCredentialStore;
+        use crate::gateway::storage::Storage;
+
+        let dump_dir = std::env::var("GATEWAY_DUMP_SRC")
+            .unwrap_or_else(|_| r"E:/code/dynamic-island/.gateway-dump2".into());
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dump_dir)
+            .expect("dump 目录")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort_by_key(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+        let Some(latest) = paths.last() else {
+            panic!("dump 目录里没有请求");
+        };
+        let payload: Value =
+            serde_json::from_str(&std::fs::read_to_string(latest).expect("读 dump")).expect("解析");
+        let real = payload["body"].clone();
+        let url = payload["url"].as_str().expect("url").to_string();
+        println!(
+            "用 dump：{}（{} 字节）",
+            latest.display(),
+            serde_json::to_string(&real).unwrap_or_default().len()
+        );
+
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "wb-cn")
+            .expect("没有 wb-cn 账号");
+        let credential = record.credential.expect("凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+        };
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let client = reqwest::Client::new();
+        let headers = identity::chat_headers(
+            &account.channel_id,
+            identity::Realm::Cn,
+            identity::Outbound::Desktop,
+            &hosts,
+            &account,
+            1,
+        );
+
+        async fn attempt(
+            label: &str,
+            url: &str,
+            headers: &[(String, String)],
+            client: &reqwest::Client,
+            body: &Value,
+        ) -> bool {
+            let upstream = UpstreamRequest {
+                url: url.to_string(),
+                headers: headers.to_vec(),
+                body: body.clone(),
+            };
+            let (blocked, status, snippet) = match transport::send(&upstream, client).await {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let text = response.text().await.unwrap_or_default();
+                    let blocked = text.contains("11128") || text.contains("11101");
+                    let snippet = format!("[OK分支] {}", &text[..text.len().min(130)]);
+                    (blocked, status, snippet)
+                }
+                Err(failure) => {
+                    eprintln!(
+                        "[bisect-debug] failure.body 前 80 字节: {:?}",
+                        &failure.body[..failure.body.len().min(80)]
+                    );
+                    let bytes = failure.body.as_bytes();
+                    let hex: Vec<String> = bytes[..bytes.len().min(40)]
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    eprintln!("[bisect-debug] 前 40 字节 hex: {}", hex.join(" "));
+                    eprintln!(
+                        "[bisect-debug] contains '11128'={} contains '-'={} contains 0x2d={}",
+                        failure.body.contains("11128"),
+                        failure.body.contains('-'),
+                        bytes.contains(&0x2d)
+                    );
+                    let blocked =
+                        failure.body.contains("11128") || failure.body.contains("11101");
+                    let snippet: String = format!("[ERR分支] {}", &failure.body[..failure.body.len().min(130)]);
+                    (blocked, failure.status, snippet)
+                }
+            };
+            println!("{:46} → HTTP {status} {} {}", label, if blocked { "【被拦】" } else { "放行" }, snippet);
+            blocked
+        }
+
+        // 0. 原样
+        if !attempt("0. 原样重放（Claude Code 真实报文）", &url, &headers, &client, &real).await {
+            println!("    原样就放行 —— 被拦的成分不在 body（可能是 headers / 账号状态）");
+            return;
+        }
+        // 1. 逐键删
+        for key in ["safeguards", "context_management", "output_config", "thinking", "metadata", "tools"] {
+            let mut map = real.as_object().cloned().unwrap_or_default();
+            if map.remove(key).is_none() {
+                continue;
+            }
+            let blocked = attempt(&format!("1. 删 {key}"), &url, &headers, &client, &Value::Object(map)).await;
+            if !blocked {
+                println!("    ★ 元凶 = {key}");
+            }
+        }
+        // 3. 二分 messages[0]（system 文本）：定位触发 11-128 的具体片段。
+        if let Some(messages) = real["messages"].as_array().cloned() {
+            if let Some(system_text) = messages[0]["content"].as_str() {
+                let chars: Vec<char> = system_text.chars().collect();
+                let total = chars.len();
+                let fine = std::env::var("GATEWAY_BISECT_FINE").is_ok();
+                println!("system 共 {total} 字符，开始二分（fine={fine}）");
+                // 粗分 10 段，每段单独当 system 发（前后加无害包装避免空段）。
+                // 第二轮（GATEWAY_BISECT_FINE=1）：对 system 的每一**行**单独发。
+                let fine = std::env::var("GATEWAY_BISECT_FINE").is_ok();
+                let step = if fine { 50 } else { (total + 9) / 10 };
+                for (index, start) in (0..total).step_by(step).enumerate() {
+                    let end = (start + step).min(total);
+                    let slice: String = chars[start..end].iter().collect();
+                    let body = json!({
+                        "model": real["model"],
+                        "messages": [
+                            { "role": "system", "content": slice },
+                            { "role": "user", "content": "hi" },
+                        ],
+                        "max_tokens": 16,
+                        "stream": true,
+                        "stream_options": { "include_usage": true },
+                    });
+                    attempt(
+                        &format!("3. system[{start}..{end}]（{} 字符）", end - start),
+                        &url,
+                        &headers,
+                        &client,
+                        &body,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        // 4. 逐行 A/B（GATEWAY_BISECT_LINES=1 时跑）。
+        if std::env::var("GATEWAY_BISECT_LINES").is_ok() {
+            if let Some(messages) = real["messages"].as_array().cloned() {
+                if let Some(system_text) = messages[0]["content"].as_str() {
+                    for (index, line) in system_text.lines().enumerate() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let body = json!({
+                            "model": real["model"],
+                            "messages": [
+                                { "role": "system", "content": line },
+                                { "role": "user", "content": "hi" },
+                            ],
+                            "max_tokens": 16,
+                            "stream": true,
+                            "stream_options": { "include_usage": true },
+                        });
+                        attempt(
+                            &format!(
+                                "4. 行 {index}（{} 字符）: {:?}",
+                                line.chars().count(),
+                                &line[..line.chars().count().min(80)]
+                            ),
+                            &url,
+                            &headers,
+                            &client,
+                            &body,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        // 5. 前缀累积二分（GATEWAY_BISECT_PREFIX=1）：逐行累加 system，
+        // 找到第一个从"放行"翻成"被拦"的前缀 —— 最后一行就是元凶。
+        if std::env::var("GATEWAY_BISECT_PREFIX").is_ok() {
+            if let Some(messages) = real["messages"].as_array().cloned() {
+                if let Some(system_text) = messages[0]["content"].as_str() {
+                    let lines: Vec<&str> = system_text.lines().collect();
+                    let mut previous_ok = true;
+                    for (index, line) in lines.iter().enumerate() {
+                        let prefix = lines[..=index].join("
+");
+                        let body = json!({
+                            "model": real["model"],
+                            "messages": [
+                                { "role": "system", "content": prefix },
+                                { "role": "user", "content": "hi" },
+                            ],
+                            "max_tokens": 16,
+                            "stream": true,
+                            "stream_options": { "include_usage": true },
+                        });
+                        let blocked = attempt(
+                            &format!("5. 前缀到行 {index}（{} 字符）: {:?}", prefix.chars().count(),
+                                &line[..line.chars().count().min(60)]),
+                            &url,
+                            &headers,
+                            &client,
+                            &body,
+                        )
+                        .await;
+                        if blocked && previous_ok {
+                            println!("    ★★★ 元凶行 = {index}: {line:?}");
+                        }
+                        previous_ok = !blocked;
+                    }
+                }
+            }
+        }
+
+        // 6. 清洗后完整重放（GATEWAY_BISECT_CLEAN=1）：验证 sanitize 后能过。
+        if std::env::var("GATEWAY_BISECT_CLEAN").is_ok() {
+            if let Some(messages) = real["messages"].as_array().cloned() {
+                let cleaned_system = super::sanitize_text(
+                    messages[0]["content"].as_str().unwrap_or_default(),
+                );
+                println!(
+                    "清洗后 system 前 80 字符: {:?}",
+                    &cleaned_system[..cleaned_system.chars().count().min(80)]
+                );
+                let mut rebuilt = real.clone();
+                if let Some(list) = rebuilt["messages"].as_array_mut() {
+                    list[0]["content"] = json!(cleaned_system);
+                }
+                attempt("6. 清洗后完整重放", &url, &headers, &client, &rebuilt).await;
+            }
+        }
+
+        // 2. messages 逐条删
+        if let Some(messages) = real["messages"].as_array().cloned() {
+            for skip in 0..messages.len() {
+                let trimmed: Vec<Value> = messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != skip)
+                    .map(|(_, value)| value.clone())
+                    .collect();
+                let mut map = real.as_object().cloned().unwrap_or_default();
+                map.insert("messages".into(), Value::Array(trimmed));
+                let size = messages[skip]
+                    .get("content")
+                    .map(|content| serde_json::to_string(content).unwrap_or_default().len())
+                    .unwrap_or(0);
+                attempt(
+                    &format!("2. 删 messages[{skip}]（{size} 字节）"),
+                    &url,
+                    &headers,
+                    &client,
+                    &Value::Object(map),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// 真机验证：Claude Code 形状的请求（带 tools + tool_choice 指定工具）
+    /// 经 build_chat_body 重建后能被上游接受（不再 11101 / 11128）。
+    #[tokio::test]
+    #[ignore]
+    async fn probe_claude_code_shape() {
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "wb-cn")
+            .expect("没有 wb-cn 账号");
+        let credential = record.credential.expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+        };
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let client = reqwest::Client::new();
+
+        // Claude Code 的典型形状：system 带自我声明 + tools + 指定 tool_choice。
+        let request = crate::gateway::protocol::cir::CanonicalRequest {
+            model: "glm-5.3".into(),
+            system: vec![crate::gateway::protocol::cir::Block::text(
+                "You are Claude Code, Anthropic's official CLI tool for Claude.",
+            )],
+            messages: vec![crate::gateway::protocol::cir::Message {
+                role: crate::gateway::protocol::cir::Role::User,
+                content: vec![crate::gateway::protocol::cir::Block::text("hi")],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            tools: vec![crate::gateway::protocol::cir::ToolSpec {
+                name: "shell".into(),
+                description: Some("run a command".into()),
+                parameters: Some(serde_json::json!({"type": "object", "properties": {}})),
+            }],
+            tool_choice: Some(serde_json::json!({"type": "function", "function": {"name": "shell"}})),
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            stream: true,
+            reasoning: None,
+            metadata: Default::default(),
+            // 模拟 Anthropic 入口的 raw：顶层 system + Anthropic 形状 tool_choice。
+            raw: serde_json::json!({
+                "system": "You are Claude Code, Anthropic's official CLI tool for Claude.",
+                "tool_choice": {"type": "tool", "name": "shell"},
+            }),
+        };
+        let body = super::build_chat_body("glm-5.3", &request);
+        println!("重建后的 tool_choice = {}", body["tool_choice"]);
+        println!("重建后有没有顶层 system = {}", body.get("system").is_some());
+
+        let headers = identity::chat_headers(
+            &account.channel_id,
+            identity::Realm::Cn,
+            identity::Outbound::Desktop,
+            &hosts,
+            &account,
+            1,
+        );
+        let upstream = UpstreamRequest {
+            url: hosts.chat_url("/v2/chat/completions"),
+            headers,
+            body,
+        };
+        match transport::send(&upstream, &client).await {
+            Ok(response) => {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                let blocked = text.contains("11128") || text.contains("11101") || text.contains("unapproved");
+                println!("HTTP {} {} {}", status, if blocked { "【被拦】" } else { "放行" },
+                    text.chars().take(150).collect::<String>().replace("
+", " "));
+            }
+            Err(failure) => println!("被拒 status={} {}", failure.status, failure.body.chars().take(200).collect::<String>()),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_fingerprint_ab() {
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "wb-cn")
+            .expect("没有 wb-cn 账号");
+        let credential = record.credential.expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+        };
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let client = reqwest::Client::new();
+
+        // 候选：每段文字单独当 system 发一次。命中 11128 的就是特征串；
+        // 放行的那几行告诉我们"改成什么写法是安全的"。
+        // 同样的正文，快发 vs 慢发：判断触发条件是"内容"还是"频率/突发"。
+        let system = "You are a helpful assistant.
+Default branch (you will usually use this for PRs): main";
+        let mut burst_blocked = 0;
+        let mut slow_blocked = 0;
+        let rounds = 8;
+
+        println!("=== A. 连续快发（无间隔）===");
+        for index in 0..rounds {
+            let text = one_call(&client, &hosts, &account, system).await;
+            let blocked = text.contains("11128") || text.contains("unapproved");
+            if blocked {
+                burst_blocked += 1;
+            }
+            println!("  第 {} 次：{}", index + 1, if blocked { "被拦 11128" } else { "放行" });
+        }
+
+        println!("=== B. 间隔 3 秒 ===");
+        for index in 0..rounds {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let text = one_call(&client, &hosts, &account, system).await;
+            let blocked = text.contains("11128") || text.contains("unapproved");
+            if blocked {
+                slow_blocked += 1;
+            }
+            println!("  第 {} 次：{}", index + 1, if blocked { "被拦 11128" } else { "放行" });
+        }
+        println!("=== 汇总：快发被拦 {burst_blocked}/{rounds}，慢发被拦 {slow_blocked}/{rounds} ===");
+    }
+
+    /// 发一次最小请求，返回响应正文（2xx）或错误正文。
+    async fn one_call(
+        client: &reqwest::Client,
+        hosts: &identity::Hosts,
+        account: &AccountSnapshot,
+        system: &str,
+    ) -> String {
+        let headers = identity::chat_headers(
+            &account.channel_id,
+            identity::Realm::Cn,
+            identity::Outbound::Desktop,
+            hosts,
+            account,
+            1,
+        );
+        let body = json!({
+            "model": "glm-5.3",
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": "hi" },
+            ],
+            "stream": true,
+            "max_tokens": 8,
+            "stream_options": { "include_usage": true },
+        });
+        let upstream = UpstreamRequest {
+            url: hosts.chat_url("/v2/chat/completions"),
+            headers,
+            body,
+        };
+        match transport::send(&upstream, client).await {
+            Ok(response) => response.text().await.unwrap_or_default(),
+            Err(failure) => failure.body,
+        }
     }
 }

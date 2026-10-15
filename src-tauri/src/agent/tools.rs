@@ -16,7 +16,6 @@ pub struct ToolDefinition {
     pub description: String,
     pub input_schema: Value,
     pub risk_level: RiskLevel,
-    pub requires_confirmation: bool,
     pub supports_cancellation: bool,
     pub supports_parallel: bool,
     pub side_effects: Vec<String>,

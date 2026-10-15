@@ -21,7 +21,7 @@ use crate::gateway::{
     errors::GatewayError,
     protocol::cir::Usage,
     security::envelope,
-    timeutil::now_ms,
+    timeutil::{civil_to_epoch_ms, now_ms},
 };
 
 const SCHEMA: &str = "
@@ -122,6 +122,44 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// `hours = 0` 表示"由调用方决定起点"（"今日"），返回 None；否则返回 now - hours。
+    fn since_ms(hours: u64) -> Option<i64> {
+        if hours == 0 {
+            None
+        } else {
+            Some(now_ms().saturating_sub(hours * 3600 * 1000) as i64)
+        }
+    }
+
+    /// 本地今天 00:00 的纪元毫秒（"今日"筛选的起点）。
+    fn local_today_start_ms() -> i64 {
+        let (year, month, day, _) = crate::gateway::timeutil::local_date_hour();
+        civil_to_epoch_ms(
+            year as i64,
+            month as i64,
+            day as i64,
+            0,
+            0,
+            0,
+            Self::local_utc_offset_secs(),
+        ) as i64
+    }
+
+    /// 本机 UTC 偏移（秒）：用"本地小时"与"UTC 小时"的差反推，夹回 ±12h。
+    fn local_utc_offset_secs() -> i64 {
+        let now = now_ms() as i64;
+        let (_, _, _, hour) = crate::gateway::timeutil::local_date_hour();
+        let utc_hour = ((now / 3_600_000) % 24) as i64;
+        let mut offset = (hour as i64 - utc_hour) * 3600;
+        if offset > 12 * 3600 {
+            offset -= 24 * 3600;
+        }
+        if offset < -12 * 3600 {
+            offset += 24 * 3600;
+        }
+        offset
+    }
+
     /// 打开（或新建）库并启动用量写入线程。
     pub fn open(dir: &Path, secrets: &dyn SecretStore) -> Result<Arc<Self>, GatewayError> {
         let path = dir.join("state.db");
@@ -287,6 +325,22 @@ impl Storage {
         })
     }
 
+    /// 设置账号的并发上限（None = 回落到渠道/全局默认）。写入 accounts 表。
+    pub fn set_account_max_inflight(
+        &self,
+        channel_id: &str,
+        uid: &str,
+        max_inflight: Option<u32>,
+    ) -> Result<(), GatewayError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET max_inflight = ?3 WHERE channel_id = ?1 AND uid = ?2",
+                params![channel_id, uid, max_inflight.map(|value| value as i64)],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn set_account_enabled(
         &self,
         channel_id: &str,
@@ -344,14 +398,25 @@ impl Storage {
 
     /// 近 `hours` 小时的用量汇总：总量 + 按渠道 + 按模型 + 缓存命中率。
     pub fn usage_summary(&self, hours: u64) -> Result<serde_json::Value, GatewayError> {
-        let since = now_ms().saturating_sub(hours * 3600 * 1000) as i64;
+        // hours = 0 是特殊语义："今日"（本地 00:00 起），面板的日期筛选要用。
+        let since = match Self::since_ms(hours) {
+            Some(value) => value,
+            None => Self::local_today_start_ms(),
+        };
+        self.usage_summary_range(since, now_ms() as i64)
+    }
+
+    /// 指定毫秒区间的汇总（日期选择器用）。
+    pub fn usage_summary_range(&self, from_ms: i64, to_ms: i64) -> Result<serde_json::Value, GatewayError> {
+        let since = from_ms;
+        let until = to_ms.max(from_ms + 1);
         let totals = self.with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
                         COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0),
                         COALESCE(SUM(credit),0), COALESCE(AVG(ttft_ms),0)
-                 FROM usage WHERE ts >= ?1",
-                params![since],
+                 FROM usage WHERE ts >= ?1 AND ts < ?2 AND model NOT LIKE '(未进入调度%)'",
+                params![since, until],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
@@ -365,8 +430,8 @@ impl Storage {
                 },
             )
         })?;
-        let by_channel = self.grouped_usage("channel_id", since)?;
-        let by_model = self.grouped_usage("model", since)?;
+        let by_channel = self.grouped_usage_range("channel_id", since, until)?;
+        let by_model = self.grouped_usage_range("model", since, until)?;
         let (requests, prompt, completion, cached, total, credit, ttft) = totals;
         let hit_rate = if prompt > 0 {
             cached as f64 / prompt as f64
@@ -374,7 +439,7 @@ impl Storage {
             0.0
         };
         Ok(serde_json::json!({
-            "window_hours": hours,
+            "window_hours": ((until - since) / 3_600_000).max(1),
             "requests": requests,
             "prompt_tokens": prompt,
             "completion_tokens": completion,
@@ -389,14 +454,25 @@ impl Storage {
     }
 
     fn grouped_usage(&self, column: &str, since: i64) -> Result<Vec<serde_json::Value>, GatewayError> {
+        self.grouped_usage_range(column, since, now_ms() as i64 + 1)
+    }
+
+    /// 分组统计（指定区间）：排除"未进入调度"行（它们没有真实的模型/渠道归属）。
+    fn grouped_usage_range(
+        &self,
+        column: &str,
+        since: i64,
+        until: i64,
+    ) -> Result<Vec<serde_json::Value>, GatewayError> {
         // column 只来自本函数内部的两个字面量，不存在注入面。
         let sql = format!(
             "SELECT {column}, COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
-             FROM usage WHERE ts >= ?1 GROUP BY {column} ORDER BY 2 DESC LIMIT 50"
+             FROM usage WHERE ts >= ?1 AND ts < ?2 AND {column} NOT LIKE '(未进入调度%'
+             GROUP BY {column} ORDER BY 2 DESC LIMIT 50"
         );
         self.with_conn(|conn| {
             let mut statement = conn.prepare(&sql)?;
-            let mapped = statement.query_map(params![since], |row| {
+            let mapped = statement.query_map(params![since, until], |row| {
                 Ok(serde_json::json!({
                     "key": row.get::<_, String>(0)?,
                     "requests": row.get::<_, i64>(1)?,
@@ -497,7 +573,24 @@ impl Storage {
         model: Option<&str>,
         bucket_hours: u64,
     ) -> Result<Vec<serde_json::Value>, GatewayError> {
-        let since = now_ms().saturating_sub(hours * 3600 * 1000) as i64;
+        // hours = 0 同 summary："今日"。
+        let since = match Self::since_ms(hours) {
+            Some(value) => value,
+            None => Self::local_today_start_ms(),
+        };
+        self.usage_series_range(since, now_ms() as i64, model, bucket_hours)
+    }
+
+    /// 指定毫秒区间的趋势序列（日期选择器用）。
+    pub fn usage_series_range(
+        &self,
+        from_ms: i64,
+        to_ms: i64,
+        model: Option<&str>,
+        bucket_hours: u64,
+    ) -> Result<Vec<serde_json::Value>, GatewayError> {
+        let since = from_ms;
+        let until = to_ms.max(from_ms + 1);
         let bucket_ms = bucket_hours.max(1) as i64 * 3600 * 1000;
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
@@ -506,10 +599,10 @@ impl Storage {
                         COALESCE(SUM(cached_tokens),0), COALESCE(SUM(completion_tokens),0),
                         COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(credit),0)
                  FROM usage
-                 WHERE ts >= ?2 AND (?3 IS NULL OR model = ?3)
+                 WHERE ts >= ?2 AND ts < ?4 AND model NOT LIKE '(未进入调度%)' AND (?3 IS NULL OR model = ?3)
                  GROUP BY bucket ORDER BY bucket",
             )?;
-            let mapped = statement.query_map(params![bucket_ms, since, model], |row| {
+            let mapped = statement.query_map(params![bucket_ms, since, model, until], |row| {
                 Ok(serde_json::json!({
                     "ts": row.get::<_, i64>(0)?,
                     "requests": row.get::<_, i64>(1)?,
@@ -525,16 +618,25 @@ impl Storage {
     }
 
     /// 最近的请求明细（日志表格用）：带上游模型、错误原文与全部用量字段。
+    ///
+    /// `limit = 0` 表示**全量**（日志页的分页在前端做，后端不再截断）。
     pub fn recent_usage(&self, limit: u32) -> Result<Vec<serde_json::Value>, GatewayError> {
+        let sql = if limit > 0 {
+            "SELECT ts, model, COALESCE(upstream_model, model), channel_id, account_uid,
+                    status, stream, attempts, prompt_tokens, completion_tokens,
+                    reasoning_tokens, cached_tokens, total_tokens, credit,
+                    ttft_ms, total_ms, effort, estimated, error_detail
+             FROM usage ORDER BY ts DESC LIMIT ?1"
+        } else {
+            "SELECT ts, model, COALESCE(upstream_model, model), channel_id, account_uid,
+                    status, stream, attempts, prompt_tokens, completion_tokens,
+                    reasoning_tokens, cached_tokens, total_tokens, credit,
+                    ttft_ms, total_ms, effort, estimated, error_detail
+             FROM usage ORDER BY ts DESC"
+        };
         self.with_conn(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT ts, model, COALESCE(upstream_model, model), channel_id, account_uid,
-                        status, stream, attempts, prompt_tokens, completion_tokens,
-                        reasoning_tokens, cached_tokens, total_tokens, credit,
-                        ttft_ms, total_ms, effort, estimated, error_detail
-                 FROM usage ORDER BY ts DESC LIMIT ?1",
-            )?;
-            let mapped = statement.query_map(params![limit as i64], |row| {
+            let mut statement = conn.prepare(sql)?;
+            let map_row = |row: &rusqlite::Row| -> rusqlite::Result<serde_json::Value> {
                 let total_ms: i64 = row.get(15)?;
                 let completion: i64 = row.get(9)?;
                 let decode_ms = total_ms - row.get::<_, Option<i64>>(14)?.unwrap_or(total_ms);
@@ -563,8 +665,20 @@ impl Storage {
                     "estimated": row.get::<_, i64>(17)? != 0,
                     "error_detail": row.get::<_, Option<String>>(18)?,
                 }))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
+            };
+            let mut rows: Vec<serde_json::Value> = Vec::new();
+            if limit > 0 {
+                let mapped = statement.query_map(params![limit as i64], map_row)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            } else {
+                let mapped = statement.query_map([], map_row)?;
+                for row in mapped {
+                    rows.push(row?);
+                }
+            }
+            Ok(rows)
         })
     }
 

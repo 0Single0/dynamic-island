@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// 工具风险等级：只用于界面徽章与轨迹标注，不再驱动任何执行前的确认。
+///
+/// Agent 现在是全自主执行，安全由技术护栏（路径/SSRF/目标窗口校验、token 与步数预算）
+/// 和事后审计（`agent_events`）保证，而不是执行前的人工批准。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RiskLevel {
     L0,
@@ -8,50 +12,7 @@ pub enum RiskLevel {
     L3,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionPolicy {
-    pub allow_l0: bool,
-    pub allow_l1: bool,
-    pub require_confirmation_l2: bool,
-    pub require_confirmation_l3: bool,
-}
-
-impl Default for PermissionPolicy {
-    fn default() -> Self {
-        Self {
-            allow_l0: true,
-            allow_l1: true,
-            require_confirmation_l2: true,
-            require_confirmation_l3: true,
-        }
-    }
-}
-
-impl PermissionPolicy {
-    pub fn requires_confirmation(&self, risk: RiskLevel) -> bool {
-        match risk {
-            RiskLevel::L0 => !self.allow_l0,
-            RiskLevel::L1 => !self.allow_l1,
-            RiskLevel::L2 => self.require_confirmation_l2,
-            RiskLevel::L3 => self.require_confirmation_l3,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovalSnapshot {
-    pub id: String,
-    pub run_id: String,
-    pub tool_name: String,
-    pub args_json: String,
-    pub args_hash: String,
-    pub risk: RiskLevel,
-    pub expires_at: String,
-    pub status: String,
-}
-
+/// 工具参数的稳定哈希（键排序后计算），用于轨迹里核对同一次调用。
 pub fn args_hash(args_json: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -63,9 +24,8 @@ pub fn args_hash(args_json: &str) -> String {
 mod tests {
     use super::*;
     #[test]
-    fn approval_hash_is_stable_and_policy_defaults_to_confirm() {
+    fn approval_hash_is_stable() {
         assert_eq!(args_hash("{}"), args_hash("{}"));
-        assert!(!PermissionPolicy::default().requires_confirmation(RiskLevel::L1));
-        assert!(PermissionPolicy::default().requires_confirmation(RiskLevel::L2));
+        assert_ne!(args_hash("{}"), args_hash("{\"a\":1}"));
     }
 }

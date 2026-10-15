@@ -34,6 +34,15 @@ pub enum ErrorKind {
     NoAccount,
     /// 本地能力缺失（例如该渠道没有登录流程）。
     Unsupported,
+    /// 上游渠道校验拦截（WorkBuddy 的 `11-128 unapproved channel`）。
+    ///
+    /// **真机 A/B 实测：它是随机出现的** —— 同一份报文（完全一样的正文与头）连续发，
+    /// 大部分放行、偶尔被拦；拦了以后重发又能过（"Default branch (...)" 那句 A/B
+    /// 是 1 放行 / 1 被拦，随后的 16 次连发 0 被拦）。所以它**不是**内容指纹、
+    /// 也不是频率，而是上游侧的随机/状态性判定。
+    /// 正确处理 = **重试**（换个账号重试更稳，因为出站身份跟着账号变），
+    /// 而不是清洗正文、更不是把账号拉黑。
+    ChannelBlocked,
     /// 网关自身缺陷。
     Internal,
 }
@@ -47,6 +56,7 @@ impl ErrorKind {
             Self::RateLimited | Self::NoAccount => "rate_limit_error",
             Self::QuotaExhausted => "insufficient_quota",
             Self::ContentPolicy => "content_policy_violation",
+            Self::ChannelBlocked => "channel_blocked_error",
             Self::Upstream5xx | Self::Network | Self::Internal => "api_error",
         }
     }
@@ -72,6 +82,9 @@ pub struct GatewayError {
     pub retryable: bool,
     /// 上游给出的恢复时刻（纪元毫秒），只有 429 一类会带。
     pub reset_at_ms: Option<u64>,
+    /// 上游原文（截断）。**必须留着**：出问题时人要看的就是"上游到底说了什么"，
+    /// 只给一句人话提示（"该模型被上游限流"）等于把线索丢掉。
+    pub upstream: Option<String>,
 }
 
 impl GatewayError {
@@ -89,6 +102,24 @@ impl GatewayError {
             message: message.into(),
             retryable,
             reset_at_ms: None,
+            upstream: None,
+        }
+    }
+
+    /// 附上上游原文（已截断）。空白正文不记，免得出现"上游返回：  "这种噪音。
+    pub fn with_upstream(mut self, upstream: impl Into<String>) -> Self {
+        let text = upstream.into();
+        if !text.trim().is_empty() {
+            self.upstream = Some(text);
+        }
+        self
+    }
+
+    /// 给人看的完整描述：人话提示 + 上游原文（面板、请求日志、探针都用它）。
+    pub fn describe(&self) -> String {
+        match &self.upstream {
+            Some(raw) => format!("{}；上游返回：{}", self.message, raw),
+            None => self.message.clone(),
         }
     }
 

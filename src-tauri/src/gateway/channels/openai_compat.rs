@@ -10,6 +10,24 @@ use crate::gateway::timeutil::civil_to_epoch_ms;
 
 /// 状态码 → 统一语义。调用方（调度器）在拿到结果后会把带 reset 的 429 收窄到模型级冷却。
 pub fn classify_openai_error(status: u16, body: &str) -> GatewayError {
+    // 分类结果带上上游原文：面板的请求日志、探针、错误详情全靠它。
+    classify_status(status, body).with_upstream(raw(body))
+}
+
+/// 上游原文（保留换行，截断到 600 字符）——给"上游返回了什么"用。
+pub fn raw(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.len() <= 600 {
+        return trimmed.to_string();
+    }
+    let mut cut = 600;
+    while cut > 0 && !trimmed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &trimmed[..cut])
+}
+
+fn classify_status(status: u16, body: &str) -> GatewayError {
     match status {
         400 | 413 | 422 => GatewayError::invalid_request(short(body, "上游拒绝了请求参数")),
         401 => GatewayError::new(
@@ -203,17 +221,13 @@ pub fn short(body: &str, fallback: &str) -> String {
 ///
 /// 抽到 = 只冷该模型；抽不到 = 账号级软限流（调度器据此分叉）。
 pub fn parse_rate_limit_reset(body: &str) -> Option<u64> {
-    let marker = body.find("reset at")? + "reset at".len();
-    let rest = body[marker..].trim_start();
-    let stamp = rest.get(..19)?;
-    let bytes = stamp.as_bytes();
-    let digits_ok = bytes
-        .iter()
-        .enumerate()
-        .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit());
-    if !digits_ok {
-        return None;
-    }
+    // **不认措辞、只认时间戳**：上游会按 `Accept-Language` 本地化错误文案 ——
+    // 英文是 "your usage will reset at 2026-09-19 18:29:03 UTC+8"，
+    // 中文是 "将在 2026-10-11 14:46:40 UTC+8 重置，您也可以切换其他模型继续使用"。
+    // 早先只找英文 "reset at"，中文文案就解析不出来 → 退化成"恢复时刻未知"，
+    // 于是按 10m/20m/40m 退避重试，而真实恢复要等到第二天（差了一整天）。
+    let start = find_timestamp(body)?;
+    let stamp = body.get(start..start + 19)?;
     let year: i64 = stamp.get(0..4)?.parse().ok()?;
     let month: i64 = stamp.get(5..7)?.parse().ok()?;
     let day: i64 = stamp.get(8..10)?.parse().ok()?;
@@ -225,6 +239,40 @@ pub fn parse_rate_limit_reset(body: &str) -> Option<u64> {
     Some(civil_to_epoch_ms(
         year, month, day, hour, minute, second, offset,
     ))
+}
+
+/// 找正文里第一个 `YYYY-MM-DD[ T]HH:MM:SS`（分隔符容忍 `-` 与 `/`）。
+///
+/// 逐字节扫描而不是正则：正文里出现这种形状的串只可能是时间戳，
+/// 而错误文案的措辞会因为语种/版本变化 —— 认时间戳比认句子稳。
+fn find_timestamp(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let digit = |slice: &[u8], index: usize| slice[index].is_ascii_digit();
+    (0..=bytes.len() - 19).find(|start| {
+        let slice = &bytes[*start..*start + 19];
+        digit(slice, 0)
+            && digit(slice, 1)
+            && digit(slice, 2)
+            && digit(slice, 3)
+            && matches!(slice[4], b'-' | b'/')
+            && digit(slice, 5)
+            && digit(slice, 6)
+            && matches!(slice[7], b'-' | b'/')
+            && digit(slice, 8)
+            && digit(slice, 9)
+            && matches!(slice[10], b' ' | b'T')
+            && digit(slice, 11)
+            && digit(slice, 12)
+            && slice[13] == b':'
+            && digit(slice, 14)
+            && digit(slice, 15)
+            && slice[16] == b':'
+            && digit(slice, 17)
+            && digit(slice, 18)
+    })
 }
 
 /// 解析 `UTC+8` / `UTC+08:00` / `UTC-5`。

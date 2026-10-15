@@ -36,10 +36,9 @@ mod tests {
             self.0.lock().unwrap().push(name.to_owned());
             if name == "netease.start_or_connect" {
                 assert_eq!(args, json!({}));
-                super::super::tools::ToolExecutionResult::failure(
-                    "USER_DENIED",
-                    "测试执行器模拟用户拒绝启动。没有启动任何真实应用，不要重试。",
-                    false,
+                super::super::tools::ToolExecutionResult::success(
+                    "测试执行器模拟启动成功。没有启动任何真实应用。",
+                    json!({"applicationId":"netease","status":"ready_for_sync"}),
                 )
             } else {
                 super::super::tools::ToolExecutionResult::failure(
@@ -143,9 +142,9 @@ mod tests {
                         "greeting must not advertise the music plugin"
                     );
                 } else {
-                    assert_eq!(calls, vec!["netease.start_or_connect"], "launch request must not be replaced by a music read or retried after denial");
+                    assert_eq!(calls, vec!["netease.start_or_connect"], "launch request must map to the launch tool, not be replaced by a music read");
                     assert!(events.iter().any(|e| e.event_type == "tool_completed"
-                        && e.payload["errorCode"] == "USER_DENIED"));
+                        && e.payload["status"] == "completed"));
                 }
             }
         }
