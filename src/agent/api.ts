@@ -78,6 +78,8 @@ export interface ProviderRecord {
   baseUrl: string;
   hasApiKey: boolean;
   enabled: boolean;
+  /** 内置「本机反代」：由岛内网关实时合成，不可编辑/删除。 */
+  builtin?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -103,6 +105,14 @@ export interface AgentRunResult {
 export function tauriInvoke<T>(command: string, args?: Record<string, unknown>) {
   return invoke<T>(command, args);
 }
+
+/**
+ * 模型/供应商配置变更广播（与 src-tauri/src/agent/config.rs 的常量一致）。
+ *
+ * 设置中心是独立窗口，岛体不会再因为打开设置而重新挂载，
+ * 所以使用模型列表的组件要监听这个事件主动重读，否则会一直显示旧数据。
+ */
+export const CONFIG_CHANGED_EVENT = "agent://config-changed";
 
 export function documentToPlainText(document: JSONContent) {
   const parts: string[] = [];

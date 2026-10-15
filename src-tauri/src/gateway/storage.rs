@@ -325,6 +325,22 @@ impl Storage {
         })
     }
 
+    /// 设置账号的并发上限（None = 回落到渠道/全局默认）。写入 accounts 表。
+    pub fn set_account_max_inflight(
+        &self,
+        channel_id: &str,
+        uid: &str,
+        max_inflight: Option<u32>,
+    ) -> Result<(), GatewayError> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET max_inflight = ?3 WHERE channel_id = ?1 AND uid = ?2",
+                params![channel_id, uid, max_inflight.map(|value| value as i64)],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn set_account_enabled(
         &self,
         channel_id: &str,

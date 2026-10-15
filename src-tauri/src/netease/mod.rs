@@ -8,7 +8,7 @@ pub mod sync;
 
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager};
+use tauri::Manager;
 use tokio::sync::Mutex as AsyncMutex;
 
 use launcher::StartOutcome;
@@ -16,7 +16,6 @@ use sync::{ConnectionState, NeteaseState, SyncRuntime};
 
 /// 全局共享：运行时状态 + 当前 CDP 会话。Arc 包装便于丢进后台任务。
 pub struct NeteaseShared {
-    pub app: AppHandle,
     pub runtime: SyncRuntime,
     pub session: AsyncMutex<Option<cdp::CdpSession>>,
 }
@@ -290,36 +289,10 @@ pub async fn netease_cover_data_url(raw_url: String) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{b64}"))
 }
 
-/// 播放控制与进度跳转的逐次确认；由插件能力处理器调用，CDP 细节不外泄。
-pub async fn confirm_action(
-    shared: &SharedNetease,
-    description: &str,
-    ctx: &crate::agent::plugins::registry::HandlerContext,
-) -> Result<(), crate::agent::tools::ToolExecutionResult> {
-    crate::agent::native_dialog::confirm(
-        &shared.app,
-        format!("{description}\n\n允许本次操作吗？"),
-        ctx.cancelled.as_ref(),
-    )
-    .await
-    .map_err(|error| {
-        if error.error_code.as_deref() == Some("USER_DENIED") {
-            crate::agent::tools::ToolExecutionResult::failure(
-                "USER_DENIED",
-                "用户未确认网易云操作，未执行操作。",
-                false,
-            )
-        } else {
-            error
-        }
-    })
-}
-
 /// 注册命令。
 pub fn setup(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[netease] setup registered");
     let shared: SharedNetease = Arc::new(NeteaseShared {
-        app: app.clone(),
         runtime: SyncRuntime::new(app.clone()),
         session: AsyncMutex::new(None),
     });

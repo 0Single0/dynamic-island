@@ -17,7 +17,8 @@ export function PluginCatalog() {
   return (
     <section className="space-y-3">
       <div className="rounded-xl border border-white/[0.08] bg-white/[0.035] px-4 py-3 text-xs leading-5 text-zinc-500">
-        插件在应用启动时自动加载。使用 AI 时，通过输入框中的 <span className="text-sky-200">@</span> 选择本轮需要调用的插件；高风险操作仍会在执行前请求确认。
+        插件在应用启动时自动加载。使用 AI 时，通过输入框中的 <span className="text-sky-200">@</span> 选择本轮需要调用的插件；Agent 自主执行，不会再弹出确认，
+        安全由路径与网络护栏、步数与用量预算以及事后执行轨迹保证。
       </div>
       {error ? (
         <div className="rounded-xl border border-rose-300/20 bg-rose-300/[0.08] px-4 py-3 text-xs text-rose-100">{error}</div>

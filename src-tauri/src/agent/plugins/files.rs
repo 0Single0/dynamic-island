@@ -1,4 +1,9 @@
-use super::super::{native_dialog, tools::ToolExecutionResult};
+//! 文件工具实现：按模型给出的绝对路径直接读写，并支持自主浏览（列目录 / 搜索）。
+//!
+//! Agent 全自主执行，不再弹出文件选择器：路径来自工具参数。安全边界只保留
+//! 技术护栏——必须绝对路径、拒绝 UNC 与符号链接/Junction、仅纯文本、有大小上限。
+//! 目录列举与搜索让 Agent 能自己探索项目结构，而不是由用户在外部喂路径。
+
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -6,28 +11,54 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::DialogExt;
 
 const MAX_BYTES: usize = 128 * 1024;
+const MAX_LIST_ENTRIES: usize = 500;
+const MAX_SEARCH_SCAN: usize = 5000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadArgs {
-    #[serde(default)]
-    pub suggested_path: Option<String>,
+    pub path: String,
 }
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateArgs {
-    pub filename: String,
+    pub path: String,
     pub content: String,
     #[serde(default)]
-    pub suggested_directory: Option<String>,
+    pub overwrite: bool,
 }
 
-pub fn validate_create(args: &CreateArgs) -> Result<(), String> {
-    let name = args.filename.as_str();
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListArgs {
+    pub path: String,
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchArgs {
+    pub path: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub content_match: bool,
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+}
+
+fn default_depth() -> usize {
+    1
+}
+fn default_max_results() -> usize {
+    50
+}
+
+/// 校验文件名语义（不含路径分隔符与 Windows 保留名）。
+pub fn validate_filename(name: &str) -> Result<(), String> {
     // 不做 trim：带首尾空白的名字会被 Windows 规范化成另一个文件，必须直接拒绝。
     if name.is_empty()
         || name.len() > 180
@@ -36,7 +67,7 @@ pub fn validate_create(args: &CreateArgs) -> Result<(), String> {
         || name.chars().any(char::is_control)
         || name.ends_with(['.', ' '])
     {
-        return Err("filename 必须是普通文件名，不含目录或特殊字符".into());
+        return Err("必须是普通文件名，不含目录或特殊字符".into());
     }
     let stem = name.split('.').next().unwrap_or("").to_uppercase();
     if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -45,12 +76,6 @@ pub fn validate_create(args: &CreateArgs) -> Result<(), String> {
             && stem.ends_with(['1', '2', '3', '4', '5', '6', '7', '8', '9']))
     {
         return Err("不支持 Windows 保留文件名".into());
-    }
-    if !is_text_path(Path::new(name))
-        || args.content.len() > MAX_BYTES
-        || args.content.contains('\0')
-    {
-        return Err("只支持不超过 128 KiB 的 UTF-8 文本，不支持二进制或可执行文件".into());
     }
     Ok(())
 }
@@ -80,53 +105,49 @@ fn is_text_path(path: &Path) -> bool {
             | "csv"
             | "log"
             | "py"
+            | "gitignore"
+            | "env"
+            | "ini"
+            | "conf"
     )
 }
 
-// Hold directory handles without delete sharing while using an explicitly selected path.
-fn guard_selected(path: &Path) -> Result<Vec<fs::File>, String> {
-    if !path.is_absolute()
-        || path.to_string_lossy().starts_with("\\\\")
-        || path.to_string_lossy().starts_with("//")
-    {
-        return Err("请选择本机绝对路径，不支持网络共享路径".into());
+// 拒绝非绝对路径、UNC 与符号链接/Junction/reparse point。
+fn guard_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("必须使用本机绝对路径（例如 E:\\code\\project\\file.ts）".into());
+    }
+    let raw = path.to_string_lossy();
+    if raw.starts_with("\\\\") || raw.starts_with("//") {
+        return Err("不支持网络共享路径".into());
     }
     let mut current = PathBuf::new();
-    let mut guards = vec![];
     for component in path.components() {
         current.push(component);
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 #[cfg(windows)]
                 {
-                    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+                    use std::os::windows::fs::MetadataExt;
                     if metadata.file_attributes() & 0x400 != 0 {
                         return Err("不支持符号链接或 Junction/reparse point".into());
-                    }
-                    if metadata.is_dir() {
-                        guards.push(
-                            fs::OpenOptions::new()
-                                .read(true)
-                                .share_mode(3)
-                                .custom_flags(0x02000000)
-                                .open(&current)
-                                .map_err(|e| e.to_string())?,
-                        );
                     }
                 }
                 if metadata.file_type().is_symlink() {
                     return Err("不支持符号链接".into());
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && current == path => {}
+            // 目标文件本身允许不存在（新建场景），父目录缺失会在写入时暴露。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
     }
-    Ok(guards)
+    Ok(())
 }
 
-pub fn read_selected(path: &Path) -> Result<serde_json::Value, String> {
-    let _guards = guard_selected(path)?;
+/// 读取单个文本文件。
+pub fn read_path(path: &Path) -> Result<serde_json::Value, String> {
+    guard_path(path)?;
     if !is_text_path(path) {
         return Err("暂只支持常见文本文件".into());
     }
@@ -156,154 +177,295 @@ pub fn read_selected(path: &Path) -> Result<serde_json::Value, String> {
     )
 }
 
-pub fn create_selected(path: &Path, content: &str) -> Result<serde_json::Value, String> {
-    let _guards = guard_selected(path)?;
-    validate_create(&CreateArgs {
-        filename: path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or("文件名无效")?
-            .into(),
-        content: content.into(),
-        suggested_directory: None,
-    })?;
-    if path.exists() {
-        return Err("目标文件已存在；此工具只新建、不覆盖，请选择新文件名".into());
+/// 写入文本文件；默认只新建不覆盖，`overwrite=true` 时原子覆盖。
+pub fn create_path(path: &Path, content: &str, overwrite: bool) -> Result<serde_json::Value, String> {
+    guard_path(path)?;
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or("文件名无效")?;
+    validate_filename(name)?;
+    if !is_text_path(path) || content.len() > MAX_BYTES || content.contains('\0') {
+        return Err("只支持不超过 128 KiB 的 UTF-8 文本，不支持二进制或可执行文件".into());
     }
     let parent = path.parent().ok_or("输出目录不存在")?;
+    if !parent.is_dir() {
+        return Err(format!("输出目录不存在：{}", parent.display()));
+    }
+    if path.exists() && !overwrite {
+        return Err("目标文件已存在；如需覆盖请传 overwrite: true".into());
+    }
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    temp.write_all(content.as_bytes())
-        .map_err(|e| e.to_string())?;
+    temp.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
     temp.as_file().sync_all().map_err(|e| e.to_string())?;
-    temp.persist_noclobber(path)
-        .map_err(|e| format!("新建失败，未覆盖现有文件：{}", e.error))?;
-    Ok(json!({"path":path,"bytes":content.len(),"operation":"create","encoding":"UTF-8"}))
+    if overwrite {
+        temp.persist(path)
+            .map_err(|e| format!("写入失败：{}", e.error))?;
+    } else {
+        temp.persist_noclobber(path)
+            .map_err(|e| format!("新建失败，未覆盖现有文件：{}", e.error))?;
+    }
+    Ok(json!({
+        "path": path,
+        "bytes": content.len(),
+        "operation": if overwrite { "overwrite" } else { "create" },
+        "encoding": "UTF-8"
+    }))
 }
 
-pub async fn read(
-    app: &AppHandle,
-    args: ReadArgs,
-    cancelled: &(dyn Fn() -> bool + Sync),
-) -> ToolExecutionResult {
-    if cancelled() {
-        return native_dialog::cancelled_result();
+/// 列目录：返回指定的直接/多层子项，用于 Agent 自主了解项目结构。
+pub fn list_path(path: &Path, depth: usize) -> Result<serde_json::Value, String> {
+    guard_path(path)?;
+    if !path.is_dir() {
+        return Err(format!("不是目录：{}", path.display()));
     }
-    let (send, receive) = tokio::sync::oneshot::channel();
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_title("选择允许 Agent 读取的文本文件");
-    if let Some(path) = args.suggested_path.as_ref().map(Path::new) {
-        if let Some(parent) = path.parent().filter(|p| p.is_absolute()) {
-            dialog = dialog.set_directory(parent);
-        }
-        if let Some(name) = path.file_name().and_then(|p| p.to_str()) {
-            dialog = dialog.set_file_name(name);
-        }
+    let depth = depth.clamp(1, 3);
+    let mut entries = vec![];
+    let mut truncated = false;
+    walk_list(path, depth, &mut entries, &mut truncated)?;
+    Ok(json!({
+        "path": path,
+        "depth": depth,
+        "count": entries.len(),
+        "truncated": truncated,
+        "entries": entries,
+        "untrusted": true
+    }))
+}
+
+fn walk_list(
+    dir: &Path,
+    depth: usize,
+    entries: &mut Vec<serde_json::Value>,
+    truncated: &mut bool,
+) -> Result<(), String> {
+    if depth == 0 || *truncated {
+        return Ok(());
     }
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
-    dialog.pick_file(move |path| {
-        let _ = send.send(path);
+    let mut children = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    children.sort_by_key(|entry| {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        (!is_dir, entry.file_name())
     });
-    let path = match native_dialog::wait(receive, cancelled).await {
-        Ok(Some(path)) => match path.into_path() {
-            Ok(path) => path,
-            Err(_) => {
-                return ToolExecutionResult::failure("INVALID_PATH", "无法解析选择的路径", false)
-            }
-        },
-        Ok(None) => {
-            return ToolExecutionResult::failure("USER_DENIED", "用户取消选取，未读取文件", false)
+    for entry in children {
+        if entries.len() >= MAX_LIST_ENTRIES {
+            *truncated = true;
+            return Ok(());
         }
-        Err(error) => return error,
+        let child = entry.path();
+        let metadata = match fs::symlink_metadata(&child) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let kind = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "dir"
+        } else {
+            "file"
+        };
+        entries.push(json!({
+            "name": entry.file_name().to_string_lossy(),
+            "path": child,
+            "kind": kind,
+            "size": if metadata.is_file() { metadata.len() } else { 0 },
+        }));
+        // 不跟随符号链接，避免递归逃逸。
+        if kind == "dir" {
+            walk_list(&child, depth - 1, entries, truncated)?;
+        }
+    }
+    Ok(())
+}
+
+/// 在目录内搜索：按文件名匹配，可选按文本内容匹配（返回行号与片段）。
+pub fn search_path(
+    path: &Path,
+    pattern: &str,
+    content_match: bool,
+    max_results: usize,
+) -> Result<serde_json::Value, String> {
+    guard_path(path)?;
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern.len() > 200 {
+        return Err("pattern 不能为空且不超过 200 字符".into());
+    }
+    if !path.is_dir() {
+        return Err(format!("搜索起点必须是目录：{}", path.display()));
+    }
+    let needle = pattern.to_lowercase();
+    let max_results = max_results.clamp(1, 200);
+    let mut matches = vec![];
+    let mut scanned = 0usize;
+    let mut truncated = false;
+    search_walk(
+        path,
+        &needle,
+        content_match,
+        max_results,
+        &mut matches,
+        &mut scanned,
+        &mut truncated,
+    );
+    Ok(json!({
+        "path": path,
+        "pattern": pattern,
+        "contentMatch": content_match,
+        "count": matches.len(),
+        "scanned": scanned,
+        "truncated": truncated,
+        "matches": matches,
+        "untrusted": true
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_walk(
+    dir: &Path,
+    needle: &str,
+    content_match: bool,
+    max_results: usize,
+    matches: &mut Vec<serde_json::Value>,
+    scanned: &mut usize,
+    truncated: &mut bool,
+) {
+    if *truncated || matches.len() >= max_results || *scanned >= MAX_SEARCH_SCAN {
+        *truncated = true;
+        return;
+    }
+    let Ok(reader) = fs::read_dir(dir) else {
+        return;
     };
-    match read_selected(&path) {
-        Ok(data) => ToolExecutionResult::success("已读取用户选中的文本文件", data),
-        Err(error) => ToolExecutionResult::failure("FILE_READ_FAILED", error, false),
+    let mut children = reader.filter_map(Result::ok).collect::<Vec<_>>();
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        if matches.len() >= max_results || *scanned >= MAX_SEARCH_SCAN {
+            *truncated = true;
+            return;
+        }
+        let child = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&child) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            // 跳过常见噪声目录，避免把搜索预算耗在依赖与版本库上。
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | "dist" | ".next" | "build" | "vendor"
+            ) {
+                continue;
+            }
+            search_walk(
+                &child,
+                needle,
+                content_match,
+                max_results,
+                matches,
+                scanned,
+                truncated,
+            );
+            continue;
+        }
+        *scanned += 1;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let name_hit = name.to_lowercase().contains(needle);
+        let mut lines = vec![];
+        if content_match && is_text_path(&child) {
+            if let Ok(text) = read_text_capped(&child) {
+                for (index, line) in text.lines().enumerate() {
+                    if line.to_lowercase().contains(needle) {
+                        lines.push(json!({
+                            "line": index + 1,
+                            "text": line.chars().take(200).collect::<String>()
+                        }));
+                        if lines.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if name_hit || !lines.is_empty() {
+            matches.push(json!({
+                "path": child,
+                "name": name,
+                "nameMatch": name_hit,
+                "contentMatches": lines,
+            }));
+        }
     }
 }
 
-pub async fn create(
-    app: &AppHandle,
-    args: CreateArgs,
-    cancelled: &(dyn Fn() -> bool + Sync),
-) -> ToolExecutionResult {
-    if let Err(error) = validate_create(&args) {
-        return ToolExecutionResult::failure("INVALID_TOOL_ARGS", error, false);
+fn read_text_capped(path: &Path) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut bytes = vec![];
+    file.take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_BYTES || bytes.contains(&0) {
+        return Err("文件过大或包含二进制内容".into());
     }
-    if let Err(error) = native_dialog::confirm(app, format!("新建文本文件：{}\n\n内容预览：\n{}\n\n确认后请选择保存位置。只创建新文件，不覆盖已有文件。", args.filename, args.content.chars().take(1200).collect::<String>()), cancelled).await { return error; }
-    let (send, receive) = tokio::sync::oneshot::channel();
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_title("保存 Agent 生成的文本文件（不覆盖）")
-        .set_file_name(&args.filename);
-    if let Some(path) = args
-        .suggested_directory
-        .as_ref()
-        .map(Path::new)
-        .filter(|p| p.is_absolute())
-    {
-        dialog = dialog.set_directory(path);
-    }
-    if let Some(window) = app.get_webview_window("main") {
-        dialog = dialog.set_parent(&window);
-    }
-    dialog.save_file(move |path| {
-        let _ = send.send(path);
-    });
-    let path = match native_dialog::wait(receive, cancelled).await {
-        Ok(Some(path)) => match path.into_path() {
-            Ok(path) => path,
-            Err(_) => {
-                return ToolExecutionResult::failure("INVALID_PATH", "无法解析保存路径", false)
-            }
-        },
-        Ok(None) => {
-            return ToolExecutionResult::failure("USER_DENIED", "用户取消保存，未写入文件", false)
-        }
-        Err(error) => return error,
-    };
-    if cancelled() {
-        return native_dialog::cancelled_result();
-    }
-    match create_selected(&path, &args.content) {
-        Ok(data) => ToolExecutionResult::success("已创建文本文件", data),
-        Err(error) => ToolExecutionResult::failure("FILE_CREATE_FAILED", error, false),
-    }
+    String::from_utf8(bytes).map_err(|_| "非 UTF-8 文本".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn create_read_and_no_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hello.txt");
-        create_selected(&path, "我").unwrap();
-        assert_eq!(read_selected(&path).unwrap()["content"], "我");
-        assert!(create_selected(&path, "replacement").is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "我");
+        create_path(&path, "我", false).unwrap();
+        assert_eq!(read_path(&path).unwrap()["content"], "我");
+        // 默认不覆盖；显式 overwrite 才能改写。
+        assert!(create_path(&path, "replacement", false).is_err());
+        create_path(&path, "replacement", true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }
+
     #[test]
     fn rejects_unsafe_names_and_binary() {
-        for name in ["../a.txt", "a.txt:stream", "CON.txt", "a.exe", "a.txt "] {
-            assert!(
-                validate_create(&CreateArgs {
-                    filename: name.into(),
-                    content: "hi".into(),
-                    suggested_directory: None
-                })
-                .is_err(),
-                "{name}"
-            );
+        for name in ["../a.txt", "a.txt:stream", "CON.txt", "a.txt "] {
+            assert!(validate_filename(name).is_err(), "{name}");
         }
         let dir = tempfile::tempdir().unwrap();
+        // 扩展名护栏由写入路径负责：可执行文件不被接受。
+        assert!(create_path(&dir.path().join("a.exe"), "hi", false).is_err());
         let path = dir.path().join("binary.txt");
         fs::write(&path, [0, 1, 2]).unwrap();
-        assert!(read_selected(&path).is_err());
-        assert!(create_selected(Path::new("\\\\server\\share\\a.txt"), "hi").is_err());
+        assert!(read_path(&path).is_err());
+        assert!(create_path(Path::new("\\\\server\\share\\a.txt"), "hi", false).is_err());
+        // 相对路径被拒绝。
+        assert!(create_path(Path::new("rel.txt"), "hi", false).is_err());
+    }
+
+    #[test]
+    fn lists_directories_with_depth_and_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.ts"), "x").unwrap();
+        fs::write(dir.path().join("README.md"), "hi").unwrap();
+        let flat = list_path(dir.path(), 1).unwrap();
+        assert_eq!(flat["count"], 2);
+        let deep = list_path(dir.path(), 2).unwrap();
+        assert_eq!(deep["count"], 3);
+    }
+
+    #[test]
+    fn searches_by_name_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/config.ts"), "const answer = 42;\n").unwrap();
+        fs::write(dir.path().join("other.txt"), "nothing here\n").unwrap();
+        let by_name = search_path(dir.path(), "config", false, 10).unwrap();
+        assert_eq!(by_name["count"], 1);
+        let by_content = search_path(dir.path(), "answer", true, 10).unwrap();
+        assert_eq!(by_content["count"], 1);
+        assert_eq!(by_content["matches"][0]["contentMatches"][0]["line"], 1);
     }
 }

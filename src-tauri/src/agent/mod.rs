@@ -3,6 +3,8 @@ mod builtin_executor;
 pub mod config;
 pub mod events;
 pub mod filesystem;
+pub mod gateway_link;
+pub mod launcher;
 pub mod limits;
 mod model;
 pub(crate) mod native_dialog;
@@ -22,14 +24,13 @@ mod stream;
 mod tests;
 pub mod tools;
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, State};
 
-use crate::agent::permissions::{args_hash, ApprovalSnapshot, PermissionPolicy, RiskLevel};
 use crate::agent::builtin_executor::BuiltinToolExecutor;
 use crate::agent::plugins::host::{self as plugin_host, PluginEnv};
 use crate::agent::plugins::PluginRuntime;
@@ -46,8 +47,10 @@ pub struct AgentState {
     pub plugins: Arc<PluginRuntime>,
     /// Windows UI Automation 短期目标注册表；跨调用共享以便窗口/元素 ID 复用。
     pub targets: Arc<Mutex<computer::Targets>>,
+    /// 岛内反代网关：作为内置供应商接入（见 `gateway_link`）。
+    /// 网关在 AgentState 之后才建立，所以用 `OnceLock` 延迟挂接。
+    gateway: OnceLock<crate::gateway::SharedGateway>,
     cancelled_runs: RunSet,
-    pending_approvals: Mutex<HashMap<String, ApprovalSnapshot>>,
 }
 
 /// 取消集合共享句柄：插件环境与 Agent 循环看到同一份状态。
@@ -91,9 +94,18 @@ impl AgentState {
             store,
             plugins: Arc::new(PluginRuntime::new()),
             targets: Arc::new(Mutex::new(computer::Targets::default())),
+            gateway: OnceLock::new(),
             cancelled_runs: RunSet::default(),
-            pending_approvals: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 挂接岛内反代网关（启动时调用一次）；重复调用忽略。
+    pub fn attach_gateway(&self, gateway: crate::gateway::SharedGateway) {
+        let _ = self.gateway.set(gateway);
+    }
+
+    pub(crate) fn gateway(&self) -> Option<&crate::gateway::SharedGateway> {
+        self.gateway.get()
     }
 
     /// 运行取消查询的共享句柄，插件环境与 Agent 循环共用同一份状态。
@@ -294,45 +306,6 @@ pub fn agent_cancel_run(state: State<'_, AgentState>, run_id: String) -> Result<
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovalInput {
-    pub run_id: String,
-    pub tool_name: String,
-    pub args_json: String,
-    pub risk: RiskLevel,
-}
-
-#[tauri::command]
-pub fn agent_preview_approval(
-    state: State<'_, AgentState>,
-    input: ApprovalInput,
-) -> Result<ApprovalSnapshot, String> {
-    let policy = PermissionPolicy::default();
-    if !policy.requires_confirmation(input.risk) {
-        return Err("该风险等级按当前策略无需审批".into());
-    }
-    let normalized_args = serde_json::from_str::<Value>(&input.args_json)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|_| input.args_json.clone());
-    let snapshot = ApprovalSnapshot {
-        id: new_id("approval"),
-        run_id: input.run_id,
-        tool_name: input.tool_name,
-        args_hash: args_hash(&normalized_args),
-        args_json: input.args_json,
-        risk: input.risk,
-        expires_at: (unix_seconds() + 300).to_string(),
-        status: "pending".into(),
-    };
-    state
-        .pending_approvals
-        .lock()
-        .map_err(|_| "审批状态不可用".to_string())?
-        .insert(snapshot.id.clone(), snapshot.clone());
-    Ok(snapshot)
-}
-
 /// 统一执行入口：所有内置工具（含手动触发）都经插件运行时转发到 capability。
 #[tauri::command]
 pub async fn agent_execute_builtin_tool(
@@ -362,20 +335,27 @@ async fn resolve_provider_request(
     use adapter::{ModelRequest, ProviderAdapter};
     use provider_error::ProviderError;
     let local = |message: String| ProviderError::local("CONFIGURATION", message, "", "", "");
-    let providers = state
+    let mut providers = state
         .store
         .list_providers()
         .map_err(|e| local(e.to_string()))?;
-    let models = state
+    let mut models = state
         .store
         .list_models()
         .map_err(|e| local(e.to_string()))?;
+    // 内置「本机反代」供应商由网关状态实时合成、不落库：端口回退与渠道目录变化要立刻反映。
+    let mut builtin_key: Option<zeroize::Zeroizing<String>> = None;
+    if let Some(gateway) = state.gateway() {
+        providers.push(gateway_link::builtin_provider(gateway));
+        models.extend(gateway_link::builtin_models(gateway).await);
+        builtin_key = Some(gateway_link::builtin_credential(gateway));
+    }
     let selected_model = match input.model_id.as_deref() {
         Some(id) => Some(
-            state
-                .store
-                .get_model(id)
-                .map_err(|e| local(e.to_string()))?
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .cloned()
                 .ok_or_else(|| local("所选模型不存在".into()))?,
         ),
         None => None,
@@ -408,14 +388,14 @@ async fn resolve_provider_request(
     let endpoint = adapter.endpoint(&provider.base_url);
     security::validate_outbound_url(&endpoint)
         .map_err(|e| local(format!("请求地址不允许: {e:?}")))?;
-    let reference = provider
-        .secret_ref
-        .as_deref()
-        .ok_or_else(|| local("供应商尚未配置密钥".into()))?;
-    let key = secrets::OsCredentialStore
-        .get(reference)
-        .map_err(|e| local(e.to_string()))?
-        .ok_or_else(|| local("供应商尚未配置密钥".into()))?;
+    // 内置反代供应商的密钥来自网关配置（未配密钥时回环开放，用占位符即可）。
+    let key = match provider.secret_ref.as_deref() {
+        Some(reference) => secrets::OsCredentialStore
+            .get(reference)
+            .map_err(|e| local(e.to_string()))?
+            .ok_or_else(|| local("供应商尚未配置密钥".into()))?,
+        None => builtin_key.ok_or_else(|| local("供应商尚未配置密钥".into()))?,
+    };
     let request = ModelRequest {
         model: model.model_id.clone(),
         system: model::SYSTEM_PROMPT.into(),
@@ -449,12 +429,6 @@ async fn resolve_provider_request(
     .await
 }
 
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 fn new_id(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

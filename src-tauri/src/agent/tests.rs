@@ -184,8 +184,8 @@ fn model_tool_catalog_has_unique_names_and_current_pdf_schema() {
         .iter()
         .find(|definition| definition.name == "markdown__convert_to_pdf")
         .expect("markdown PDF tool is registered");
-    assert_eq!(pdf.input_schema["required"], json!(["html"]));
-    assert!(pdf.input_schema["properties"].get("outputPath").is_none());
+    assert_eq!(pdf.input_schema["required"], json!(["html", "outputPath"]));
+    assert!(pdf.input_schema["properties"].get("outputPath").is_some());
     assert!(pdf.input_schema["properties"].get("html").is_some());
 }
 
@@ -222,9 +222,11 @@ async fn production_prompt_and_real_tool_catalog_reach_the_http_request() {
         .collect::<Vec<_>>();
     assert!(names.len() > 3);
     assert!(names.contains(&"system__get_time"));
-    assert!(!names.contains(&"system__launch_app"));
+    assert!(names.contains(&"system__launch_app"));
     assert!(names.contains(&"netease__start_or_connect"));
     assert!(names.contains(&"files__create_text"));
+    assert!(names.contains(&"files__list"));
+    assert!(names.contains(&"files__search"));
     assert!(names.contains(&"computer__list_windows"));
     assert!(names.contains(&"netease__get_current_state"));
     let launch = body["tools"]
@@ -794,12 +796,15 @@ async fn netease_and_markdown_adapters_handle_hostless_contexts() {
     let oversized = executor
         .execute(
             "markdown_convert_to_pdf",
-            json!({"html": "x".repeat(512 * 1024 + 1)}),
+            json!({"html": "x".repeat(512 * 1024 + 1), "outputPath": "E:\\tmp\\out.pdf"}),
         )
         .await;
     assert_eq!(oversized.error_code.as_deref(), Some("INVALID_TOOL_ARGS"));
     let no_host = executor
-        .execute("markdown.convert_to_pdf", json!({"html": "<h1>hi</h1>"}))
+        .execute(
+            "markdown.convert_to_pdf",
+            json!({"html": "<h1>hi</h1>", "outputPath": "E:\\tmp\\out.pdf"}),
+        )
         .await;
     assert_eq!(no_host.error_code.as_deref(), Some("HOST_UNAVAILABLE"));
 }

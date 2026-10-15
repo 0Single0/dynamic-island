@@ -74,7 +74,8 @@ pub struct PoolAccount {
     pub priority: u32,
     /// 同档内的容量份额。
     pub weight: u32,
-    pub max_inflight: u32,
+    /// 并发上限（面板可调）。原子：PoolAccount 常在 Arc 后面共享，&self 也要能改。
+    max_inflight: AtomicU32,
     pub proxy_slot: Option<String>,
     pub runtime: AccountRuntime,
 }
@@ -90,7 +91,7 @@ impl PoolAccount {
             quota: RwLock::new(None),
             priority: 100,
             weight: 1,
-            max_inflight: 1,
+            max_inflight: AtomicU32::new(1),
             proxy_slot: None,
             runtime: AccountRuntime::default(),
         }
@@ -161,11 +162,11 @@ impl PoolAccount {
 
     /// 取一个在飞槽位。返回 None = 该账号并发已满（调度器应换号或让请求排队）。
     pub fn try_acquire(self: &Arc<Self>) -> Option<InflightGuard> {
-        if self.runtime.inflight.load(Ordering::SeqCst) >= self.max_inflight {
+        if self.runtime.inflight.load(Ordering::SeqCst) >= self.max_inflight() {
             return None;
         }
         // 先加再看：避免并发下两个请求同时通过上限判断。
-        if self.runtime.inflight.fetch_add(1, Ordering::SeqCst) >= self.max_inflight {
+        if self.runtime.inflight.fetch_add(1, Ordering::SeqCst) >= self.max_inflight() {
             self.runtime.inflight.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
@@ -285,6 +286,7 @@ impl PoolAccount {
         ) {
             *target = source.clone();
         }
+        self.max_inflight.store(previous.max_inflight(), Ordering::SeqCst);
         if let Some(quota) = previous.quota() {
             self.set_quota(Some(quota));
         }
@@ -293,6 +295,15 @@ impl PoolAccount {
     /// 清空全部惩罚状态（面板"重置状态"按钮）。
     ///
     /// 只清运行态：凭据、额度、启停都不动。
+    /// 调整并发上限（面板可改）。不低于 1；在飞中的请求不受影响（只影响新请求）。
+    pub fn set_max_inflight(&self, value: u32) {
+        self.max_inflight.store(value.max(1), Ordering::SeqCst);
+    }
+
+    pub fn max_inflight(&self) -> u32 {
+        self.max_inflight.load(Ordering::SeqCst)
+    }
+
     pub fn reset_runtime(&self) {
         self.runtime.cooldown_until.store(0, Ordering::SeqCst);
         self.runtime.balance_until.store(0, Ordering::SeqCst);
@@ -418,7 +429,7 @@ impl PoolAccount {
 
     /// 该账号在飞是否已达上限（调度器据此换号，而不是排队等它）。
     pub fn inflight_full(&self) -> bool {
-        self.inflight() >= self.max_inflight
+        self.inflight() >= self.max_inflight()
     }
 
     fn model_cooldowns(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, u64>> {
@@ -527,7 +538,7 @@ impl PoolAccount {
                 limits
             },
             inflight: self.inflight(),
-            max_inflight: self.max_inflight,
+            max_inflight: self.max_inflight(),
             priority: self.priority,
             weight: self.weight,
             proxy_slot: self.proxy_slot.clone(),
@@ -545,7 +556,7 @@ mod tests {
         let mut account = PoolAccount::new("fake", "u1");
         account.nickname = "测试账号".into();
         account.requires_credential = false;
-        account.max_inflight = 1;
+        account.set_max_inflight(1);
         Arc::new(account)
     }
 

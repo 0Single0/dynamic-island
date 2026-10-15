@@ -51,7 +51,6 @@ pub fn manifest() -> PluginManifest {
                 input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
                 capability_id: CAPABILITY_STATE.into(),
                 risk_level: RiskLevel::L0,
-                requires_confirmation: false,
                 side_effects: vec![],
                 legacy_names: vec![
                     "netease.get_current_state".into(),
@@ -65,7 +64,6 @@ pub fn manifest() -> PluginManifest {
                 input_schema: json!({"type":"object","required":["action"],"properties":{"action":{"type":"string","enum":["play","pause","next","previous"]}},"additionalProperties":false}),
                 capability_id: CAPABILITY_CONTROL.into(),
                 risk_level: RiskLevel::L1,
-                requires_confirmation: true,
                 side_effects: vec!["修改播放状态".into()],
                 legacy_names: vec!["netease.control".into(), "netease_control".into()],
                 timeout_ms: INTERACTIVE_TIMEOUT_MS,
@@ -76,7 +74,6 @@ pub fn manifest() -> PluginManifest {
                 input_schema: json!({"type":"object","required":["positionMs"],"properties":{"positionMs":{"type":"integer","minimum":0}},"additionalProperties":false}),
                 capability_id: CAPABILITY_SEEK.into(),
                 risk_level: RiskLevel::L1,
-                requires_confirmation: true,
                 side_effects: vec!["修改播放进度".into()],
                 legacy_names: vec!["netease.seek".into(), "netease_seek".into()],
                 timeout_ms: INTERACTIVE_TIMEOUT_MS,
@@ -87,7 +84,6 @@ pub fn manifest() -> PluginManifest {
                 input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
                 capability_id: CAPABILITY_CONNECT.into(),
                 risk_level: RiskLevel::L1,
-                requires_confirmation: true,
                 side_effects: vec!["启动桌面应用".into(), "开启经用户确认的本机音乐同步连接".into()],
                 legacy_names: vec!["netease.start_or_connect".into(), "netease_start_or_connect".into()],
                 timeout_ms: INTERACTIVE_TIMEOUT_MS,
@@ -145,12 +141,6 @@ pub fn handlers(shared: Option<SharedNetease>) -> HandlerMap {
                     false,
                 );
             };
-            if let Err(error) =
-                crate::netease::confirm_action(&shared, &format!("网易云播放控制：{action}"), &ctx)
-                    .await
-            {
-                return error;
-            }
             if ctx.is_cancelled() {
                 return super::host::cancelled_result();
             }
@@ -177,15 +167,6 @@ pub fn handlers(shared: Option<SharedNetease>) -> HandlerMap {
                     false,
                 );
             };
-            if let Err(error) = crate::netease::confirm_action(
-                &shared,
-                &format!("网易云跳转到 {} 秒", position_ms / 1000),
-                &ctx,
-            )
-            .await
-            {
-                return error;
-            }
             if ctx.is_cancelled() {
                 return super::host::cancelled_result();
             }
@@ -200,24 +181,6 @@ pub fn handlers(shared: Option<SharedNetease>) -> HandlerMap {
                 return error;
             }
             let shared = shared.expect("checked above");
-            if ctx.is_cancelled() {
-                return super::host::cancelled_result();
-            }
-            if !crate::agent::native_dialog::confirm(
-                &shared.app,
-                "启动网易云音乐并连接同步？\n\n同步使用本机 9222 调试端口，可读取歌曲、歌词和进度。若客户端已经以普通模式运行，本次不会结束或重启它。".into(),
-                ctx.cancelled.as_ref(),
-            )
-            .await
-            .map(|_| true)
-            .unwrap_or(false)
-            {
-                return ToolExecutionResult::failure(
-                    "USER_DENIED",
-                    "用户未确认启动，未执行操作。不要再次尝试或绕过拒绝。",
-                    false,
-                );
-            }
             if ctx.is_cancelled() {
                 return super::host::cancelled_result();
             }

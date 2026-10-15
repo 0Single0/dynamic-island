@@ -1,5 +1,5 @@
 import { Coins, Power, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 import * as api from "@/api/gateway";
 import type { GatewayAccount } from "@/api/gateway";
@@ -78,6 +78,81 @@ export function accountColumns(
   ];
 }
 
+
+/** "请求中"单元格：`在飞/上限`，点上限可改（改完立即生效并落库）。 */
+function InflightCell({
+  channelId,
+  uid,
+  inflight,
+  maxInflight,
+  onChange,
+}: {
+  channelId: string;
+  uid: string;
+  inflight: number;
+  maxInflight: number;
+  onChange: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  const commit = async () => {
+    setEditing(false);
+    const value = Number.parseInt(draft, 10);
+    if (Number.isNaN(value) || value === maxInflight || value < 1) return;
+    try {
+      await api.setAccountMaxInflight(channelId, uid, value);
+      toast.success(`并发上限已改为 ${value}`);
+      onChange();
+    } catch (reason) {
+      toast.error(errorText(reason, "修改失败"));
+    }
+  };
+
+  if (!editing) {
+    return (
+      <span
+        className="text-[10px] text-zinc-400"
+        title={`正在处理的请求 ${inflight} 个 / 上限 ${maxInflight} 个（点数字修改上限；该上限是网关默认值，上游没有每账号并发限制）`}
+      >
+        {inflight}/
+        <span
+          role="button"
+          tabIndex={0}
+          onClick={(event) => {
+            event.stopPropagation();
+            setDraft(String(maxInflight));
+            setEditing(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              setDraft(String(maxInflight));
+              setEditing(true);
+            }
+          }}
+          className="cursor-pointer border-b border-dashed border-zinc-500 hover:text-sky-200"
+        >
+          {maxInflight}
+        </span>
+      </span>
+    );
+  }
+  return (
+    <input
+      autoFocus
+      value={draft}
+      onClick={(event) => event.stopPropagation()}
+      onChange={(event) => setDraft(event.target.value.replace(/\D/g, ""))}
+      onBlur={() => void commit()}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") void commit();
+        if (event.key === "Escape") setEditing(false);
+      }}
+      className="h-4 w-8 rounded border border-sky-400/50 bg-black/40 text-center font-mono text-[10px] text-zinc-100 outline-none"
+      aria-label="并发上限"
+    />
+  );
+}
 
 /** 凭据剩余天数：只给天数，过期就直说。 */
 function credentialDays(expiresAtMs: number): string {
@@ -182,13 +257,15 @@ export function accountCell(
     case "quota":
       return <QuotaCell quota={account.quota} />;
     case "inflight":
+      // 上限是**我们自己定的默认值**（上游没有每账号并发限制），点开就能改。
       return (
-        <span
-          className="text-[10px] text-zinc-400"
-          title={`正在处理的请求 ${account.inflight} 个 / 该账号上限 ${account.max_inflight} 个`}
-        >
-          {account.inflight}/{account.max_inflight}
-        </span>
+        <InflightCell
+          channelId={account.channel_id}
+          uid={account.uid}
+          inflight={account.inflight}
+          maxInflight={account.max_inflight}
+          onChange={context.onChange}
+        />
       );
     case "cooldown": {
       // 账号级冷却优先；没有账号冷却但有**模型级**限流时如实显示 ——

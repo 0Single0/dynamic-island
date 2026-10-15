@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { Settings, X } from "lucide-react";
-import { useNavigate } from "react-router-dom";
 import { widgetRegistry, getWidget } from "@/widgets";
 import { ApplicationLauncher, type LauncherTarget } from "@/widgets/ApplicationLauncher";
 import { getTool } from "@/widgets/tools";
-import { openToolWindow } from "@/api/window";
+import { openSettingsWindow, openToolWindow } from "@/api/window";
 import { toast } from "@/utils/toast";
 import {
   COMPACT_SIZE,
@@ -35,7 +34,6 @@ type IslandState = "collapsed" | "hovered" | "expanded";
 export function Island() {
   const [state, setState] = useState<IslandState>(() => (readIslandPanel().expanded ? "expanded" : "collapsed"));
   const [activePanel, setActivePanel] = useState<ActivePanel>(() => readIslandPanel().panel);
-  const navigate = useNavigate();
   const hoverTimer = useRef<number | null>(null);
   const pressedRef = useRef(false);
   const [widgetHeaderSlot, setWidgetHeaderSlot] = useState<HTMLSpanElement | null>(null);
@@ -53,7 +51,7 @@ export function Island() {
       ? EXPANDED_SIZE[activeTool.size]
       : EXPANDED_SIZE[activeWidget?.size ?? "md"];
 
-  // 启动：置顶 + 固定窗口位置（只调一次）
+  // 启动时恢复固定的顶部居中位置，不读取旧的拖拽停靠记录。
   const initWindow = useCallback(() => {
     void positionWindow(WINDOW_MARGIN_TOP, WINDOW_SIZE.width, WINDOW_SIZE.height);
     void setAlwaysOnTop();
@@ -93,6 +91,7 @@ export function Island() {
   };
 
   const isCollapsed = state !== "expanded";
+  const islandRef = useRef<HTMLDivElement | null>(null);
 
   const openLauncherTarget = (target: LauncherTarget) => {
     if (target.kind === "widget") {
@@ -116,7 +115,6 @@ export function Island() {
 
   // 动画帧上把岛体视口逻辑坐标上报给 Rust（换算物理像素后驱动点击穿透）。
   // hover 缩放围绕岛体中心，需按 scale 反算实际占位矩形。
-  const islandRef = useRef<HTMLDivElement | null>(null);
   const reportRect = useCallback(() => {
     const el = islandRef.current;
     if (!el) return;
@@ -133,8 +131,7 @@ export function Island() {
 
   return (
     <div
-      className="flex h-screen w-screen items-start justify-center bg-transparent"
-      style={{ paddingTop: 8 }}
+      className="flex h-screen w-screen items-start justify-center bg-transparent pt-2"
       onClick={() => {
         if (state === "expanded") collapse();
       }}
@@ -143,7 +140,7 @@ export function Island() {
       <motion.div
         ref={islandRef}
         onClick={(event) => {
-          // 阻止冒泡到外层透明区域，避免展开态内部点击被判定为“点外部”
+          // 阻止冒泡到外层透明区域，避免展开态内部点击被判定为“点外部”。
           event.stopPropagation();
           if (isCollapsed) expand({ kind: "launcher" });
         }}
@@ -206,21 +203,22 @@ export function Island() {
           className="absolute inset-0 flex flex-col p-4"
           style={{ pointerEvents: isCollapsed ? "none" : "auto" }}
         >
-          {/* 这一条同时是窗口拖拽手柄：岛体是无边框窗口，没有系统标题栏可拖。 */}
-          <div
-            data-tauri-drag-region
-            className="flex h-7 shrink-0 cursor-grab items-center justify-between active:cursor-grabbing"
-          >
+          {/* 顶栏只提供标题与操作按钮。 */}
+          <div className="flex h-7 shrink-0 items-center justify-between">
             <div className="flex min-w-0 items-center gap-2">
               <span ref={setWidgetHeaderSlot} className="contents" />
-              {isLauncher && <IconButton icon={Settings} label="打开设置中心" onClick={() => navigate("/settings")} />}
+              {isLauncher && <IconButton icon={Settings} label="打开设置中心" onClick={() => void openSettingsWindow()} />}
               <span className="text-sm font-semibold text-zinc-100">
                 {activeWidget?.name ?? activeTool?.name ?? (isLauncher ? "应用" : "")}
               </span>
             </div>
             <div className="flex items-center gap-1">
               {(isLauncher || activeWidget?.id === "ai") && (
-                <IconButton icon={Settings} label={isLauncher ? "打开设置中心" : "打开模型设置"} onClick={() => navigate(isLauncher ? "/settings" : "/settings?section=ai-models")} />
+                <IconButton
+                  icon={Settings}
+                  label={isLauncher ? "打开设置中心" : "打开模型设置"}
+                  onClick={() => void openSettingsWindow(isLauncher ? undefined : "ai-models")}
+                />
               )}
               <IconButton icon={X} label="收起" onClick={collapse} />
             </div>

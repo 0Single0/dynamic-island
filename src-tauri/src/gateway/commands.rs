@@ -290,6 +290,29 @@ pub async fn gateway_set_account_enabled(
     Ok(json!({ "ok": true }))
 }
 
+/// 设置单个账号的并发上限（面板"请求中"列点开改）。`None` = 回落默认。
+///
+/// 立即生效：写库后重建账号池（`replace` 会带上运行态，冷却/额度不丢）。
+#[tauri::command]
+pub async fn gateway_set_account_max_inflight(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    max_inflight: Option<u32>,
+) -> Result<Value, String> {
+    let Some(account) = state.account(&channel_id, &uid) else {
+        return Err(format!("账号 {channel_id}/{uid} 不存在"));
+    };
+    // 先在池子上生效（不用等重建），再落库持久化。
+    account.set_max_inflight(max_inflight.unwrap_or(state.config().concurrency.per_account.max(1)));
+    state
+        .storage
+        .set_account_max_inflight(&channel_id, &uid, max_inflight)
+        .map_err(message)?;
+    state.reload_accounts().map_err(message)?;
+    Ok(json!({ "ok": true, "max_inflight": account.max_inflight() }))
+}
+
 #[tauri::command]
 pub async fn gateway_delete_account(
     state: State<'_, SharedGateway>,

@@ -23,7 +23,6 @@ export interface ToolStatus {
   description: string;
   capabilityId: string;
   riskLevel: PluginRisk;
-  requiresConfirmation: boolean;
   legacyNames: string[];
   available: boolean;
 }

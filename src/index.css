@@ -207,122 +207,6 @@ body,
   .markdown-print a { color: inherit; text-decoration: none; }
 }
 
-/* 设置中心使用更紧凑的编辑密度，标题栏保持独立，正文面板内部滚动。 */
-[data-settings-page] main > div:first-child {
-  max-width: 48rem !important;
-  padding: 1.25rem 1.5rem 1.5rem !important;
-}
-
-[data-settings-page] main > div:first-child > header {
-  margin-bottom: 1rem !important;
-}
-
-[data-settings-page] main > div:first-child > header h1 {
-  font-size: 1.25rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid {
-  grid-template-columns: 150px minmax(0, 1fr) !important;
-  border-radius: 0.75rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > aside {
-  padding: 0.5rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section {
-  padding: 1.25rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid h2 {
-  font-size: 1.125rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid input {
-  padding-top: 0.5rem !important;
-  padding-bottom: 0.5rem !important;
-}
-
-/* 模型编辑页按导航栏密度收紧表单和模型列表。 */
-[data-settings-page] main > div:first-child > div.grid > section {
-  padding: 1rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section h2 {
-  font-size: 1rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div {
-  gap: 0.5rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div:nth-of-type(2) {
-  margin-top: 0.75rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div:nth-of-type(3) {
-  margin-top: 0.5rem !important;
-  gap: 0.35rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div:nth-of-type(3) > div {
-  min-height: 2rem;
-  padding-top: 0.35rem !important;
-  padding-bottom: 0.35rem !important;
-  border-radius: 0.5rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div:nth-of-type(3) > div > div:nth-child(2) > div.mt-0\.5 {
-  display: none !important;
-}
-
-/* 模型列表的真实容器是 mt-3 grid，列表项固定为参考图的一行高度。 */
-[data-settings-page] main > div:first-child > div.grid > section > div.mt-3.grid {
-  margin-top: 0.5rem !important;
-  gap: 0.35rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div.mt-3.grid > div.flex.items-center {
-  height: 2.5rem !important;
-  min-height: 2.5rem !important;
-  box-sizing: border-box;
-  gap: 0.5rem !important;
-  border-radius: 0.6rem !important;
-  padding: 0.35rem 0.65rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div.mt-3.grid > div.flex.items-center > div.grid {
-  width: 1.75rem !important;
-  height: 1.75rem !important;
-  flex: 0 0 1.75rem;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section > div.mt-3.grid > div.flex.items-center > div.min-w-0 > div.mt-0\.5 {
-  display: none !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > aside > button {
-  min-height: 2rem !important;
-  height: 2rem !important;
-  padding-top: 0.25rem !important;
-  padding-bottom: 0.25rem !important;
-}
-
-[data-settings-page] main > div:first-child > div.grid > section input {
-  height: 2.5rem !important;
-  padding-top: 0.45rem !important;
-  padding-bottom: 0.45rem !important;
-}
-
-[data-settings-page] main > div:first-child:not(:has(> div.grid)) {
-  overflow: hidden !important;
-}
-
-[data-settings-page] main > div:first-child:not(:has(> div.grid)) > :not(header) {
-  min-height: 0;
-  overflow-y: auto;
-}
-
 /* ===== 反代号池：深色滚动条 =====
    WebView 默认滚动条是白底黑条，在深色面板里非常扎眼。
    只作用于显式声明 .gw-scroll / .gw-scroll-x 的容器，不影响岛体其他区域。 */
@@ -350,4 +234,32 @@ body,
 }
 .gw-scroll-x::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+/* ===== 应用列表：滚动时才出现的滚动条 =====
+   静止时不显示任何滚动条，滚动期间滑块淡入，停下由 JS 摘掉 .is-scrolling。
+   8px 宽度始终保留在布局里（轨道透明），避免出现滚动条时卡片被横向挤动。 */
+.island-scroll {
+  scrollbar-color: transparent transparent;
+  scrollbar-gutter: stable;
+}
+.island-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.island-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.island-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+  transition: background-color 0.25s ease;
+}
+.island-scroll.is-scrolling {
+  scrollbar-color: rgb(63 63 70) transparent;
+}
+.island-scroll.is-scrolling::-webkit-scrollbar-thumb {
+  background: rgb(63 63 70);
+}
+.island-scroll.is-scrolling::-webkit-scrollbar-thumb:hover {
+  background: rgb(82 82 91);
 }

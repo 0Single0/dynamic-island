@@ -345,6 +345,18 @@ export function claimTask(channelId: string, uid: string, code: string) {
   return invoke<GatewayTaskRunResult>("gateway_claim_task", { channelId, uid, code });
 }
 
+/**
+ * 设置单个账号的并发上限（"请求中"列点开改）。`null` = 回落渠道/全局默认。
+ * 立即生效；重启后保留（写在账号配置里）。
+ */
+export function setAccountMaxInflight(channelId: string, uid: string, maxInflight: number | null) {
+  return invoke<{ ok: boolean; max_inflight: number }>("gateway_set_account_max_inflight", {
+    channelId,
+    uid,
+    maxInflight,
+  });
+}
+
 export function checkinAccount(channelId: string, uid: string) {
   return invoke<{ ok: boolean }>("gateway_checkin_account", { channelId, uid });
 }

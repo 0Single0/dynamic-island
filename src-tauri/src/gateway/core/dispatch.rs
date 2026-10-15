@@ -180,7 +180,7 @@ pub async fn open_chat_session(
                                     candidate.route.channel_id,
                                     candidate.account.key.uid,
                                     candidate.account.inflight(),
-                                    candidate.account.max_inflight
+                                    candidate.account.max_inflight()
                                 )
                             } else {
                                 continue;

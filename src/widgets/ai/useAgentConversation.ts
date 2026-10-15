@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { JSONContent } from "@tiptap/core";
-import { documentToPlainText, documentToPluginIds, deleteSession as deleteStoredSession, listExecutionEvents, tauriInvoke, type ExecutionEvent, type MessageRecord, type ModelRecord, type ProviderError, type SessionRecord, type TimelineRecord } from "@/agent/api";
+import { documentToPlainText, documentToPluginIds, deleteSession as deleteStoredSession, listExecutionEvents, tauriInvoke, CONFIG_CHANGED_EVENT, type ExecutionEvent, type MessageRecord, type ModelRecord, type ProviderError, type ProviderRecord, type SessionRecord, type TimelineRecord } from "@/agent/api";
 import { emptyTrace, reduceTrace, type TraceState } from "@/agent/trace";
 import { toast } from "@/utils/toast";
 import { legacyEntries } from "./legacy";
@@ -18,6 +18,7 @@ export function useAgentConversation() {
   const [sessionId, setSessionId] = useState(NEW_CONVERSATION);
   const [isLoading, setIsLoading] = useState(true);
   const [models, setModels] = useState<ModelRecord[]>([]);
+  const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -104,11 +105,14 @@ export function useAgentConversation() {
     }).then(unlisten => { if (!disposed) stop = unlisten; else unlisten(); });
     void listenerReady.current.then(async () => {
       if (disposed) return;
-      const [storedSessions, modelRecords] = await Promise.all([
-        tauriInvoke<SessionRecord[]>("agent_list_sessions"), tauriInvoke<ModelRecord[]>("agent_list_model_configs"),
+      const [storedSessions, modelRecords, providerRecords] = await Promise.all([
+        tauriInvoke<SessionRecord[]>("agent_list_sessions"),
+        tauriInvoke<ModelRecord[]>("agent_list_model_configs"),
+        tauriInvoke<ProviderRecord[]>("agent_list_provider_configs"),
       ]);
       if (disposed) return;
       setSessions(storedSessions); setModels(modelRecords.filter(m => m.enabled));
+      setProviders(providerRecords);
       setSelectedModelId(modelRecords.find(m => m.enabled)?.id || "");
       const active = getActiveConversation();
       const session = storedSessions.find(s => s.id === active);
@@ -134,6 +138,35 @@ export function useAgentConversation() {
   useEffect(() => {
     if (followTailRef.current && viewportRef.current) viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
   }, [trace]);
+
+  // 设置中心是独立窗口，改完模型配置后岛体这个窗口不会再重新挂载，
+  // 所以模型列表必须靠后端广播刷新，否则下拉里一直是旧数据。
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let disposed = false;
+    void listen(CONFIG_CHANGED_EVENT, () => {
+      void Promise.all([
+        tauriInvoke<ModelRecord[]>("agent_list_model_configs"),
+        tauriInvoke<ProviderRecord[]>("agent_list_provider_configs"),
+      ])
+        .then(([records, providerRecords]) => {
+          if (disposed || !mounted.current) return;
+          const enabled = records.filter((model) => model.enabled);
+          setModels(enabled);
+          setProviders(providerRecords);
+          // 被删掉/停用的模型不能继续留在选择里，否则发送时才报错。
+          setSelectedModelId((current) => (enabled.some((model) => model.id === current) ? current : enabled[0]?.id ?? ""));
+        })
+        .catch(() => undefined);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else stop = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stop?.();
+    };
+  }, []);
 
   const createNewSession = async () => {
     if (sending.current) return;
@@ -199,5 +232,5 @@ export function useAgentConversation() {
     }
   };
 
-  return { entries: trace.entries, sessions, sessionId, isLoading, models, selectedModelId, setSelectedModelId, isSending, activeRunId, viewportRef, followTailRef, loadSession, createNewSession, deleteSession, sendMessage };
+  return { entries: trace.entries, sessions, sessionId, isLoading, models, providers, selectedModelId, setSelectedModelId, isSending, activeRunId, viewportRef, followTailRef, loadSession, createNewSession, deleteSession, sendMessage };
 }

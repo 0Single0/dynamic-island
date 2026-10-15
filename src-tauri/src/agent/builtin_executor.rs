@@ -72,7 +72,6 @@ mod tests {
                 input_schema: json!({"type":"object","properties":{"value":{"type":"string"}},"additionalProperties":false}),
                 capability_id: "fixture.echo".into(),
                 risk_level: RiskLevel::L0,
-                requires_confirmation: false,
                 side_effects: vec![],
                 legacy_names: vec!["fixture.echo".into()],
                 timeout_ms: DEFAULT_TIMEOUT_MS,

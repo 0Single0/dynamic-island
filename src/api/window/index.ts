@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-/** 当前窗口标签（`main` / `tool-<id>`）。浏览器预览下返回空串。 */
+/** 当前窗口标签（`main` / `tool-<id>` / `settings`）。浏览器预览下返回空串。 */
 export function currentWindowLabel(): string {
   try {
     return getCurrentWindow().label;
@@ -28,16 +28,11 @@ export function setAlwaysOnTop() {
 }
 
 /**
- * 上报岛体在视口内的逻辑坐标（物理像素由 Rust 侧换算）。
- * Rust 光标轮询线程据此决定窗口哪些区域对鼠标穿透。
+ * 上报岛体在视口内的逻辑坐标。
+ * Rust 光标轮询线程结合窗口实时位置据此决定窗口哪些区域对鼠标穿透。
  */
 export function setIslandRect(x: number, y: number, width: number, height: number) {
   return invoke<void>("set_island_rect", { x, y, width, height }).catch(() => {});
-}
-
-/** 切换完整页面 / 灵动岛局部点击模式。 */
-export function setWindowInteractive(interactive: boolean) {
-  return invoke<void>("set_window_interactive", { interactive }).catch(() => {});
 }
 
 /** 退出应用 */
@@ -56,6 +51,20 @@ export function openToolWindow(
   height: number,
 ) {
   return invoke<void>("open_tool_window", { toolId, title, width, height });
+}
+
+/** 设置窗口的标签（与 src-tauri/src/commands/window.rs 的常量一致）。 */
+export const SETTINGS_WINDOW_LABEL = "settings";
+
+/** 设置窗口已开着时，让它切分类的事件名。 */
+export const SETTINGS_SECTION_EVENT = "agent://settings-section";
+
+/**
+ * 打开（或聚焦）设置窗口。窗口是单例：重复调用只聚焦，不会开一堆。
+ * 已经开着时若传了 `section`，通知它切到该分类而非重建窗口。
+ */
+export function openSettingsWindow(section?: string) {
+  return invoke<void>("open_settings_window", { section: section ?? null });
 }
 
 /** 隐藏窗口到托盘 */

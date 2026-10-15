@@ -466,7 +466,7 @@ fn build_accounts(
                 .weight_override
                 .or_else(|| channel.map(|channel| channel.weight))
                 .unwrap_or(1);
-            pooled.max_inflight = record.max_inflight.unwrap_or(per_account);
+            pooled.set_max_inflight(record.max_inflight.unwrap_or(per_account));
             pooled.proxy_slot = record.proxy_slot.clone();
             if let Some(credential) = &record.credential {
                 pooled.set_credentials(credential.clone());

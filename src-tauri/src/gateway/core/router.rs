@@ -145,7 +145,7 @@ pub fn score(candidate: &Candidate, hint: Option<&AccountKey>, scoring: &Scoring
     let mut value = candidate.route.weight.max(1) as f64;
 
     // 负载：在飞占满的账号要被推后，避免把同一账号打满。
-    let limit = candidate.account.max_inflight.max(1) as f64;
+    let limit = candidate.account.max_inflight().max(1) as f64;
     value -= (candidate.account.inflight() as f64 / limit) * scoring.load_weight;
 
     // 缓存亲和：同账号 > 同渠道 > 换渠道（换渠道必丢缓存，代价最高）。
@@ -229,7 +229,7 @@ mod tests {
         account.requires_credential = false;
         account.priority = priority;
         account.weight = weight;
-        account.max_inflight = 2;
+        account.set_max_inflight(2);
         Arc::new(account)
     }
 
