@@ -1,0 +1,55 @@
+[package]
+name = "gateway-server"
+version = "0.1.0"
+description = "反代号池 Web 网关：下游多协议反代 + 面板管理 API"
+edition = "2021"
+
+[[bin]]
+name = "gateway-server"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP 服务（下游 /v1/* + 面板 API + 静态托管）
+axum = "0.8.9"
+tower-http = { version = "0.6", features = ["fs"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "net",
+    "signal",
+] }
+# 上游客户端：rustls 避免容器里依赖系统 OpenSSL。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "http2",
+    "charset",
+] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 凭据加密信封（master key 落文件，见 src/secrets.rs）
+aes-gcm = "0.11.1"
+sha2 = "0.10"
+getrandom = "0.4.3"
+base64 = "0.22"
+zeroize = { version = "1.8", features = ["alloc"] }
+# 账号 / 用量 / 亲和落库
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+# 面板静态资源的层组合（ServiceBuilder / SetResponseHeaderLayer）
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = true

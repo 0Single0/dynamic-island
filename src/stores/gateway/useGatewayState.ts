@@ -8,8 +8,8 @@ const POLL_MS = 2000;
 /**
  * 反代号池状态。
  *
- * 走 Tauri 命令轮询（不是事件推送）：面板只在展开时轮询，收起即停，
- * 换来的是 Rust 侧不用为面板维护事件通道。浏览器预览模式下给出明确提示。
+ * 走 HTTP 轮询（不是事件推送）：面板只在打开时轮询，关掉即停，
+ * 换来的是后端不用为面板维护事件通道。
  */
 export function useGatewayState(active: boolean) {
   const [status, setStatus] = useState<GatewayStatus | null>(null);
@@ -34,12 +34,8 @@ export function useGatewayState(active: boolean) {
       setError(null);
     } catch (reason) {
       if (!mounted.current) return;
-      const message = reason instanceof Error ? reason.message : String(reason);
-      setError(
-        message.includes("__TAURI") || message.includes("undefined")
-          ? "浏览器预览模式：反代号池需要桌面端运行"
-          : message,
-      );
+      // 401 由 request 层统一打回登录页，这里不必再报一次。
+      setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       if (mounted.current) setLoading(false);
     }

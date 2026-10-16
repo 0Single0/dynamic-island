@@ -1,6 +1,0 @@
-[build]
-# 项目自己的 target 目录：覆盖用户级的 CARGO_TARGET_DIR
-# （那个全局变量指向 E:\CodexCaches\cargo-target\git-kline-market，
-#  让所有项目共用一个 target —— 2026-10-10 曾导致 dev 跑的是旧编译产物，
-#  "改了代码重启还是旧行为"排查了一轮才定位到这里。）
-target-dir = "target"

@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Rust 构建产物
+server/target
+target
+
+# Docker 镜像归档 / 打包产物
+*.tar
+*.tar.gz
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -23,4 +31,14 @@ dist-ssr
 *.sln
 *.sw?
 .gateway-dump2/
-.gateway-dump2/
+
+# 部署密钥：面板密码、会话盐、凭据主密钥都在这里，绝不能进仓库
+.env
+.env.local
+.env.*.local
+
+# 运行时状态：配置、SQLite、主密钥。备份它，但别提交它
+data/
+
+# 本地 Docker 验证用的临时配置
+.verify/

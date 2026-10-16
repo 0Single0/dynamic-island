@@ -8,8 +8,29 @@ import { toast } from "@/utils/toast";
  */
 const instance: AxiosInstance = axios.create({
   timeout: 15_000,
+  // 面板鉴权靠 HttpOnly Cookie：同源请求本来就会带上，
+  // 显式打开是为了将来把面板和 API 分域部署时不用改这里。
+  withCredentials: true,
   headers: { "Content-Type": "application/json" },
 });
+
+/**
+ * 401 订阅：会话过期时通知界面回登录页。
+ *
+ * 放订阅而不是在拦截器里直接跳转 —— request 层不该知道路由长什么样。
+ */
+const unauthorizedListeners = new Set<() => void>();
+
+export function onUnauthorized(listener: () => void): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
+function notifyUnauthorized() {
+  for (const listener of unauthorizedListeners) listener();
+}
 
 instance.interceptors.response.use(
   (response) => {
@@ -25,6 +46,7 @@ instance.interceptors.response.use(
     return Promise.reject(new Error(body.msg || "请求失败"));
   },
   (error: AxiosError) => {
+    if (error.response?.status === 401) notifyUnauthorized();
     const message =
       (error.response?.data as { msg?: string } | undefined)?.msg ??
       (error.code === "ECONNABORTED"

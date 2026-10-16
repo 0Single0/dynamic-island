@@ -1,48 +1,31 @@
-import { useEffect, useMemo } from "react";
-import { Route, Routes, useLocation } from "react-router-dom";
+import { Loader2 } from "lucide-react";
 import { AppToaster } from "@/components/common/AppToaster";
-import { routes } from "@/routes";
-import { currentWindowLabel } from "@/api/window";
+import { LoginPage } from "@/pages/Login";
+import { ProxyPoolPage } from "@/pages/ProxyPool";
+import { usePanelSession } from "@/stores/panel/usePanelSession";
 
-/** 工具窗口的标签约定是 `tool-<id>`（见 src-tauri 的 open_tool_window）。 */
-const TOOL_WINDOW_PREFIX = "tool-";
-
-function RoutedApp() {
-  const location = useLocation();
-  // 浏览器预览时拿不到标签，返回空串（不影响任何逻辑）。
-  const label = useMemo(() => currentWindowLabel(), []);
-  const toolId = label.startsWith(TOOL_WINDOW_PREFIX)
-    ? label.slice(TOOL_WINDOW_PREFIX.length)
-    : null;
-
-  useEffect(() => {
-    // 自愈：工具窗口必须落在工具页。开发/生产下 URL 处理偶有差异，
-    // 一旦 hash 没带上，窗口里跑的就是岛体首页 —— 表现为"点了没反应"。
-    if (toolId && !location.pathname.startsWith("/tool/")) {
-      window.location.hash = `#/tool/${toolId}`;
-    }
-  }, [toolId, location.pathname]);
-
-  return (
-    <>
-      <Routes>
-        {routes.map((route) => (
-          <Route
-            key={route.path}
-            path={route.path}
-            element={<route.Component />}
-          />
-        ))}
-      </Routes>
-      <AppToaster />
-    </>
-  );
-}
-
+/**
+ * Web 面板根组件。
+ *
+ * 单页应用：未登录显示登录页，登录后直接是号池面板（不再有岛体/设置页）。
+ * 登录态由服务端 Cookie 决定，刷新页面不会掉登录。
+ */
 export default function App() {
+  const { state, username, login, logout } = usePanelSession();
+
   return (
-    <div className="h-screen w-screen overflow-hidden bg-transparent text-zinc-100 antialiased">
-      <RoutedApp />
+    <div className="h-screen w-screen overflow-hidden bg-zinc-950 text-zinc-100 antialiased">
+      {state === "checking" ? (
+        <div className="flex h-full w-full items-center justify-center gap-2 text-[12px] text-zinc-500">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          正在检查登录状态…
+        </div>
+      ) : state === "anonymous" ? (
+        <LoginPage onLogin={login} />
+      ) : (
+        <ProxyPoolPage username={username} onLogout={logout} />
+      )}
+      <AppToaster />
     </div>
   );
 }
