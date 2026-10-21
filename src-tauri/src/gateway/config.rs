@@ -80,7 +80,10 @@ pub fn default_channels() -> Vec<ChannelConfig> {
             id: "codearts".into(),
             adapter: "codearts".into(),
             display_name: "华为 CodeArts".into(),
-            enabled: true,
+            // **默认停用**：适配器已从注册表摘掉（见 `channels::build_registry`）。
+            // 上游的 3 会话并发上限与 tool_choice 方言限制短期解不掉，
+            // 用「自定义供应商」接华为云 ModelArts 更省心。
+            enabled: false,
             priority: 100,
             weight: 5,
             // 华为云码道的模型网关（商业版 snap-access 域）。
@@ -407,7 +410,8 @@ mod tests {
         assert!(trae.options.get("base_url").and_then(|v| v.as_str()).is_some());
         assert!(trae.enabled, "默认启用：不然弹窗里看不到它");
 
-        // CodeArts 同理：要在默认配置里，且带基址。
+        // CodeArts 同理：要在默认配置里，且带基址 —— 但**默认停用**
+        // （适配器已从注册表摘掉，见 `channels::build_registry`）。
         assert!(adapters.contains(&"codearts"), "默认配置必须带 CodeArts");
         let codearts = channels
             .iter()
@@ -418,7 +422,7 @@ mod tests {
             .get("base_url")
             .and_then(|v| v.as_str())
             .is_some_and(|url| url.contains("myhuaweicloud.com")));
-        assert!(codearts.enabled);
+        assert!(!codearts.enabled, "CodeArts 默认停用：适配器未注册");
     }
 
     /// 升级路径要把 CodeArts 也补上，且幂等。

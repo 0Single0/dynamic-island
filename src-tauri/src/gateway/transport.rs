@@ -168,6 +168,51 @@ pub fn frame_stream(response: reqwest::Response, idle_timeout: Duration) -> Fram
     }))
 }
 
+/// 把上游响应体切成 SSE 帧流，**保留整帧**（含 `event:` 行与 `id:` 行）。
+///
+/// 与 [`frame_stream`] 的差别只在"给不给事件名"：那个只吐 `data` 负载，
+/// 对 OpenAI 兼容流够用；而 Trae 的事件类型**只存在于 `event:` 行**里
+/// （同一份 payload 形状既可能是心跳也可能是正文），剥掉就无从判断。
+pub fn frame_stream_full(response: reqwest::Response, idle_timeout: Duration) -> FrameStream {
+    let state = FrameState {
+        response,
+        buffer: Vec::new(),
+        done: false,
+    };
+    Box::pin(stream::unfold(state, move |mut state| async move {
+        loop {
+            match crate::agent::providers::pop_sse_frame(&mut state.buffer) {
+                Ok(Some(frame)) => {
+                    // 纯心跳/注释帧没有 data 行，直接跳过（否则解码器白跑）。
+                    if sse_payload(&frame).is_none() {
+                        continue;
+                    }
+                    return Some((Ok(frame), state));
+                }
+                Ok(None) => {}
+                Err(message) => return Some((Err(GatewayError::network(message)), state)),
+            }
+            if state.done {
+                return None;
+            }
+            match tokio::time::timeout(idle_timeout, state.response.chunk()).await {
+                Err(_) => {
+                    return Some((
+                        Err(GatewayError::network("上游流空闲超时（300 秒无数据）")),
+                        state,
+                    ))
+                }
+                Ok(Ok(Some(chunk))) => state.buffer.extend_from_slice(&chunk),
+                Ok(Ok(None)) => state.done = true,
+                Ok(Err(error)) => {
+                    state.done = true;
+                    return Some((Err(GatewayError::from_reqwest(error)), state));
+                }
+            }
+        }
+    }))
+}
+
 /// 从一帧 SSE 里取 `data` 负载（多行 data 用换行拼接）。心跳与注释行返回 None。
 fn sse_payload(frame: &str) -> Option<String> {
     let mut lines = Vec::new();

@@ -20,7 +20,7 @@ pub mod signer;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::gateway::{
     channels::{
@@ -69,6 +69,19 @@ impl CodeArtsChannel {
         format!("{}{path}", self.base_url)
     }
 
+    /// 稳定的上游会话 id（`Chat-Id` / `Session-Id`）。
+    ///
+    /// 上游按会话计并发，超过 3 个就 `TM.00001041`。所以必须：
+    /// · 同一轮对话 → 同一个 id（多轮复用，也保住 prompt cache 亲和）；
+    /// · 客户端没给会话键 → 回落到该账号的固定 id（绝不能每请求新生成）。
+    fn session_id(&self, account: &AccountSnapshot, session_key: Option<&str>) -> String {
+        let key = session_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .unwrap_or("shared");
+        crate::gateway::security::derive_id(&self.id, &account.uid, &format!("chat:{key}"))
+    }
+
     /// 从账号凭据里取出签名材料。缺 AK/SK 时**直接报错**，
     /// 而不是发一个注定 401 的请求（那样只会让账号进冷却，更难排查）。
     fn credentials(account: &AccountSnapshot) -> Result<SignCredentials, GatewayError> {
@@ -100,16 +113,16 @@ impl CodeArtsChannel {
         credentials: &SignCredentials,
         method: &str,
         url: &str,
+        accept: &str,
         extra: &[(String, String)],
         body: &[u8],
     ) -> Vec<(String, String)> {
         let mut headers = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
-            ("Accept".to_string(), "text/event-stream".to_string()),
-            (
-                "x-auth-token".to_string(),
-                account.access_token.clone().unwrap_or_default(),
-            ),
+            // **`Accept` 决定上游把请求路由到哪条链路**：
+            // 目录接口必须 `application/json`；发 `text/event-stream` 会被当成
+            // SSE 请求，回 `TM.00001001 未找到合法可路由api`（真实实测）。
+            ("Accept".to_string(), accept.to_string()),
             (
                 "x-snap-traceid".to_string(),
                 format!("{:x}{:04x}", crate::gateway::timeutil::now_ms(), self.sequence.fetch_add(1, Ordering::Relaxed) & 0xffff),
@@ -118,6 +131,16 @@ impl CodeArtsChannel {
             ("app-id".to_string(), "CodeAgent3.0".to_string()),
             ("is_confidential".to_string(), "false".to_string()),
         ];
+        // `x-auth-token` 只在用 **STS 临时凭据** 时发。
+        // 长期 AK/SK 没有 security token，发空值会被上游判成非法调用。
+        if let Some(token) = account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            headers.push(("x-auth-token".to_string(), token.to_string()));
+        }
         headers.extend(extra.iter().cloned());
 
         let signed = signer::sign(
@@ -159,19 +182,37 @@ impl ChannelAdapter for CodeArtsChannel {
     ) -> Result<UpstreamRequest, GatewayError> {
         let credentials = Self::credentials(account)?;
         // 上游就是 OpenAI 形状：直接复用通用编码（把 CIR 还原成 OpenAI 报文）。
-        let body = crate::gateway::channels::custom::build_openai_chat_body(request);
+        let mut body = crate::gateway::channels::custom::build_openai_chat_body(request);
+        // `tool_choice` 要按这条上游的方言改写（见 `normalize_tool_choice`）。
+        normalize_tool_choice(&mut body);
         let raw = serde_json::to_vec(&body)
             .map_err(|error| GatewayError::internal(format!("请求体序列化失败：{error}")))?;
         let url = self.url(CHAT_PATH);
-        let mut extra = vec![
+        // 会话标识**必须稳定**。
+        //
+        // 上游按会话计并发，**超过 3 个会话**就回
+        // `TM.00001041 并发会话数已达上限(3个),请关闭部分会话后重试`。
+        // 之前只在客户端给了 session_key 时才发 Chat-Id，没给就每请求一个新会话，
+        // 连发几个就把账号打满 —— 表现是"用几下就不能用了"。
+        //
+        // 这里按 (账号, 会话键) 稳定派生：同一轮对话恒定落在同一会话上；
+        // 客户端完全没给会话键时退回到该账号的固定会话（所有请求共用），
+        // 宁可牺牲跨对话的缓存亲和，也不要打满并发上限。
+        let session = self.session_id(account, request.metadata.session_key().as_deref());
+        let extra = vec![
             ("tool_stream".to_string(), "true".to_string()),
+            ("Chat-Id".to_string(), session.clone()),
+            ("Session-Id".to_string(), session),
         ];
-        // 会话粘性：把会话键作为 chat_id，保证多轮落在同一上游会话
-        // （上游按它做 prompt cache 亲和）。
-        if let Some(session) = request.metadata.session_key() {
-            extra.push(("Chat-Id".to_string(), session.clone()));
-        }
-        let headers = self.signed_headers(account, &credentials, "POST", &url, &extra, &raw);
+        let headers = self.signed_headers(
+            account,
+            &credentials,
+            "POST",
+            &url,
+            "text/event-stream",
+            &extra,
+            &raw,
+        );
         Ok(UpstreamRequest {
             url,
             headers,
@@ -179,8 +220,19 @@ impl ChannelAdapter for CodeArtsChannel {
         })
     }
 
-    /// 上游是标准 OpenAI SSE：直接复用通用解析。
+    /// 上游是标准 OpenAI SSE；但**错误会被塞进 HTTP 200 的流里**，先拦一层。
     fn parse_event(&self, frame: &str) -> Vec<CanonicalEvent> {
+        // ```json
+        // {"text":"[DONE]","error_code":"TM.00001041",
+        //  "error_msg":"并发会话数已达上限(3个),请关闭部分会话后重试。"}
+        // ```
+        // 这种帧没有 `choices`，通用解析器返回空 —— 于是整条流"正常结束"，
+        // 用量被记成「完成 / 输出 0」，真正的失败被吞掉（截图里的 0 输出行）。
+        if let Some(error) = embedded_stream_error(frame) {
+            return vec![CanonicalEvent::Error {
+                message: error.describe(),
+            }];
+        }
         openai_compat::parse_openai_chunk(frame)
     }
 
@@ -206,6 +258,8 @@ impl ChannelAdapter for CodeArtsChannel {
                 &credentials,
                 "GET",
                 &url,
+                // 目录是普通 JSON 接口：**不能**发 text/event-stream。
+                "application/json",
                 &[("Agent-Type".to_string(), "PromptCenter".to_string())],
                 &[],
             ),
@@ -582,15 +636,78 @@ pub fn parse_builtin_models(payload: &Value) -> Vec<UpstreamModel> {
                 _ => None,
             })
         };
+        // `supports_images` 是这条上游的权威视觉能力位（目录里没有顶层 multimodal）。
+        let vision = raw
+            .get("supports_images")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         models.push(UpstreamModel {
             id: id.to_string(),
+            credits: parse_builtin_credits(raw),
             context_length: number("context_window").filter(|value| *value > 0),
             max_output_tokens: number("max_tokens").filter(|value| *value > 0),
             vendor: Some("codearts".into()),
+            capabilities: crate::gateway::channels::ModelCapabilities {
+                vision,
+                // 未知即乐观放行：目录不声明工具/思考能力时不该在本地拦掉。
+                tool_calls: false,
+                reasoning: false,
+                // 但"没声明"要如实记下来（区别于"声明了不支持"）。
+                declared_vision: raw.get("supports_images").and_then(Value::as_bool).is_some(),
+                declared_tools: false,
+            },
             ..UpstreamModel::default()
         });
     }
     models
+}
+
+/// 从 `credit[]` 里取**倍率**。
+///
+/// 上游给的是分段计价表：
+/// ```json
+/// "credit":[{"ratio":"0.05","ratio_display":"0.7x","input_from":0,"input_to":-1,
+///            "input_price":"8","cache_price":"2","output_price":"28"}]
+/// ```
+/// `ratio_display` 是给用户看的倍率（`0.7x`），`ratio` 是结算系数。
+/// 优先透出 `ratio_display`，没有就用 `ratio` 拼一个 —— 面板只认 `x…` 形式。
+pub fn parse_builtin_credits(raw: &Value) -> Option<String> {
+    let segments = raw.get("credit").and_then(Value::as_array)?;
+    // `input_from: 0 / input_to: -1` 是"全区间"那一段，取它最准。
+    let whole = segments.iter().find(|segment| {
+        segment.get("input_from").and_then(Value::as_i64) == Some(0)
+            && segment.get("input_to").and_then(Value::as_i64) == Some(-1)
+    });
+    let segment = whole.or_else(|| segments.first())?;
+    if let Some(display) = segment
+        .get("ratio_display")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(normalize_rate(display));
+    }
+    segment
+        .get("ratio")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_rate)
+}
+
+/// 把 `0.7x` / `x0.5` / `0.05` 统一成 `x0.70` / `x0.50` / `x0.05`。
+fn normalize_rate(value: &str) -> String {
+    // `x` 可能在前也可能在后（上游同一个字段两种写法都出现过）。
+    let trimmed = value
+        .trim()
+        .trim_start_matches(['x', 'X'])
+        .trim_end_matches(['x', 'X'])
+        .trim();
+    match trimmed.parse::<f64>() {
+        Ok(rate) => format!("x{rate:.2}"),
+        // 解析不了就原样透出，别把上游给的东西吞掉。
+        Err(_) => value.trim().to_string(),
+    }
 }
 
 /// 上游错误分类：先认业务码，再按状态码兜底。
@@ -600,6 +717,128 @@ pub fn parse_builtin_models(payload: &Value) -> Vec<UpstreamModel> {
 /// · `002002009` / `not registered` / `4004.200` / `benefit not found` ——
 ///   该账号用不了这个模型，是**模型级**问题，不该冷却整个账号；
 /// · `InferHub.001001005` / `request param is invalid` —— 请求参数错，重试无用。
+/// 把 `tool_choice` 改写成**这条上游认的形状**。
+///
+/// 实测（真实账号，逐变体对照）：
+/// | 报文 | 结果 |
+/// |---|---|
+/// | `tools` + `tool_choice: {type:function,name:X}` | `InferHub.001001005 请求参数非法` |
+/// | `tools` + `tool_choice: "X"`（函数名字符串） | 同上 |
+/// | `tools` + 不带 `tool_choice` | 正常 |
+/// | `tools:[X]` + `tool_choice: "required"` | **正常** |
+///
+/// 所以：**只接受三个字符串**（`auto` / `required` / `none`）；
+/// 客户端点名要某个工具时，把 `tools` 裁成那一个再发 `required` ——
+/// 语义等价（模型只能调它），而且上游认。
+pub fn normalize_tool_choice(body: &mut Value) {
+    // 没有 tools 时 tool_choice 没有意义，留着反而可能被判非法。
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        if let Some(map) = body.as_object_mut() {
+            map.remove("tool_choice");
+        }
+        return;
+    }
+    let Some(choice) = body.get("tool_choice").cloned() else {
+        return;
+    };
+    // (归一后的字符串, 要不要把 tools 裁成单个)
+    let (normalized, only) = match &choice {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
+                "auto" => ("auto", None),
+                "none" => ("none", None),
+                "required" | "any" => ("required", None),
+                // 函数名字符串：上游不认，改成"只发这个工具 + required"。
+                _ if !trimmed.is_empty() => ("required", Some(trimmed.to_string())),
+                _ => ("auto", None),
+            }
+        }
+        Value::Object(map) => match map.get("type").and_then(Value::as_str).unwrap_or("") {
+            "auto" => ("auto", None),
+            "any" => ("required", None),
+            "none" => ("none", None),
+            // OpenAI 的 `{type:"function", function:{name}}` 与 Anthropic 的
+            // `{type:"tool", name}` 都落到这里。
+            "function" | "tool" => {
+                let name = map
+                    .get("name")
+                    .or_else(|| map.get("function").and_then(|function| function.get("name")))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                match name {
+                    Some(name) => ("required", Some(name.to_string())),
+                    None => ("auto", None),
+                }
+            }
+            _ => ("auto", None),
+        },
+        _ => ("auto", None),
+    };
+
+    if let Some(name) = only {
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            let filtered: Vec<Value> = tools
+                .iter()
+                .filter(|tool| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(name.as_str())
+                })
+                .cloned()
+                .collect();
+            // 找不到同名工具就退回 auto：硬发 required 会让上游拒绝。
+            if filtered.is_empty() {
+                body["tool_choice"] = json!("auto");
+                return;
+            }
+            body["tools"] = Value::Array(filtered);
+        }
+    }
+    body["tool_choice"] = json!(normalized);
+}
+
+/// 会话并发上限的恢复时刻：现在就 + 20 秒。
+///
+/// 上游那个 3 会话配额是**瞬时**占用的：请求结束后上游要过一小会儿才释放。
+/// 我们只需要让出这一小会儿，而不是把账号整体停几分钟。
+pub fn session_limit_release_at() -> u64 {
+    crate::gateway::timeutil::now_ms().saturating_add(20_000)
+}
+
+/// 识别**藏在 200 SSE 流里**的业务错误。
+///
+/// 上游在限流/未开通时不会改 HTTP 状态码，而是在流里发一帧：
+/// ```json
+/// {"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)…"}
+/// ```
+/// 参考实现专门有个 `preflightSSE` + `embeddedSSEError` 处理这件事；
+/// 不做的话错误帧会被当成"没有内容的正常帧"，最后记成完成 + 0 token。
+pub fn embedded_stream_error(frame: &str) -> Option<GatewayError> {
+    let value: Value = serde_json::from_str(frame).ok()?;
+    let code = value
+        .get("error_code")
+        .or_else(|| value.get("errorCode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty() && *code != "0")?;
+    let message = value
+        .get("error_msg")
+        .or_else(|| value.get("errorMsg"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // 走与 HTTP 错误相同的分类，保证同一个码落到同一个语义。
+    Some(refine(200, &format!("{code} {message}"), "").with_upstream(frame.to_string()))
+}
+
 pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
     let lowered = body.to_ascii_lowercase();
     if lowered.contains("tm.00001041")
@@ -607,7 +846,14 @@ pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
         || lowered.contains("\"tpm\"")
         || status == 429
     {
-        return GatewayError::new(
+        // 会话并发上限要**短冷却**。
+        //
+        // 上游的 `TM.00001041`（并发会话数已达上限）是"现在这一刻开着的会话太多"，
+        // 实测几十秒就自行释放；不给恢复时刻的话，池子会按指数退避把整个账号
+        // 停 9 分钟 —— 用户看到的就是"发两条就废九分钟"。
+        let session_limit =
+            lowered.contains("tm.00001041") || lowered.contains("并发会话");
+        let error = GatewayError::new(
             ErrorKind::RateLimited,
             ErrorScope::Account,
             429,
@@ -615,6 +861,11 @@ pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
             true,
         )
         .with_upstream(openai_compat::raw(body));
+        return if session_limit {
+            error.with_reset_at(Some(session_limit_release_at()))
+        } else {
+            error
+        };
     }
     if lowered.contains("002002009")
         || lowered.contains("not registered")
@@ -820,6 +1071,160 @@ mod tests {
         assert_eq!(upstream.body["stream"], true);
     }
 
+    /// 真实目录响应（抓包）里的字段：倍率在 `credit[].ratio_display`，
+    /// 视觉能力在 `supports_images`。
+    #[test]
+    fn builtin_models_read_credit_and_vision_from_the_real_shape() {
+        let payload = json!({"count": 2, "builtinModels": [
+            {
+                "model_id": "GLM-5.2", "model_name": "GLM-5.2",
+                "model_category": "文本生成", "supports_images": false,
+                "credit": [{
+                    "input_from": 0, "input_to": -1, "output_from": 0, "output_to": -1,
+                    "ratio": "0.05", "input_price": "8", "cache_price": "2",
+                    "output_price": "28", "ratio_display": "0.7x"
+                }]
+            },
+            {
+                "model_id": "Qwen3-VL-235B", "model_name": "Qwen3-VL-235B",
+                "model_category": "图片理解", "supports_images": true, "credit": []
+            }
+        ]});
+        let models = parse_builtin_models(&payload);
+        assert_eq!(models.len(), 2);
+        // `ratio_display: "0.7x"` → 面板认的 `x0.70`。
+        assert_eq!(models[0].credits.as_deref(), Some("x0.70"));
+        assert!(!models[0].capabilities.vision);
+        assert!(models[0].capabilities.declared_vision, "声明过就要记下来");
+        // 没有 credit 段 → 不编造倍率。
+        assert_eq!(models[1].credits, None);
+        assert!(models[1].capabilities.vision, "supports_images=true");
+    }
+
+    /// 倍率归一化：`0.7x` / `0.05` / `x0.5` 都要变成 `x…` 形式。
+    #[test]
+    fn rate_normalization_matches_the_panel_expectation() {
+        assert_eq!(normalize_rate("0.7x"), "x0.70");
+        assert_eq!(normalize_rate("0.05"), "x0.05");
+        assert_eq!(normalize_rate("x0.5"), "x0.50");
+        assert_eq!(normalize_rate("1.5X"), "x1.50");
+        // 认不出的原样保留，不吞掉上游信息。
+        assert_eq!(normalize_rate("面议"), "面议");
+    }
+
+    /// 目录接口必须用 `Accept: application/json`。
+    ///
+    /// 发 `text/event-stream` 会被上游当成 SSE 路由请求，回
+    /// `TM.00001001 未找到合法可路由api, agentType:PromptCenter, 协议:SSE`
+    /// —— 这个错误看起来像"没开通"，实际只是头写错了。
+    #[test]
+    fn catalog_headers_ask_for_json_not_sse() {
+        let channel = channel();
+        let account = account();
+        let creds = CodeArtsChannel::credentials(&account).expect("credentials");
+        let url = channel.url(BUILTIN_MODELS_PATH);
+        let headers = channel.signed_headers(
+            &account,
+            &creds,
+            "GET",
+            &url,
+            "application/json",
+            &[("Agent-Type".to_string(), "PromptCenter".to_string())],
+            &[],
+        );
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(find("Accept").as_deref(), Some("application/json"));
+        assert_eq!(find("Agent-Type").as_deref(), Some("PromptCenter"));
+        assert!(find("Authorization")
+            .is_some_and(|value| value.starts_with("SDK-HMAC-SHA256 Access=")));
+    }
+
+    /// 长期 AK/SK 没有 STS token 时**不能发空的 `x-auth-token`**。
+    #[test]
+    fn empty_security_token_is_not_sent_as_an_empty_header() {
+        let channel = channel();
+        let mut long_term = account();
+        long_term.access_token = None;
+        let creds = CodeArtsChannel::credentials(&long_term).expect("credentials");
+        let url = channel.url(BUILTIN_MODELS_PATH);
+        let headers = channel.signed_headers(
+            &long_term,
+            &creds,
+            "GET",
+            &url,
+            "application/json",
+            &[],
+            &[],
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-auth-token")),
+            "没有 STS token 就不该发 x-auth-token"
+        );
+
+        // 有 STS token 时必须带上。
+        let creds = CodeArtsChannel::credentials(&account()).expect("credentials");
+        let headers =
+            channel.signed_headers(&account(), &creds, "GET", &url, "application/json", &[], &[]);
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-auth-token") && value == "STS-TOKEN"));
+    }
+
+    /// 会话 id 必须稳定：上游按会话计并发，超过 3 个就 `TM.00001041`。
+    ///
+    /// 关键回归点是**客户端不给会话键时也不能每请求新生成** ——
+    /// 之前正是这样，连发几个请求就把 3 个会话配额用光。
+    #[test]
+    fn session_id_is_stable_even_without_a_client_session() {
+        let channel = channel();
+        let account = account();
+        // 没给会话键：两次独立生成必须相同（回落成该账号的固定会话）。
+        let first = channel.session_id(&account, None);
+        let second = channel.session_id(&account, None);
+        assert_eq!(first, second, "无会话键时必须稳定，否则会打满并发上限");
+
+        // 空串/空白也算"没给"。
+        assert_eq!(first, channel.session_id(&account, Some("   ")));
+
+        // 给了会话键：同键稳定、异键不同。
+        let a1 = channel.session_id(&account, Some("sess-a"));
+        let a2 = channel.session_id(&account, Some("sess-a"));
+        let b = channel.session_id(&account, Some("sess-b"));
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_ne!(a1, first);
+
+        // 换账号必须换会话（否则多账号共用同一个上游会话，并发反而更紧）。
+        let mut other = account.clone();
+        other.uid = "uid-2".into();
+        assert_ne!(first, channel.session_id(&other, None));
+    }
+
+    /// 请求必须带上稳定的 `Chat-Id` 与 `Session-Id`。
+    #[test]
+    fn chat_request_always_carries_a_session_id() {
+        let upstream = channel()
+            .build_chat_request(&account(), &request())
+            .expect("应当能构建报文");
+        let find = |name: &str| {
+            upstream
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        let chat_id = find("Chat-Id").expect("必须带 Chat-Id");
+        assert_eq!(find("Session-Id").as_deref(), Some(chat_id.as_str()));
+        assert!(!chat_id.is_empty());
+    }
+
     #[test]
     fn builtin_models_parse_with_limits() {
         let payload = json!({"builtinModels": [
@@ -835,6 +1240,96 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, Some(8_192));
         // `context_window: 0` 视为"未知"，不是"上限 0"。
         assert_eq!(models[1].context_length, None);
+    }
+
+    /// 上游把业务错误塞进 200 SSE 流里时必须被识别出来。
+    ///
+    /// 不识别的话，这一帧没有 `choices`，通用解析器返回空 → 整条流"正常结束"
+    /// → 用量记成「完成 / 输出 0」，把真正的失败吞掉。
+    #[test]
+    fn embedded_stream_errors_are_surfaced_not_swallowed() {
+        let channel = channel();
+        let frame = r#"{"text":"[DONE]","error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个),请关闭部分会话后重试。"}"#;
+        let events = channel.parse_event(frame);
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalEvent::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("错误帧必须转成 Error 事件：{events:?}"));
+        assert!(error.contains("TM.00001041"), "{error}");
+        assert!(error.contains("并发会话"), "{error}");
+        // 语义要落到 RateLimited（可换号重试）。
+        let classified = embedded_stream_error(frame).expect("应当识别");
+        assert_eq!(classified.kind, ErrorKind::RateLimited);
+        assert!(classified.retryable);
+
+        // 正常帧不能被误判成错误。
+        assert!(embedded_stream_error(
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#
+        )
+        .is_none());
+        // `error_code: "0"` 是正常结束标记。
+        assert!(embedded_stream_error(r#"{"error_code":"0","text":"[DONE]"}"#).is_none());
+    }
+
+    /// `tool_choice` 必须归一成三个字符串之一。
+    ///
+    /// 实测对照（真实账号）：
+    /// · 对象形态 → `InferHub.001001005 请求参数非法`
+    /// · 函数名字符串 → 同上
+    /// · `required` + 只带那一把工具 → 正常
+    #[test]
+    fn tool_choice_is_normalized_to_the_string_dialect() {
+        let tools = json!([
+            {"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}
+        ]);
+
+        // ① OpenAI 对象点名某个函数 → required + 只留那一个工具。
+        let mut body = json!({"tools": tools.clone(),
+            "tool_choice": {"type":"function","function":{"name":"read_file"}}});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+        let kept = body["tools"].as_array().expect("tools");
+        assert_eq!(kept.len(), 1, "只能留被点名的那一把");
+        assert_eq!(kept[0]["function"]["name"], "read_file");
+
+        // ② Anthropic 形状 `{type:"tool",name}` 等价处理。
+        let mut body = json!({"tools": tools.clone(),
+            "tool_choice": {"type":"tool","name":"get_weather"}});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+
+        // ③ 函数名字符串：上游不认，转成 required + 过滤。
+        let mut body = json!({"tools": tools.clone(), "tool_choice": "get_weather"});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+
+        // ④ 三个字符串原样保留。
+        for (input, expected) in [("auto", "auto"), ("none", "none"), ("required", "required")] {
+            let mut body = json!({"tools": tools.clone(), "tool_choice": input});
+            normalize_tool_choice(&mut body);
+            assert_eq!(body["tool_choice"], expected);
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(2), "不该裁工具");
+        }
+        // ⑤ Anthropic 的 `any` → required。
+        let mut body = json!({"tools": tools.clone(), "tool_choice": {"type":"any"}});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+
+        // ⑥ 点名的工具不存在 → 退回 auto（硬发 required 会被上游拒）。
+        let mut body = json!({"tools": tools.clone(), "tool_choice": "no_such_tool"});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "auto");
+
+        // ⑦ 没有 tools → 直接删掉 tool_choice。
+        let mut body = json!({"messages": [], "tool_choice": "required"});
+        normalize_tool_choice(&mut body);
+        assert!(body.get("tool_choice").is_none());
     }
 
     #[test]
@@ -937,3 +1432,124 @@ mod tests {
         assert_eq!(utc, plus8, "同一时刻的两种写法要相等");
     }
 }
+
+#[cfg(test)]
+mod probe_chat {
+    use super::*;
+    use crate::gateway::storage::Storage;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    #[ignore]
+    async fn dump_chat() {
+        let dir = std::path::PathBuf::from(
+            r"C:\Users\issuser\AppData\Roaming\com.issuser.dynamic-island\gateway",
+        );
+        let store = crate::agent::secrets::OsCredentialStore;
+        let storage = Storage::open(&dir, &store).expect("open");
+        let record = storage
+            .list_accounts()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.channel_id == "codearts")
+            .expect("no codearts account");
+        let credential = record.credential.expect("no credential");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()).filter(|t| !t.is_empty()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+            access_key_id: credential.access_key_id.clone(),
+            secret_key: credential.secret_key.clone(),
+            code_verifier: credential.code_verifier.clone(),
+        };
+        let channel = CodeArtsChannel::from_options("codearts", &serde_json::json!({}));
+        let client = reqwest::Client::new();
+
+        // 先看目录解析结果。
+        let models = channel
+            .list_models(&client, &account)
+            .await
+            .expect("list_models")
+            .unwrap_or_default();
+        println!("=== 目录 {} 个 ===", models.len());
+        for m in models.iter().take(10) {
+            println!(
+                "  {:<24} credits={:?} vision={}",
+                m.id, m.credits, m.capabilities.vision
+            );
+        }
+        let Some(first) = models.first() else { panic!("目录为空") };
+        let model = first.id.clone();
+
+        // 再打一次 chat。
+        let request = CanonicalRequest {
+            model: model.clone(),
+            system: Vec::new(),
+            messages: vec![crate::gateway::protocol::cir::Message {
+                role: crate::gateway::protocol::cir::Role::User,
+                content: vec![crate::gateway::protocol::cir::Block::text(
+                    "北京现在天气怎么样？请调用工具查询。",
+                )],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            // 带工具 + 对象形态的 tool_choice：这正是触发 001001005 的组合。
+            tools: vec![crate::gateway::protocol::cir::ToolSpec {
+                name: "get_weather".into(),
+                description: Some("查询指定城市的天气".into()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "description": "城市名"}},
+                    "required": ["city"]
+                })),
+            }],
+            tool_choice: Some(serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_weather"}
+            })),
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            stream: true,
+            reasoning: None,
+            metadata: Default::default(),
+            raw: serde_json::json!({}),
+        };
+        match channel.chat_stream(&account, &request, &client).await {
+            Ok(mut frames) => {
+                let mut text = String::new();
+                let mut seen = 0usize;
+                while let Some(frame) = frames.next().await {
+                    seen += 1;
+                    match frame {
+                        Ok(frame) => {
+                            for event in channel.parse_event(&frame) {
+                                match event {
+                                    CanonicalEvent::Text { text: chunk } => text.push_str(&chunk),
+                                    CanonicalEvent::Error { message } => {
+                                        panic!("上游 error 事件：{message}")
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(error) => panic!("帧失败：{}", error.describe()),
+                    }
+                    if text.chars().count() > 20 || seen > 300 {
+                        break;
+                    }
+                }
+                println!("=== chat 模型 {model} 帧数 {seen} ===");
+                println!("=== 正文 ===\n{text}");
+            }
+            Err(error) => println!("=== chat 失败 ===\n{}", error.describe()),
+        }
+    }
+}
+
+
+

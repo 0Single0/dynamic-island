@@ -154,6 +154,28 @@ fn decode_json(name: &str, value: &Value, state: &mut StreamState) -> Vec<Canoni
         return events;
     }
 
+    // **`plan_item` 才是正文的真实载体**。
+    //
+    // SOLO Agent 的回复不走 `content` delta，而是以「计划项」形式下发：
+    // ```json
+    // {"id":"pi_...","thought":"你好","reasoning_content":"",
+    //  "tool_call_info":{"name":"","params":null}}
+    // ```
+    // `thought` 是**累计快照**（同一个 `id` 会重复下发多次），最后的
+    // `tool_call_info.name = "finish"` 里 `params.summary` 是最终答案。
+    // 之前完全不认这个事件，所以"建会话成功但正文为空"。
+    if name == "plan_item" {
+        let visible = plan_item_text(value);
+        if let Some(delta) = push_delta(&mut state.text, &visible) {
+            events.push(CanonicalEvent::Text { text: delta });
+        }
+        // 工具类 plan item 才转成工具调用；`finish` 是终止标记，不是调用。
+        if let Some(call) = plan_item_tool_call(value) {
+            events.push(call);
+        }
+        return events;
+    }
+
     // 思考内容：与正文分开，绝不混进 content。
     // 思考**两种形态都存在**（累计快照 / 逐段增量），所以按"能当增量就当增量"处理。
     let reasoning = extract_reasoning(value);
@@ -370,14 +392,79 @@ fn extract_reasoning(value: &Value) -> String {
     String::new()
 }
 
-/// `tool_call_info` → CIR 工具调用。
+/// `plan_item` 的可见文本（累计快照）。
+///
+/// 上游把"思考轨迹"放 `thought`/`reasoning_content`，把"实际回复"放 `content`。
+/// 两者都是累计快照，所以拼起来作为正文；只取一个会漏掉另一半。
+/// 已经包含关系时不重复拼接（`content in thought` 很常见）。
+fn plan_item_text(value: &Value) -> String {
+    let thought = value
+        .get("thought")
+        .or_else(|| value.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let content = pick_content_text(value).unwrap_or_default();
+    let content = content.trim();
+    if content.is_empty() {
+        return thought;
+    }
+    if thought.is_empty() {
+        return content.to_string();
+    }
+    if thought.contains(content) {
+        return thought;
+    }
+    format!("{thought}\n\n{content}")
+}
+
+/// `plan_item` 里的工具调用。
+///
+/// 只有**真的有工具名**的才转成调用；`finish` 是上游的终止标记，不是调用 ——
+/// 把它当工具调用会让客户端去执行一个叫 "finish" 的函数。
+fn plan_item_tool_call(value: &Value) -> Option<CanonicalEvent> {
+    let info = value.get("tool_call_info")?;
+    let name = info
+        .get("name")
+        .or_else(|| info.get("tool_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("finish"))?;
+    let id = info
+        .get("id")
+        .or_else(|| info.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let arguments = info
+        .get("params")
+        .or_else(|| info.get("arguments"))
+        .map(|params| match params {
+            Value::String(text) => text.clone(),
+            Value::Null => String::new(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    Some(CanonicalEvent::ToolCall {
+        index: 0,
+        id,
+        name: Some(name.to_string()),
+        arguments_delta: (!arguments.is_empty()).then_some(arguments),
+    })
+}
+
+/// `tool_call_info` 形状的工具调用。
 fn extract_tool_call(value: &Value) -> Option<CanonicalEvent> {
     let info = value.get("tool_call_info")?;
     let name = info
         .get("name")
         .or_else(|| info.get("tool_name"))
         .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())?
+        .map(str::trim)
+        // `finish` 是上游的终止标记（`params.summary` 才是最终答案），
+        // 它不是客户端要执行的函数，不能当 tool_call 下发。
+        .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("finish"))?
         .to_string();
     let id = info
         .get("tool_call_id")
@@ -509,6 +596,75 @@ mod tests {
     }
 
     #[test]
+    /// `plan_item` 才是正文的真实载体。
+    ///
+    /// 真实帧（抓包）：
+    /// ```text
+    /// event: plan_item
+    /// data: {"id":"pi_...","thought":"你好","reasoning_content":"",
+    ///        "tool_call_info":{"id":"","name":"","params":null}}
+    /// ```
+    /// 同一个 plan item 会**重复下发**（tool_call_started / finished 各一次），
+    /// 所以必须按累计快照处理，不能每帧都追加。
+    #[test]
+    fn plan_item_carries_the_visible_answer() {
+        let decoder = Decoder::default();
+        let first = decoder.decode(
+            "event: plan_item\ndata: {\"id\":\"pi_1\",\"thought\":\"你\",\"reasoning_content\":\"\",\"tool_call_info\":{\"name\":\"\"}}",
+        );
+        assert_eq!(text_of(&first), "你");
+        // 同一 id 重复下发同一份快照：不重复吐。
+        let replay = decoder.decode(
+            "event: plan_item\ndata: {\"id\":\"pi_1\",\"thought\":\"你\",\"reasoning_content\":\"\",\"tool_call_info\":{\"name\":\"\"}}",
+        );
+        assert!(text_of(&replay).is_empty(), "累计快照不该重复");
+        // 快照变长：只吐新增。
+        let grown = decoder.decode(
+            "event: plan_item\ndata: {\"id\":\"pi_1\",\"thought\":\"你好\",\"reasoning_content\":\"\",\"tool_call_info\":{\"name\":\"\"}}",
+        );
+        assert_eq!(text_of(&grown), "好");
+    }
+
+    /// 计划项同时带 `thought` 与 `content` 时要拼接，且不重复。
+    #[test]
+    fn plan_item_joins_thought_and_content_without_duplication() {
+        let decoder = Decoder::default();
+        let both = decoder.decode(
+            "event: plan_item\ndata: {\"thought\":\"思考\",\"content\":\"答案\"}",
+        );
+        assert_eq!(text_of(&both), "思考\n\n答案");
+
+        // content 已包含在 thought 里：只留 thought。
+        let nested = Decoder::default().decode(
+            "event: plan_item\ndata: {\"thought\":\"思考里有答案\",\"content\":\"答案\"}",
+        );
+        assert_eq!(text_of(&nested), "思考里有答案");
+    }
+
+    /// `finish` 是终止标记，不是客户端要执行的工具调用。
+    #[test]
+    fn finish_marker_is_not_emitted_as_a_tool_call() {
+        let decoder = Decoder::default();
+        let events = decoder.decode(
+            "event: plan_item\ndata: {\"thought\":\"你好\",\"tool_call_info\":{\"id\":\"pi_1\",\"name\":\"finish\",\"params\":{\"summary\":\"你好\"}}}",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CanonicalEvent::ToolCall { .. })),
+            "finish 不能变成 tool_call：{events:?}"
+        );
+        assert_eq!(text_of(&events), "你好");
+
+        // 普通 tool_call_info 仍然要识别。
+        let real = decoder.decode(
+            "event: plan_item\ndata: {\"tool_call_info\":{\"name\":\"read_file\",\"id\":\"c1\",\"params\":{\"path\":\"a\"}}}",
+        );
+        assert!(real
+            .iter()
+            .any(|event| matches!(event, CanonicalEvent::ToolCall { .. })));
+    }
+
     fn tool_call_info_becomes_a_cir_tool_call() {
         let decoder = Decoder::default();
         let events = decoder.decode(

@@ -1,5 +1,6 @@
 //! Markdown HTML → PDF：使用 Windows WebView2 的原生打印接口。
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -84,6 +85,51 @@ pub async fn markdown_to_pdf(
     }
 }
 
+/// 打印页面（含内联图片）的体积上限：正常文档远低于这个值，超了说明不是 Markdown 了。
+#[cfg(target_os = "windows")]
+const MAX_PRINT_HTML_BYTES: usize = 64 * 1024 * 1024;
+
+/// 落盘的临时打印页面。
+///
+/// 不能用 `ICoreWebView2::NavigateToString`：它只接受 2 MiB 以内的 HTML。
+/// Markdown 里带本地图片时，前端会把图片内联成 data URL，HTML 很快超过这个上限，
+/// WebView2 直接返回 E_INVALIDARG —— 界面上就是「参数错误。 (0x80070057)」，
+/// 表现为"带图的 md 转不了 PDF、纯文本的却可以"。
+/// 改成写临时文件再用 `file://` 导航：体积只受内存限制，图片仍是文档内置的 data URL，
+/// 不需要额外放开任何文件访问权限。临时文件在打印结束（含失败）后删除。
+#[cfg(target_os = "windows")]
+struct PrintDocument {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl PrintDocument {
+    fn write(html: &str) -> Result<Self, String> {
+        if html.len() > MAX_PRINT_HTML_BYTES {
+            return Err(format!(
+                "文档过大（{:.1} MiB），超过打印上限 {:.0} MiB",
+                html.len() as f64 / (1024.0 * 1024.0),
+                MAX_PRINT_HTML_BYTES as f64 / (1024.0 * 1024.0)
+            ));
+        }
+        let path = std::env::temp_dir().join(format!("dynamic-island-print-{}.html", uuid_suffix()));
+        std::fs::write(&path, html).map_err(|error| format!("写入临时打印页面失败: {error}"))?;
+        Ok(Self { path })
+    }
+
+    fn url(&self) -> Result<tauri::Url, String> {
+        tauri::Url::from_file_path(&self.path)
+            .map_err(|_| "临时打印页面路径无法转成 file:// 地址".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PrintDocument {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(target_os = "windows")]
 async fn render_with_webview2(
     app: &tauri::AppHandle,
@@ -91,8 +137,11 @@ async fn render_with_webview2(
     output_path: &str,
     title: &str,
 ) -> Result<(), String> {
+    let document = PrintDocument::write(&printable_document(html, title))?;
+    let document_url = document.url()?;
+
     let label = format!("markdown-print-{}", uuid_suffix());
-    let print_window = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+    let print_window = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(blank_url()?))
         .title(title)
         .inner_size(794.0, 1123.0)
         .position(-2000.0, -2000.0)
@@ -103,40 +152,108 @@ async fn render_with_webview2(
         .build()
         .map_err(|e| format!("创建打印页面失败: {e}"))?;
 
-    let document = printable_document(html, title);
-    if let Err(error) = navigate_to_string(&print_window, &document) {
-        let _ = print_window.destroy();
-        return Err(error);
-    }
-    tokio::time::sleep(Duration::from_millis(650)).await;
-
-    let result = print_to_pdf(&print_window, output_path).await;
+    let result = render_and_print(&print_window, &document_url, output_path).await;
     let _ = print_window.destroy();
+    // document 在这里析构：临时 HTML 无论成功失败都会被删掉。
+    drop(document);
     result
 }
 
 #[cfg(target_os = "windows")]
-fn navigate_to_string(window: &tauri::WebviewWindow, html: &str) -> Result<(), String> {
-    use std::sync::mpsc;
+fn blank_url() -> Result<tauri::Url, String> {
+    tauri::Url::parse("about:blank").map_err(|e| format!("打印页面初始地址无效: {e}"))
+}
 
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
-    use windows::core::PCWSTR;
+/// 导航到目标文档 → 等 WebView2 报导航完成 → 再打印。
+///
+/// 旧实现是"NavigateToString 之后固定睡 650ms"，文档一大就是抓空页；
+/// 这里改成等 NavigationCompleted 事件，只留一点绘制余量。
+#[cfg(target_os = "windows")]
+async fn render_and_print(
+    window: &tauri::WebviewWindow,
+    document_url: &tauri::Url,
+    output_path: &str,
+) -> Result<(), String> {
+    // 先让初始的 about:blank 导航落地，否则它的完成事件会抢在真正的文档之前。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    navigate_and_wait(window, document_url).await?;
+    // 导航完成到首帧之间还有一点间隔（排版 + 图片解码）。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    print_to_pdf(window, output_path).await
+}
 
-    let content: Vec<u16> = html.encode_utf16().chain(std::iter::once(0)).collect();
-    let (sender, receiver) = mpsc::channel::<Result<(), String>>();
+#[cfg(target_os = "windows")]
+async fn navigate_and_wait(
+    window: &tauri::WebviewWindow,
+    url: &tauri::Url,
+) -> Result<(), String> {
+    use tokio::sync::mpsc;
+
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationCompletedEventHandler,
+    };
+    use windows::core::{BOOL, PCWSTR};
+
+    let (sender, mut receiver) = mpsc::unbounded_channel::<Result<bool, String>>();
+    let callback_sender = sender.clone();
+    let target: Vec<u16> = url.as_str().encode_utf16().chain(std::iter::once(0)).collect();
+
     window
         .with_webview(move |webview| unsafe {
-            let result = webview
-                .controller()
-                .CoreWebView2()
-                .and_then(|core: ICoreWebView2| core.NavigateToString(PCWSTR(content.as_ptr())))
-                .map_err(|e| e.to_string());
-            let _ = sender.send(result);
+            let setup: Result<(), String> = (|| {
+                let core: ICoreWebView2 = webview
+                    .controller()
+                    .CoreWebView2()
+                    .map_err(|e| e.to_string())?;
+                let mut token = 0_i64;
+                let handler = NavigationCompletedEventHandler::create(Box::new(
+                    move |_sender, args| {
+                        let succeeded = args
+                            .map(|args| {
+                                let mut flag = BOOL(0);
+                                args.IsSuccess(&mut flag)
+                                    .map(|_| flag.as_bool())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        let _ = callback_sender.send(Ok(succeeded));
+                        Ok(())
+                    },
+                ));
+                core.add_NavigationCompleted(&handler, &mut token)
+                    .map_err(|e| e.to_string())?;
+                core.Navigate(PCWSTR(target.as_ptr()))
+                    .map_err(|e| e.to_string())
+            })();
+            if let Err(error) = setup {
+                let _ = sender.send(Err(error));
+            }
         })
-        .map_err(|e| format!("加载打印页面失败: {e}"))?;
-    receiver
-        .recv_timeout(Duration::from_secs(3))
-        .map_err(|_| "加载打印页面超时".to_string())?
+        .map_err(|e| format!("启动打印页面导航失败: {e}"))?;
+
+    let expected = url.as_str().to_string();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("打印页面加载超时".into());
+        }
+        match tokio::time::timeout(remaining, receiver.recv()).await {
+            // 事件可能来自残留的 about:blank，核对当前地址确实是目标文档才算数。
+            Ok(Some(Ok(_))) => {
+                let current = window
+                    .url()
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_default();
+                if current == expected || current.starts_with("file:") {
+                    return Ok(());
+                }
+            }
+            Ok(Some(Err(error))) => return Err(format!("加载打印页面失败: {error}")),
+            Ok(None) => return Err("加载打印页面失败".into()),
+            Err(_) => return Err("打印页面加载超时".into()),
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
