@@ -20,7 +20,7 @@ pub mod signer;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::gateway::{
     channels::{
@@ -182,7 +182,9 @@ impl ChannelAdapter for CodeArtsChannel {
     ) -> Result<UpstreamRequest, GatewayError> {
         let credentials = Self::credentials(account)?;
         // 上游就是 OpenAI 形状：直接复用通用编码（把 CIR 还原成 OpenAI 报文）。
-        let body = crate::gateway::channels::custom::build_openai_chat_body(request);
+        let mut body = crate::gateway::channels::custom::build_openai_chat_body(request);
+        // `tool_choice` 要按这条上游的方言改写（见 `normalize_tool_choice`）。
+        normalize_tool_choice(&mut body);
         let raw = serde_json::to_vec(&body)
             .map_err(|error| GatewayError::internal(format!("请求体序列化失败：{error}")))?;
         let url = self.url(CHAT_PATH);
@@ -715,6 +717,93 @@ fn normalize_rate(value: &str) -> String {
 /// · `002002009` / `not registered` / `4004.200` / `benefit not found` ——
 ///   该账号用不了这个模型，是**模型级**问题，不该冷却整个账号；
 /// · `InferHub.001001005` / `request param is invalid` —— 请求参数错，重试无用。
+/// 把 `tool_choice` 改写成**这条上游认的形状**。
+///
+/// 实测（真实账号，逐变体对照）：
+/// | 报文 | 结果 |
+/// |---|---|
+/// | `tools` + `tool_choice: {type:function,name:X}` | `InferHub.001001005 请求参数非法` |
+/// | `tools` + `tool_choice: "X"`（函数名字符串） | 同上 |
+/// | `tools` + 不带 `tool_choice` | 正常 |
+/// | `tools:[X]` + `tool_choice: "required"` | **正常** |
+///
+/// 所以：**只接受三个字符串**（`auto` / `required` / `none`）；
+/// 客户端点名要某个工具时，把 `tools` 裁成那一个再发 `required` ——
+/// 语义等价（模型只能调它），而且上游认。
+pub fn normalize_tool_choice(body: &mut Value) {
+    // 没有 tools 时 tool_choice 没有意义，留着反而可能被判非法。
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        if let Some(map) = body.as_object_mut() {
+            map.remove("tool_choice");
+        }
+        return;
+    }
+    let Some(choice) = body.get("tool_choice").cloned() else {
+        return;
+    };
+    // (归一后的字符串, 要不要把 tools 裁成单个)
+    let (normalized, only) = match &choice {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
+                "auto" => ("auto", None),
+                "none" => ("none", None),
+                "required" | "any" => ("required", None),
+                // 函数名字符串：上游不认，改成"只发这个工具 + required"。
+                _ if !trimmed.is_empty() => ("required", Some(trimmed.to_string())),
+                _ => ("auto", None),
+            }
+        }
+        Value::Object(map) => match map.get("type").and_then(Value::as_str).unwrap_or("") {
+            "auto" => ("auto", None),
+            "any" => ("required", None),
+            "none" => ("none", None),
+            // OpenAI 的 `{type:"function", function:{name}}` 与 Anthropic 的
+            // `{type:"tool", name}` 都落到这里。
+            "function" | "tool" => {
+                let name = map
+                    .get("name")
+                    .or_else(|| map.get("function").and_then(|function| function.get("name")))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                match name {
+                    Some(name) => ("required", Some(name.to_string())),
+                    None => ("auto", None),
+                }
+            }
+            _ => ("auto", None),
+        },
+        _ => ("auto", None),
+    };
+
+    if let Some(name) = only {
+        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+            let filtered: Vec<Value> = tools
+                .iter()
+                .filter(|tool| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(name.as_str())
+                })
+                .cloned()
+                .collect();
+            // 找不到同名工具就退回 auto：硬发 required 会让上游拒绝。
+            if filtered.is_empty() {
+                body["tool_choice"] = json!("auto");
+                return;
+            }
+            body["tools"] = Value::Array(filtered);
+        }
+    }
+    body["tool_choice"] = json!(normalized);
+}
+
 /// 识别**藏在 200 SSE 流里**的业务错误。
 ///
 /// 上游在限流/未开通时不会改 HTTP 状态码，而是在流里发一帧：
@@ -1165,6 +1254,64 @@ mod tests {
         assert!(embedded_stream_error(r#"{"error_code":"0","text":"[DONE]"}"#).is_none());
     }
 
+    /// `tool_choice` 必须归一成三个字符串之一。
+    ///
+    /// 实测对照（真实账号）：
+    /// · 对象形态 → `InferHub.001001005 请求参数非法`
+    /// · 函数名字符串 → 同上
+    /// · `required` + 只带那一把工具 → 正常
+    #[test]
+    fn tool_choice_is_normalized_to_the_string_dialect() {
+        let tools = json!([
+            {"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}
+        ]);
+
+        // ① OpenAI 对象点名某个函数 → required + 只留那一个工具。
+        let mut body = json!({"tools": tools.clone(),
+            "tool_choice": {"type":"function","function":{"name":"read_file"}}});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+        let kept = body["tools"].as_array().expect("tools");
+        assert_eq!(kept.len(), 1, "只能留被点名的那一把");
+        assert_eq!(kept[0]["function"]["name"], "read_file");
+
+        // ② Anthropic 形状 `{type:"tool",name}` 等价处理。
+        let mut body = json!({"tools": tools.clone(),
+            "tool_choice": {"type":"tool","name":"get_weather"}});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+
+        // ③ 函数名字符串：上游不认，转成 required + 过滤。
+        let mut body = json!({"tools": tools.clone(), "tool_choice": "get_weather"});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+
+        // ④ 三个字符串原样保留。
+        for (input, expected) in [("auto", "auto"), ("none", "none"), ("required", "required")] {
+            let mut body = json!({"tools": tools.clone(), "tool_choice": input});
+            normalize_tool_choice(&mut body);
+            assert_eq!(body["tool_choice"], expected);
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(2), "不该裁工具");
+        }
+        // ⑤ Anthropic 的 `any` → required。
+        let mut body = json!({"tools": tools.clone(), "tool_choice": {"type":"any"}});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "required");
+
+        // ⑥ 点名的工具不存在 → 退回 auto（硬发 required 会被上游拒）。
+        let mut body = json!({"tools": tools.clone(), "tool_choice": "no_such_tool"});
+        normalize_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], "auto");
+
+        // ⑦ 没有 tools → 直接删掉 tool_choice。
+        let mut body = json!({"messages": [], "tool_choice": "required"});
+        normalize_tool_choice(&mut body);
+        assert!(body.get("tool_choice").is_none());
+    }
+
     #[test]
     fn error_codes_map_to_the_right_scope() {
         // 限流：账号级，可换号重试。
@@ -1322,14 +1469,28 @@ mod probe_chat {
             system: Vec::new(),
             messages: vec![crate::gateway::protocol::cir::Message {
                 role: crate::gateway::protocol::cir::Role::User,
-                content: vec![crate::gateway::protocol::cir::Block::text("只回复两个字：你好")],
+                content: vec![crate::gateway::protocol::cir::Block::text(
+                    "北京现在天气怎么样？请调用工具查询。",
+                )],
                 tool_calls: Vec::new(),
                 tool_call_id: None,
                 name: None,
                 reasoning: None,
             }],
-            tools: Vec::new(),
-            tool_choice: None,
+            // 带工具 + 对象形态的 tool_choice：这正是触发 001001005 的组合。
+            tools: vec![crate::gateway::protocol::cir::ToolSpec {
+                name: "get_weather".into(),
+                description: Some("查询指定城市的天气".into()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string", "description": "城市名"}},
+                    "required": ["city"]
+                })),
+            }],
+            tool_choice: Some(serde_json::json!({
+                "type": "function",
+                "function": {"name": "get_weather"}
+            })),
             temperature: None,
             top_p: None,
             max_tokens: Some(64),
@@ -1369,5 +1530,6 @@ mod probe_chat {
         }
     }
 }
+
 
 
