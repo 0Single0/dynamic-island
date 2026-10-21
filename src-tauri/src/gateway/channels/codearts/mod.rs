@@ -804,6 +804,14 @@ pub fn normalize_tool_choice(body: &mut Value) {
     body["tool_choice"] = json!(normalized);
 }
 
+/// 会话并发上限的恢复时刻：现在就 + 20 秒。
+///
+/// 上游那个 3 会话配额是**瞬时**占用的：请求结束后上游要过一小会儿才释放。
+/// 我们只需要让出这一小会儿，而不是把账号整体停几分钟。
+pub fn session_limit_release_at() -> u64 {
+    crate::gateway::timeutil::now_ms().saturating_add(20_000)
+}
+
 /// 识别**藏在 200 SSE 流里**的业务错误。
 ///
 /// 上游在限流/未开通时不会改 HTTP 状态码，而是在流里发一帧：
@@ -838,7 +846,14 @@ pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
         || lowered.contains("\"tpm\"")
         || status == 429
     {
-        return GatewayError::new(
+        // 会话并发上限要**短冷却**。
+        //
+        // 上游的 `TM.00001041`（并发会话数已达上限）是"现在这一刻开着的会话太多"，
+        // 实测几十秒就自行释放；不给恢复时刻的话，池子会按指数退避把整个账号
+        // 停 9 分钟 —— 用户看到的就是"发两条就废九分钟"。
+        let session_limit =
+            lowered.contains("tm.00001041") || lowered.contains("并发会话");
+        let error = GatewayError::new(
             ErrorKind::RateLimited,
             ErrorScope::Account,
             429,
@@ -846,6 +861,11 @@ pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
             true,
         )
         .with_upstream(openai_compat::raw(body));
+        return if session_limit {
+            error.with_reset_at(Some(session_limit_release_at()))
+        } else {
+            error
+        };
     }
     if lowered.contains("002002009")
         || lowered.contains("not registered")

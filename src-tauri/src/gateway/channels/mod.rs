@@ -4,6 +4,9 @@
 //! 它只负责「怎么登录 / 怎么刷新 / 怎么发一次请求 / 怎么读回事件 / 这个错误是什么意思」。
 //! 新增渠道只改本模块 + 配置。
 
+// 华为云 CodeArts：**暂时停用**，实现完整保留（见下方 `build_registry` 的说明）。
+// 整个模块暂时没有调用方，dead_code 警告是这个状态的正常产物。
+#[allow(dead_code)]
 pub mod codearts;
 pub mod custom;
 pub mod fake;
@@ -523,11 +526,21 @@ pub fn build_registry(
                 &channel.id,
                 &channel.options,
             )),
-            // 华为云 CodeArts：STS token + AK/SK 签名，见 `codearts::mod`。
-            "codearts" => Arc::new(codearts::CodeArtsChannel::from_options(
-                &channel.id,
-                &channel.options,
-            )),
+            // 华为云 CodeArts：**暂时停用**。
+            //
+            // 上游有两个硬约束，短期内解不掉：
+            // · 每账号同时只能有 3 个会话，超了回 `TM.00001041`；
+            // · `tool_choice` 只认 auto/required/none 三个字符串，对象形态直接
+            //   判「请求参数非法」（`InferHub.001001005`）。
+            // 我们虽然按这两个约束做了适配，但它会把整个账号拖进限流，
+            // 收益不如直接用「自定义供应商」接华为云 ModelArts。
+            //
+            // 实现完整保留在 `codearts` 模块里，恢复时把这行取消注释即可
+            // （同时在配置里把该渠道 `enabled` 改回 true）。
+            // "codearts" => Arc::new(codearts::CodeArtsChannel::from_options(
+            //     &channel.id,
+            //     &channel.options,
+            // )),
             other => {
                 warnings.push(format!(
                     "渠道 {} 的适配器 {other} 尚未实现，已跳过",

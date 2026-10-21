@@ -219,6 +219,15 @@ impl GatewayState {
         let mut catalogs = Vec::new();
         for channel in self.channels() {
             let channel_config = config.channel(channel.id());
+            // **名下账号全被停用时不再拉目录**。
+            //
+            // 否则 `/v1/models` 会照常宣称这个渠道的一堆模型，调度时却一个都挑不出来，
+            // 客户端看到的就是"模型列表里有，一调用就报无可用账号"。
+            // 目录该反映"现在真能调什么"，而不是"配置里有什么"。
+            let named = self.pool.by_channel(channel.id());
+            if !named.is_empty() && named.iter().all(|account| !account.enabled) {
+                continue;
+            }
             // 没有账号也要试着拉目录：假渠道不需要凭据，真实渠道拿不到凭据时会回落到内置快照。
             let account = self
                 .first_account_for(channel.id())
