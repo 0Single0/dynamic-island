@@ -46,6 +46,109 @@ const FINGERPRINT_REWRITES: [(&str, &str); 6] = [
 /// 来源域名：命中即移除（域名本身没有任何语义价值）。
 const FINGERPRINT_DOMAINS: [&str; 1] = ["github.com/anthropics/"];
 
+/// 注入的最小中性 system 提示词。
+///
+/// 上游的渠道校验会看"请求长什么样"：**没有 system 消息的请求**本身就是一个
+/// 特征（官方客户端总会带一条）。所以空手起手的请求先补一条中性的，
+/// 内容刻意不含任何品牌、模型名或工具声明。
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+
+/// 身份声明句式：`You are an AI agent powered by X` 这类"自我介绍 + 品牌"。
+///
+/// 上游 WAF 把它当成"非官方渠道"（参考实现 #533 / #537 / #539）：
+/// ```text
+/// You are an AI agent powered by DeepSeek Harness.
+/// You are a coding agent powered by the deepseek-v4.1-flash model.
+/// You are an AI assistant built on DeepSeek.
+/// ```
+/// 大小写不敏感、连续子串匹配；单独的品帬词或改语序后放行 ——
+/// 所以匹配到的**整句**换成中性句，而不是只删品牌词（只删品牌词仍会被判异常）。
+///
+/// 正则与参考实现逐字对齐：
+/// `You are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)[^\n]*?(?:\.(?=\s|$)|(?=\n|$))`
+/// 身份声明句式的**前缀**（到品牌归属词为止）。
+///
+/// 停在这里而不是把句尾也写进正则：句尾判定要"句号后跟空白或串尾"，
+/// 而 `deepseek-v4.1-flash` 这种模型名里也有 `.`，纯正则会把 `v4.` 当句尾。
+/// 句尾交给 [`identity_sentence_end`] 逐字符判断，与参考实现的 look-ahead 等价。
+fn identity_prefix_regex() -> &'static regex::Regex {
+    static CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)You are an?(?:\s+AI)?(?:\s+coding)?\s+(?:agent\s+powered by|assistant\s+built on)",
+        )
+        .expect("身份声明正则是编译期常量，不会失败")
+    })
+}
+
+/// 从 `from` 开始找一句的结尾：返回**不含**结尾的字节偏移。
+///
+/// 与参考实现的 `(?:\.(?=\s|$)|(?=\n|$))` 等价：
+/// · 句号后面是空白或串尾 → 句子结束（句号本身属于这句话，会被替换掉）；
+/// · 换行 → 句子结束（换行不属于这句话，保留）；
+/// · 都没有 → 到串尾。
+fn identity_sentence_end(text: &str, from: usize) -> usize {
+    let mut chars = text[from..].char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if ch == '\n' {
+            return from + index;
+        }
+        if ch == '.' {
+            let next = chars.peek().map(|(_, next)| *next);
+            let ends_here = match next {
+                None => true,
+                Some(next) => next.is_whitespace(),
+            };
+            if ends_here {
+                // 句号本身也要吃掉（它属于这句被替换掉的内容）。
+                return from + index + ch.len_utf8();
+            }
+        }
+    }
+    text.len()
+}
+
+/// 把所有身份声明整句换成中性句。
+fn rewrite_identity_declarations(text: &str) -> String {
+    let regex = identity_prefix_regex();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for matched in regex.find_iter(text) {
+        // 已经落在上一处替换里的匹配直接跳过（避免重复处理同一句）。
+        if matched.start() < cursor {
+            continue;
+        }
+        let end = identity_sentence_end(text, matched.end());
+        output.push_str(&text[cursor..matched.start()]);
+        output.push_str("You are a helpful AI assistant.");
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+/// OmO 框架的身份指纹：`Sisyphus-Junior - Focused executor`。
+///
+/// 参考实现注释确认：上游**按连续子串**匹配，且"改掉句式结构后就不再命中"。
+/// 所以这里把 `- ` 结构改成括号式（语义不变，结构已不同），
+/// 比只做大小写归一化更可靠 —— 后者对原样出现的串等于没改。
+fn omo_junior_regex() -> &'static regex::Regex {
+    static CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        regex::Regex::new(r"(?i)Sisyphus-Junior\s*[-–—]\s*Focused executor")
+            .expect("OmO 指纹正则是编译期常量，不会失败")
+    })
+}
+
+/// 计费头残片的 KV 串：`cc_xxx=yyy;`。
+fn cc_kv_regex() -> &'static regex::Regex {
+    static CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        regex::Regex::new(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
+            .expect("cc_* KV 正则是编译期常量，不会失败")
+    })
+}
+
 /// 拼出上游请求体：以原始请求体为基底（保留渠道特有的透传字段），再逐层清洗。
 pub fn build_chat_body(model: &str, request: &CanonicalRequest) -> Value {
     let mut body = match request.raw.clone() {
@@ -124,14 +227,43 @@ fn build_messages(request: &CanonicalRequest) -> Vec<Value> {
 
     let system: Vec<&str> = request.system.iter().filter_map(Block::as_text).collect();
     if !system.is_empty() {
+        // system 是"客户端自我声明"，允许做身份改写（user 内容不允许）。
         messages.push(json!({
             "role": "system",
-            "content": sanitize_text(&system.join("\n")),
+            "content": sanitize_text_with(&system.join("\n"), true),
         }));
     }
 
     for message in &request.messages {
         messages.push(build_message(message));
+    }
+
+    // **保证请求一定以 system 开头**。
+    //
+    // 官方客户端总会带一条 system；"没有 system 消息"本身就是一个渠道特征。
+    // 清洗后 system 变空（整段都是指纹）时也走这里补一条中性的，
+    // 避免发出一条 `content: ""` 的怪 system。
+    let needs_prompt = match messages.first() {
+        None => true,
+        Some(first) => {
+            first.get("role").and_then(Value::as_str) != Some("system")
+                || first
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_none_or(|text| text.trim().is_empty())
+        }
+    };
+    if needs_prompt {
+        // 已经有空的 system 就替换，没有才插入 —— 不能留两条 system。
+        match messages.first().map(|first| first.get("role").and_then(Value::as_str)) {
+            Some(Some("system")) => {
+                messages[0] = json!({ "role": "system", "content": DEFAULT_SYSTEM_PROMPT });
+            }
+            _ => messages.insert(
+                0,
+                json!({ "role": "system", "content": DEFAULT_SYSTEM_PROMPT }),
+            ),
+        }
     }
     messages
 }
@@ -196,12 +328,28 @@ fn content_value(blocks: &[Block]) -> Value {
 }
 
 /// 把会被判「未授权渠道」的特征串改写成等价写法，并抹平 `\r\n` 残片。
-pub fn sanitize_text(text: &str) -> String {
+///
+/// `identity` 控制是否处理**身份声明句式**（`You are an AI agent powered by X`）：
+/// · `true` —— system / developer 角色。这类文本是"客户端自我声明"，
+///   改写它不影响模型行为，却能去掉 WAF 最大的一个指纹；
+/// · `false` —— user / assistant / tool 角色。这些是**用户数据**，
+///   改写会让模型看到与磁盘不一致的内容（参考实现 #537 因此明确收窄）。
+pub fn sanitize_text_with(text: &str, identity: bool) -> String {
     // 绝大多数请求没有任何特征串：先判断，省掉下面这一串无谓的拷贝与扫描。
-    if !has_fingerprint(text) {
+    if !has_fingerprint_with(text, identity) {
         return text.to_string();
     }
     let mut output = text.to_string();
+
+    // ① 身份声明整句换中性写法（最先做：它吃掉整句后，后面的规则少扫一遍）。
+    if identity {
+        output = rewrite_identity_declarations(&output);
+    }
+    // ② OmO 框架指纹：改句式结构而不是删词（删词不解除匹配）。
+    output = omo_junior_regex()
+        .replace_all(&output, "Sisyphus-Junior (focused executor)")
+        .into_owned();
+
     // **计费头残片要整段删**（参考实现的 SANITIZE_HDR_RE + SANITIZE_KV_RE）：
     // Claude Code 的 system 里有被塞进来的 HTTP 头结构 ——
     //   x-anthropic-billing-header: cc_version=2.1.296.32d; cc_...=...; ...
@@ -244,6 +392,10 @@ pub fn sanitize_text(text: &str) -> String {
             break;
         }
     }
+    // 正则兜底：跨行或夹在句中、前面没有整行前缀的 KV 对也要清掉。
+    if output.contains("cc_") {
+        output = cc_kv_regex().replace_all(&output, "").into_owned();
+    }
     for (from, to) in FINGERPRINT_REWRITES {
         if output.contains(from) {
             output = output.replace(from, to);
@@ -255,11 +407,29 @@ pub fn sanitize_text(text: &str) -> String {
         }
     }
     // `\r\n` 残片会被上游当成"伪造头"的特征。
-    output.replace("\r\n", "\n")
+    output = output.replace("\r\n", "\n");
+    // 首尾空白也带着"拼接进来的头部"形状，一并去掉（与参考实现一致）。
+    output.trim().to_string()
+}
+
+/// 兼容入口：按「非身份文本」处理（user / tool 内容）。
+pub fn sanitize_text(text: &str) -> String {
+    sanitize_text_with(text, false)
+}
+
+/// 按角色决定要不要做身份改写：只有 system / developer 是"客户端自我声明"。
+pub fn sanitize_for_role(text: &str, role: &str) -> String {
+    let identity = matches!(role, "system" | "developer");
+    sanitize_text_with(text, identity)
 }
 
 /// 是否含需要处理的特征（给调用方做"要不要改写"的判断，避免无谓的字符串拷贝）。
 pub fn has_fingerprint(text: &str) -> bool {
+    has_fingerprint_with(text, true)
+}
+
+/// `identity` = 是否把身份声明句式也算作特征（只对 system / developer 为 true）。
+pub fn has_fingerprint_with(text: &str, identity: bool) -> bool {
     FINGERPRINT_REWRITES
         .iter()
         .any(|(from, _)| !from.is_empty() && text.contains(from))
@@ -267,6 +437,9 @@ pub fn has_fingerprint(text: &str) -> bool {
         // 计费头残片：cc_* KV（WAF 指纹，见 sanitize_text 里的注释）。
         || text.contains("cc_")
         || text.contains("\r\n")
+        // OmO 框架指纹与身份声明：正则匹配（字面量认不出各种变体）。
+        || omo_junior_regex().is_match(text)
+        || (identity && identity_prefix_regex().is_match(text))
 }
 
 /// 工具配对自愈：合并相邻 assistant(tool_calls) → 按 call 重排 tool 结果 → 清孤儿。
@@ -492,6 +665,28 @@ mod tests {
         }
     }
 
+    /// 只带 user 消息（`role, text` 列表）的最小请求。
+    fn request_with(messages: &[(&str, &str)]) -> CanonicalRequest {
+        let mut request = request();
+        request.system.clear();
+        request.messages = messages
+            .iter()
+            .map(|(role, text)| Message {
+                role: match *role {
+                    "assistant" => Role::Assistant,
+                    "tool" => Role::Tool,
+                    _ => Role::User,
+                },
+                content: vec![Block::text(*text)],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            })
+            .collect();
+        request
+    }
+
     fn assistant_with_call(id: &str, name: &str) -> Message {
         Message {
             role: Role::Assistant,
@@ -516,6 +711,92 @@ mod tests {
             name: None,
             reasoning: None,
         }
+    }
+
+    /// 身份声明句式（`You are an AI agent powered by X`）—— 这是触发
+    /// `11-128 Illegal API invocation from an unapproved channel` 的主要指纹。
+    ///
+    /// 三条用例都取自参考实现确认过的真实报障（#533 / #537 / #539）。
+    #[test]
+    fn identity_declarations_are_replaced_with_a_neutral_sentence() {
+        for source in [
+            "You are an AI agent powered by DeepSeek Harness.",
+            "You are a coding agent powered by the deepseek-v4.1-flash model.",
+            "You are an AI assistant built on DeepSeek.",
+        ] {
+            let cleaned = sanitize_text_with(source, true);
+            assert_eq!(
+                cleaned, "You are a helpful AI assistant.",
+                "整句要换成中性句：{source}"
+            );
+        }
+    }
+
+    /// 大小写不敏感；且必须**整句**替换，只删品牌词仍会被判异常。
+    #[test]
+    fn identity_matching_is_case_insensitive_and_sentence_wide() {
+        let cleaned = sanitize_text_with("you are an ai agent powered by deepseek harness.", true);
+        assert_eq!(cleaned, "You are a helpful AI assistant.");
+    }
+
+    /// 身份改写**只对 system / developer 生效**：user / tool 是用户数据，
+    /// 改写会让模型看到与磁盘不一致的内容（参考实现 #537 因此收窄）。
+    #[test]
+    fn identity_rewrite_is_limited_to_system_roles() {
+        let source = "You are an AI agent powered by DeepSeek Harness.";
+        assert_eq!(
+            sanitize_for_role(source, "system"),
+            "You are a helpful AI assistant."
+        );
+        assert_eq!(
+            sanitize_for_role(source, "developer"),
+            "You are a helpful AI assistant."
+        );
+        // user 内容原样保留。
+        assert_eq!(sanitize_for_role(source, "user"), source);
+        assert_eq!(sanitize_for_role(source, "tool"), source);
+    }
+
+    /// OmO 框架指纹：必须**改句式结构**才算解除匹配（只删词不行）。
+    #[test]
+    fn omo_junior_fingerprint_loses_its_structure() {
+        let cleaned = sanitize_text("agent=Sisyphus-Junior - Focused executor; mode=hard");
+        assert!(!cleaned.contains("Sisyphus-Junior - Focused executor"), "{cleaned}");
+        assert!(cleaned.contains("focused executor"), "语义要保留：{cleaned}");
+
+        // 大小写变体同样命中。
+        let lower = sanitize_text("x sisyphus-junior – focused executor y");
+        assert!(!lower.contains("Sisyphus-Junior - Focused executor"));
+    }
+
+    /// 请求必须**以 system 开头**：缺了就补一条中性提示词。
+    /// 这是"没有 system 消息"这个渠道特征的解法。
+    #[test]
+    fn body_always_starts_with_a_system_message() {
+        let mut request = request_with(&[("user", "你好")]);
+        request.system.clear();
+        let body = build_chat_body("glm-5.3", &request);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(body["messages"][1]["content"], "你好");
+    }
+
+    /// 整段 system 都是指纹、清洗后变空时，也要补回中性提示词（不能发空 system）。
+    #[test]
+    fn empty_system_after_sanitizing_falls_back_to_the_neutral_prompt() {
+        let mut request = request_with(&[("user", "hi")]);
+        request.system = vec![Block::text("x-anthropic-billing-hdr")];
+        let body = build_chat_body("glm-5.3", &request);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], DEFAULT_SYSTEM_PROMPT);
+        // 不能同时留两条 system。
+        let systems = body["messages"]
+            .as_array()
+            .expect("数组")
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .count();
+        assert_eq!(systems, 1, "只能有一条 system");
     }
 
     #[test]
@@ -841,8 +1122,11 @@ mod probe {
 
     use crate::agent::secrets::OsCredentialStore;
     use crate::gateway::channels::{workbuddy::identity, AccountSnapshot};
+    use crate::gateway::protocol::cir::{Block, CanonicalRequest, Message, Role};
     use crate::gateway::storage::Storage;
     use crate::gateway::transport::{self, UpstreamRequest};
+
+    use super::build_chat_body;
 
     /// **决定性 A/B**：读 dump 目录里 Claude Code 的真实出站报文（带全部私有键），
     /// 用真实凭据直打上游，逐键删减 —— 哪个键删掉后从"被拦"变"放行"，哪个就是元凶。
@@ -897,6 +1181,7 @@ mod probe {
             access_token: Some(credential.access_token.clone()),
             refresh_token: credential.refresh_token.clone(),
             enterprise_id: credential.enterprise_id.clone(),
+            ..Default::default()
         };
         let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
         let client = reqwest::Client::new();
@@ -1149,6 +1434,7 @@ mod probe {
             access_token: Some(credential.access_token.clone()),
             refresh_token: credential.refresh_token.clone(),
             enterprise_id: credential.enterprise_id.clone(),
+            ..Default::default()
         };
         let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
         let client = reqwest::Client::new();
@@ -1236,6 +1522,7 @@ mod probe {
             access_token: Some(credential.access_token.clone()),
             refresh_token: credential.refresh_token.clone(),
             enterprise_id: credential.enterprise_id.clone(),
+            ..Default::default()
         };
         let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
         let client = reqwest::Client::new();
@@ -1270,6 +1557,118 @@ Default branch (you will usually use this for PRs): main";
             println!("  第 {} 次：{}", index + 1, if blocked { "被拦 11128" } else { "放行" });
         }
         println!("=== 汇总：快发被拦 {burst_blocked}/{rounds}，慢发被拦 {slow_blocked}/{rounds} ===");
+    }
+
+    /// 真实上游回归闸门：走**完整出站管线**（报文卫生 + 会话身份头），
+    /// 确认一次真实对话能拿到模型回复，而不是 `11-128`。
+    ///
+    /// 与 `probe_fingerprint_ab` 的分工：那个逐段 A/B 找特征串；
+    /// 这个验证"修完整条链路能对话"，改动后跑它当闸门。
+    ///
+    /// ```text
+    /// cargo test --lib probe_real_chat_passes -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn probe_real_chat_passes() {
+        use crate::agent::secrets::OsCredentialStore;
+        use crate::gateway::storage::Storage;
+
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let storage = Storage::open(&dir, &OsCredentialStore).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "wb-cn")
+            .expect("没有 wb-cn 账号");
+        let credential = record.credential.clone().expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+            ..Default::default()
+        };
+
+        // 用**真实管线**构建请求：清洗 + 会话身份头都在里面。
+        let request = CanonicalRequest {
+            model: "glm-5.3".into(),
+            system: vec![Block::text("你是一个乐于助人的助手。")],
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Block::text("用一句话回答：1+1 等于几？")],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            stream: true,
+            reasoning: None,
+            metadata: Default::default(),
+            raw: json!({}),
+        };
+        let body = build_chat_body(&request.model, &request);
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let headers = identity::with_conversation_identity(
+            identity::chat_headers(
+                &account.channel_id,
+                identity::Realm::Cn,
+                identity::Outbound::Desktop,
+                &hosts,
+                &account,
+                1,
+            ),
+            &account.channel_id,
+            &account.uid,
+            request.metadata.session_key().as_deref(),
+        );
+        println!("=== 出站头 ===");
+        for (name, _) in headers.iter().filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            lower.starts_with("x-conversation")
+                || lower == "x-request-id"
+                || lower == "x-agent-type"
+                || lower == "x-private-data"
+                || lower == "x-product"
+                || lower == "x-agent-intent"
+        }) {
+            println!("  {name}");
+        }
+
+        let upstream = UpstreamRequest {
+            url: hosts.chat_url("/v2/chat/completions"),
+            headers,
+            body,
+        };
+        match transport::send(&upstream, &reqwest::Client::new()).await {
+            Ok(response) => {
+                let text = response.text().await.unwrap_or_default();
+                let blocked = text.contains("11-128") || text.contains("unapproved");
+                if blocked {
+                    println!("=== 结果：仍被拦（11-128）===\n{}", text.chars().take(400).collect::<String>());
+                    panic!("仍然被渠道校验拦截");
+                }
+                println!("=== 结果：放行 ===\n{}", text.chars().take(600).collect::<String>());
+            }
+            Err(failure) => {
+                println!(
+                    "=== 结果：HTTP {} ===\n{}",
+                    failure.status,
+                    failure.body.chars().take(400).collect::<String>()
+                );
+                panic!("上游拒绝：status={}", failure.status);
+            }
+        }
     }
 
     /// 发一次最小请求，返回响应正文（2xx）或错误正文。

@@ -1,0 +1,1 @@
+{"model": "glm-5.3-flash", "input": "列出 D:\\code\\dynamic-island 目录下的条目（用 files 工具，depth 1）", "stream": true, "tools": [{"type": "function", "name": "files__list", "description": "列出目录", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}}, "required": ["path"]}}]}

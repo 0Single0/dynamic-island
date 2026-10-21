@@ -1,0 +1,272 @@
+//! 自定义供应商渠道：把任意 OpenAI / Anthropic 兼容端点接进号池。
+//!
+//! 与 workbuddy 这种「协议 + 私有错误码」的渠道不同，这里没有上游特有的身份伪装、
+//! WAF 清洗或计费逻辑 —— 它只做三件事：
+//! ① 按配置把 CIR 请求编成上游报文（OpenAI Chat Completions 或 Anthropic Messages）；
+//! ② 把上游 SSE 帧翻回 CIR 事件；
+//! ③ 把模型清单报给矩阵（模型与元数据由用户在面板里填，或由「获取模型」拉取）。
+//!
+//! 为什么要有它：号池不该只认识内置渠道。中转站、自建反代、本地推理服务
+//! （Ollama / LM Studio / vLLM）都讲 OpenAI 兼容协议，接进来即可被调度、
+//! 被限流、被用量统计，和内置渠道享受同一套核心能力，核心一行不用改。
+//!
+//! **刻意不做指纹清洗**：`workbuddy::hygiene::sanitize_text` 是为绕过某个特定上游的
+//! WAF 而写的（它会把 "Claude Code" 之类的串改写成等价写法）。对通用供应商套用
+//! 会改写用户正文 —— 一个正当的供应商不该收到被篡改的内容。
+//!
+//! 分文件按职责：`catalog`（模型清单 + 通用「获取模型」）、`encode`（CIR → 上游报文）、
+//! `decode`（上游 SSE → CIR）。
+
+mod catalog;
+mod decode;
+mod encode;
+
+// 命令层只要 `fetch_models`；候选地址推导与清单解析是它的内部细节（但有单测覆盖）。
+pub use catalog::fetch_models;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use async_trait::async_trait;
+use serde_json::Value;
+
+use crate::gateway::{
+    channels::{openai_compat, AccountSnapshot, ChannelAdapter, Credential, UpstreamModel},
+    errors::GatewayError,
+    protocol::cir::{CanonicalEvent, CanonicalRequest},
+    transport::UpstreamRequest,
+};
+
+use catalog::configured_models;
+use decode::{parse_anthropic_event, parse_responses_event};
+use encode::{build_anthropic_body, build_openai_body, build_responses_body};
+
+/// 供其它「协议本来就是 OpenAI 形状」的渠道复用（CodeArts）。
+pub(crate) use encode::build_openai_body as build_openai_chat_body;
+
+#[cfg(test)]
+mod tests;
+
+/// Anthropic 只认这个版本号；缺了直接 400。
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// 鉴权头：按协议选 Bearer 还是 x-api-key。**两类请求共用的唯一实现**。
+///
+/// Anthropic 只用 `x-api-key`（发 `Authorization: Bearer` 会 401）；
+/// OpenAI 兼容面两个都发 —— 中转站有的只认其中一种，同时带上对两者都无害。
+pub(super) fn protocol_auth_headers(
+    protocol: UpstreamProtocol,
+    account: &AccountSnapshot,
+) -> Vec<(String, String)> {
+    let key = account.access_token.clone().unwrap_or_default();
+    if key.is_empty() {
+        return Vec::new();
+    }
+    match protocol {
+        UpstreamProtocol::Anthropic => vec![
+            ("x-api-key".into(), key),
+            ("anthropic-version".into(), ANTHROPIC_VERSION.into()),
+        ],
+        // Bearer + x-api-key 都发：中转站有的只认其中一种，同时带上对两者都无害。
+        UpstreamProtocol::OpenAi | UpstreamProtocol::Responses => vec![
+            ("Authorization".into(), format!("Bearer {key}")),
+            ("x-api-key".into(), key),
+        ],
+    }
+}
+
+/// 拼接地址，容忍任一侧的斜杠。
+pub(crate) fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// 上游协议。决定报文形状、SSE 形状与鉴权头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamProtocol {
+    /// OpenAI Chat Completions（`/chat/completions`）。绝大多数中转站与本地服务。
+    OpenAi,
+    /// OpenAI Responses（`/responses`）。新版 OpenAI 与兼容它的中转。
+    Responses,
+    /// Anthropic Messages（`/messages`）。Claude 官方与兼容反代。
+    Anthropic,
+}
+
+impl UpstreamProtocol {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "anthropic" | "anthropic-messages" | "messages" | "claude" => Self::Anthropic,
+            "responses" | "openai-responses" => Self::Responses,
+            _ => Self::OpenAi,
+        }
+    }
+}
+
+pub struct CustomChannel {
+    id: String,
+    /// 用户填的地址，可能已带版本段（`.../v1`）或已是完整端点。
+    base_url: String,
+    protocol: UpstreamProtocol,
+    /// 配置里的模型清单：矩阵的候选就来自它，**它就是事实来源**。
+    ///
+    /// 刻意不在 `list_models` 里回上游重拉：用户在面板里勾选过要发布哪些模型，
+    /// 重拉会把取消勾选的模型又带回来。
+    models: Vec<UpstreamModel>,
+    /// 是否需要密钥。本地服务（Ollama 等）可以没有。
+    require_api_key: bool,
+    /// 单调序号：给 X-Request-ID 用，避免同账号高并发下撞 ID。
+    sequence: AtomicU64,
+}
+
+impl CustomChannel {
+    pub fn from_options(id: &str, options: &Value) -> Self {
+        let base_url = options
+            .get("base_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        Self {
+            id: id.to_string(),
+            base_url,
+            protocol: UpstreamProtocol::parse(
+                options
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .unwrap_or("openai-chat"),
+            ),
+            models: configured_models(options),
+            require_api_key: options
+                .get("require_api_key")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            sequence: AtomicU64::new(0),
+        }
+    }
+
+    /// 对话端点。地址已是完整端点时不再拼接。
+    fn chat_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        // 用户粘的就是完整端点：不管配置里选了哪个协议，都别再拼一次
+        // （否则 "/v1/responses" 会被拼成 "/v1/responses/chat/completions"）。
+        if base.ends_with("/chat/completions")
+            || base.ends_with("/responses")
+            || base.ends_with("/messages")
+        {
+            return base.to_string();
+        }
+        match self.protocol {
+            UpstreamProtocol::OpenAi => join_url(base, "chat/completions"),
+            UpstreamProtocol::Responses => join_url(base, "responses"),
+            UpstreamProtocol::Anthropic => join_url(base, "messages"),
+        }
+    }
+
+    fn auth_headers(&self, account: &AccountSnapshot) -> Vec<(String, String)> {
+        let mut headers = vec![("Content-Type".into(), "application/json".into())];
+        headers.extend(protocol_auth_headers(self.protocol, account));
+        headers
+    }
+
+    fn model_meta(&self, id: &str) -> Option<&UpstreamModel> {
+        self.models.iter().find(|model| model.id == id)
+    }
+}
+
+#[async_trait]
+impl ChannelAdapter for CustomChannel {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn adapter_kind(&self) -> &str {
+        "custom"
+    }
+
+    /// 密钥是用户填的静态值，没有刷新流程 —— 保鲜链路据此跳过刷新。
+    fn static_credential(&self) -> bool {
+        true
+    }
+
+    fn requires_credential(&self) -> bool {
+        self.require_api_key
+    }
+
+    fn build_chat_request(
+        &self,
+        account: &AccountSnapshot,
+        request: &CanonicalRequest,
+    ) -> Result<UpstreamRequest, GatewayError> {
+        if self.base_url.is_empty() {
+            return Err(GatewayError::internal(format!(
+                "自定义供应商 {} 没有配置地址",
+                self.id
+            )));
+        }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let mut headers = self.auth_headers(account);
+        headers.push((
+            "X-Request-ID".into(),
+            crate::gateway::security::request_id(&self.id, &account.uid, sequence),
+        ));
+
+        let body = match self.protocol {
+            UpstreamProtocol::OpenAi => build_openai_body(request),
+            UpstreamProtocol::Responses => build_responses_body(request),
+            UpstreamProtocol::Anthropic => {
+                let max_output = self.model_meta(&request.model).and_then(|m| m.max_output_tokens);
+                build_anthropic_body(request, max_output)
+            }
+        };
+        Ok(UpstreamRequest {
+            url: self.chat_url(),
+            headers,
+            body,
+        })
+    }
+
+    fn parse_event(&self, frame: &str) -> Vec<CanonicalEvent> {
+        match self.protocol {
+            UpstreamProtocol::OpenAi => openai_compat::parse_openai_chunk(frame),
+            UpstreamProtocol::Responses => parse_responses_event(frame),
+            UpstreamProtocol::Anthropic => parse_anthropic_event(frame),
+        }
+    }
+
+    fn classify_error(&self, status: u16, body: &str, _upstream_model: &str) -> GatewayError {
+        // 状态码语义是跨协议共通的（401 凭据 / 402 额度 / 429 限流 / 5xx 上游异常），
+        // 这一份映射对两类供应商都成立。
+        openai_compat::classify_openai_error(status, body)
+    }
+
+    /// 目录就是配置里的清单：自定义供应商没有标准元数据端点可拉。
+    async fn list_models(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<Option<Vec<UpstreamModel>>, GatewayError> {
+        Ok(Some(self.models.clone()))
+    }
+
+    /// 静态密钥没有刷新概念；返回 None 让上层保持原凭据。
+    async fn refresh(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<Option<Credential>, GatewayError> {
+        Ok(None)
+    }
+
+    /// 自定义供应商不提供登录流：密钥由用户在面板里填。
+    /// （`login_start` 的默认实现已经返回可读的 unsupported，这里不再覆盖。）
+    async fn sign_in(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+}

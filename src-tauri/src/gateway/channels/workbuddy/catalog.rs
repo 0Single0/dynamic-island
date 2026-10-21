@@ -152,6 +152,9 @@ pub fn snapshot_cn() -> Vec<UpstreamModel> {
                     vision: flag(&item, "supportsImages"),
                     tool_calls: flag(&item, "supportsToolCall"),
                     reasoning: flag(&item, "supportsReasoning"),
+                    // 快照条目：三个位都来自我们自己的对照表，算"已声明"。
+                    declared_tools: true,
+                    declared_vision: true,
                 },
                 context_windows: listed_u64(&item, "contextWindow", "supportedLengths"),
                 reasoning_efforts: listed_str(&item, "supportedEfforts"),
@@ -165,6 +168,7 @@ pub fn snapshot_cn() -> Vec<UpstreamModel> {
                 temperature: item.get("temperature").and_then(serde_json::Value::as_f64),
                 top_p: item.get("top_p").and_then(serde_json::Value::as_f64),
                 from_snapshot: true,
+                user_declared: false,
             })
         })
         .collect()
@@ -375,10 +379,16 @@ fn overlay(entry: &mut UpstreamModel, meta: Option<&Value>) {
         entry.max_output_tokens = Some(output);
     }
     let flag = |key: &str| meta.get(key).and_then(Value::as_bool);
+    // 只有实时元数据里**真的带了**该键，才把对应的"已声明"置真；
+    // 缺失时保留快照的判断（快照本身是已声明的）。
+    let declared_vision = flag("supportsImages").is_some() || entry.capabilities.declared_vision;
+    let declared_tools = flag("supportsToolCall").is_some() || entry.capabilities.declared_tools;
     entry.capabilities = ModelCapabilities {
         vision: flag("supportsImages").unwrap_or(entry.capabilities.vision),
         tool_calls: flag("supportsToolCall").unwrap_or(entry.capabilities.tool_calls),
         reasoning: flag("supportsReasoning").unwrap_or(entry.capabilities.reasoning),
+        declared_tools,
+        declared_vision,
     };
 }
 

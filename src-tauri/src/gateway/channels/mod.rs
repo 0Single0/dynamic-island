@@ -4,8 +4,11 @@
 //! 它只负责「怎么登录 / 怎么刷新 / 怎么发一次请求 / 怎么读回事件 / 这个错误是什么意思」。
 //! 新增渠道只改本模块 + 配置。
 
+pub mod codearts;
+pub mod custom;
 pub mod fake;
 pub mod openai_compat;
+pub mod trae;
 pub mod workbuddy;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -28,11 +31,23 @@ pub struct AccountSnapshot {
     /// 刷新凭据要用；上游每次刷新都会轮换它。
     pub refresh_token: Option<String>,
     pub enterprise_id: Option<String>,
+    /// 华为云这类「每请求签名」渠道需要的 AK/SK（随 token 一起轮换）。
+    pub access_key_id: Option<String>,
+    pub secret_key: Option<String>,
+    /// OAuth 刷新时回传的 PKCE verifier。
+    pub code_verifier: Option<String>,
 }
 
 /// 落库的凭据。刷新会轮换 refresh_token，所以整块一起换。
 ///
 /// 需要序列化：它以 JSON 形式装进加密信封再进 SQLite。
+///
+/// `access_token` 的语义按渠道而定：
+/// · Trae / WorkBuddy —— 上游 JWT（`Authorization: Cloud-IDE-JWT …`）；
+/// · CodeArts —— **STS security token**（`x-auth-token`）。
+///
+/// `secret_key` / `access_key_id` 是为华为云这类「AK/SK + HMAC 签名」的渠道准备的：
+/// 它们的每个请求都要用临时密钥签名，光有 token 打不动上游。
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Credential {
     pub access_token: String,
@@ -42,9 +57,32 @@ pub struct Credential {
     pub nickname: Option<String>,
     pub enterprise_id: Option<String>,
     pub domain: Option<String>,
+    /// 华为云临时 Access Key（随 STS token 一起轮换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// 华为云临时 Secret Key。**只在签名时用，绝不外传**。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<String>,
+    /// OAuth 刷新时要回传的 PKCE verifier（CodeArts 需要它才换得到新 token）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_verifier: Option<String>,
 }
 
 impl Credential {
+    /// 这份凭据**能不能拿去发请求**。
+    ///
+    /// 不能只看 `access_token`：不同渠道的凭据形态不同 ——
+    /// · Trae / WorkBuddy：一个 JWT 就够了；
+    /// · CodeArts：长期 AK/SK（`credentials.csv`）**没有 token**，靠 AK/SK 签名；
+    /// · 自定义供应商：一把静态 API Key（也存在 `access_token` 里）。
+    ///
+    /// 早先各处都写 `access_token.is_empty()` 判断，结果 CodeArts 一导入就被判成
+    /// "没有凭据 / 需要先登录" —— 明明凭据是好的。
+    pub fn is_present(&self) -> bool {
+        !self.access_token.is_empty()
+            || !self.access_key_id.as_deref().unwrap_or_default().is_empty()
+    }
+
     /// 剩余寿命不足 `margin_ms` 就要刷新（选号时的安全边距）。
     pub fn is_expiring(&self, now_ms: u64, margin_ms: u64) -> bool {
         match self.expires_at_ms {
@@ -78,6 +116,15 @@ pub struct UpstreamModel {
     /// 这条来自内置快照（而非实时目录）：能力字段与"现在是免费的"都可能过期，
     /// 所以矩阵会把它标成 Builtin 来源，并且不拿它的能力去做硬性过滤。
     pub from_snapshot: bool,
+    /// 这条是**用户显式声明**的（自定义供应商的模型清单），不是某个渠道家族的目录。
+    ///
+    /// 两处必须区别对待，否则自定义供应商会坏掉：
+    /// ① 命名清洗（`is_chat_model` 剔掉 `auto`/`lite` 等）是 workbuddy 家族的约定，
+    ///    而用户填的模型名就是他要用的名字 —— 一个叫 `auto` 的模型不能静默消失；
+    /// ② 能力字段是**参考信息**而不是硬性过滤器：用户只填了模型 ID 时，
+    ///    三个能力位都是 false，若据此判定"不支持工具/图片"就会把正常请求拦在本地，
+    ///    这与「未知就乐观放行、让上游报错」的既定策略相反。
+    pub user_declared: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -85,6 +132,20 @@ pub struct ModelCapabilities {
     pub vision: bool,
     pub tool_calls: bool,
     pub reasoning: bool,
+    /// 目录里**明确声明过**工具能力吗？
+    ///
+    /// `tool_calls = false` 有两种截然不同的含义：
+    /// · 上游明确说"这个模型不支持工具" → 应当过滤；
+    /// · 上游根本没提这个字段 → **不能**当成不支持（乐观放行，让上游自己报错）。
+    ///
+    /// 只看 bool 无法区分二者，于是出现了"Trae 明明能调工具，却被判成
+    /// 不支持工具调用、整个候选被剔掉"的故障（`caps_known` 由 vision/reasoning
+    /// 为真推导出来，掩盖了"工具位其实没声明"这件事）。
+    #[serde(default)]
+    pub declared_tools: bool,
+    /// 目录里**明确声明过**图片能力吗？理由同 [`Self::declared_tools`]。
+    #[serde(default)]
+    pub declared_vision: bool,
 }
 
 /// 渠道无关的"运营任务"视图：面板的「任务」表格按它渲染。
@@ -194,6 +255,14 @@ pub trait ChannelAdapter: Send + Sync {
         true
     }
 
+    /// 凭据是否是**用户填的静态值**（自定义供应商的 API Key），而不是会过期的令牌。
+    ///
+    /// 为 true 时保鲜链路不再尝试刷新：静态 Key 没有刷新端点，刷新必然失败，
+    /// 而"刷新失败"会让调度器把这个账号当作不可用 —— 等于永远用不了。
+    fn static_credential(&self) -> bool {
+        false
+    }
+
     /// 构建上游报文。纯函数，不碰网络 —— 它是渠道层最值得单测的部分。
     fn build_chat_request(
         &self,
@@ -270,6 +339,34 @@ pub trait ChannelAdapter: Send + Sync {
         Err(GatewayError::unsupported("该渠道不支持登录流程"))
     }
 
+    /// 该渠道的登录是否需要「用户把回调地址粘回来」。
+    ///
+    /// Trae 这类渠道的授权回调被上游强制为 `http://127.0.0.1:<authorize` 的回环地址，
+    /// 而网关没有常驻的本地监听端口 —— 只能由用户复制地址栏内容交回来。
+    /// 面板据此把「添加账号」弹窗切到粘贴框，而不是干等一个永远不会来的轮询结果。
+    fn login_needs_callback(&self) -> bool {
+        false
+    }
+
+    /// 该渠道**有没有真正的授权页**。
+    ///
+    /// 与 `login_needs_callback` 正交：Trae 是「有授权页 + 要粘回调」，
+    /// 而 CodeArts 是「压根没有授权页」—— 它要求粘贴一份凭据 JSON / AK-SK。
+    /// 没有授权页时，`login_start` 返回的 `auth_url` 只是一行**填写说明**，
+    /// 面板绝不能拿它去 `openUrl`（那会打开一个不存在的地址 / 静默失败）。
+    fn login_has_auth_page(&self) -> bool {
+        true
+    }
+
+    /// 用用户粘贴的回调地址完成登录，返回可落库的凭据。
+    async fn login_complete(
+        &self,
+        _client: &reqwest::Client,
+        _callback: &str,
+    ) -> Result<Credential, GatewayError> {
+        Err(GatewayError::unsupported("该渠道不需要粘贴回调地址"))
+    }
+
     /// 运营任务清单（面板「任务」表格）。`Ok(None)` = 该渠道没有任务体系。
     async fn list_tasks(
         &self,
@@ -339,6 +436,20 @@ pub trait ChannelAdapter: Send + Sync {
         Err(GatewayError::unsupported("该渠道不支持每日动作"))
     }
 
+    /// 诊断：用该账号的真实凭据打一次上游，**原样返回响应**。
+    ///
+    /// 用于"面板显示缺字段"这类问题：只看到 `—`/`?` 时无法判断是上游
+    /// 没给、字段名不同，还是接口直接失败。`target` 的含义由渠道自己定义
+    /// （Trae 是 models / detail / credits）。
+    async fn diagnose(
+        &self,
+        _client: &reqwest::Client,
+        _account: &AccountSnapshot,
+        _target: &str,
+    ) -> Result<serde_json::Value, GatewayError> {
+        Err(GatewayError::unsupported("该渠道没有诊断接口"))
+    }
+
     /// 运营类动作：每日签到（国内版积分）。返回是否算成功（含幂等）。
     ///
     /// 保留这个薄封装：登录流程里会签一次（新号马上拿分）。
@@ -399,6 +510,21 @@ pub fn build_registry(
         let adapter: Arc<dyn ChannelAdapter> = match channel.adapter.as_str() {
             "fake" => Arc::new(fake::FakeChannel::from_options(&channel.id, &channel.options)),
             "workbuddy" => Arc::new(workbuddy::WorkbuddyChannel::from_options(
+                &channel.id,
+                &channel.options,
+            )),
+            // 用户自定义的 OpenAI / Anthropic 兼容供应商（地址、密钥、模型都在 options 里）。
+            "custom" => Arc::new(custom::CustomChannel::from_options(
+                &channel.id,
+                &channel.options,
+            )),
+            // Trae CN / SOLO CN：两段式会话协议，见 `trae::mod` 的模块说明。
+            "trae" => Arc::new(trae::TraeChannel::from_options(
+                &channel.id,
+                &channel.options,
+            )),
+            // 华为云 CodeArts：STS token + AK/SK 签名，见 `codearts::mod`。
+            "codearts" => Arc::new(codearts::CodeArtsChannel::from_options(
                 &channel.id,
                 &channel.options,
             )),

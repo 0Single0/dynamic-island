@@ -17,6 +17,21 @@ export interface GatewayChannel {
   options: unknown;
   accounts: number;
   ready: number;
+  /**
+   * 该渠道的登录是否需要「用户把回调地址粘回来」。
+   *
+   * 后端按适配器给（Trae 为 true）：授权回调被上游强制成回环地址，
+   * 网关没有那个监听端口。弹窗据此切到粘贴框，而不是轮询一个永远
+   * 不会到达的结果。
+   */
+  login_needs_callback: boolean;
+  /**
+   * 该渠道有没有**真正的授权页**。
+   *
+   * `false` 表示它要求粘贴凭据（CodeArts 这类），此时 `auth_url` 只是一行
+   * 填写说明 —— 面板不能拿它去 `openUrl`，那会打开一个不存在的地址。
+   */
+  login_has_auth_page: boolean;
 }
 
 /**
@@ -48,9 +63,17 @@ export interface GatewayAccount {
   model_limits: Array<{ model: string; until_ms: number }>;
   inflight: number;
   max_inflight: number;
+  /** 生效值（已按"覆盖 → 渠道 → 默认"解开）。 */
   priority: number;
   weight: number;
+  /** 账号级覆盖值：`null` = 跟随渠道。编辑弹窗据此决定输入框留空还是填数。 */
+  priority_override: number | null;
+  weight_override: number | null;
   proxy_slot: string | null;
+  /** 这个账号只服务哪些对外模型名。空 = 不限。 */
+  model_allow: string[];
+  /** 账号级模型改名：`对外名 -> 该账号的上游名`。 */
+  model_rename: Record<string, string>;
   quota: GatewayQuota | null;
 }
 
@@ -107,7 +130,11 @@ export interface GatewayRouteEntry {
   temperature: number | null;
   top_p: number | null;
   caps_known: boolean;
-  source: string;
+  /**
+   * 这条路由的元数据来源：`live`（实时目录）/ `builtin`（拉取失败回落的快照）/
+   * `override`（人工覆盖）。面板据此区分"上游没给"与"这次没拉到"。
+   */
+  source: "live" | "builtin" | "override";
   context: number | null;
   max_output: number | null;
 }
@@ -203,10 +230,83 @@ export function updateChannel(patch: {
   return invoke<{ ok: boolean }>("gateway_update_channel", patch);
 }
 
+/** 「获取模型」拉回的一条（各家方言已归一成这几个字段）。 */
+export interface GatewayFetchedModel {
+  id: string;
+  context_length: number | null;
+  max_output_tokens: number | null;
+  capabilities: { vision: boolean; tool_calls: boolean; reasoning: boolean };
+}
+
+/**
+ * 拉取某个自定义供应商的模型清单（通用实现：候选地址 + 协议鉴权 + 多方言解析）。
+ *
+ * 只读、不落库 —— 面板拿到后让用户勾选，再随供应商一起保存。
+ */
+export function fetchModels(input: {
+  baseUrl: string;
+  apiKey?: string;
+  modelsUrl?: string;
+  protocol?: string;
+}) {
+  return invoke<{ count: number; models: GatewayFetchedModel[] }>("gateway_fetch_models", input);
+}
+
+/** 随供应商一起落库的一条模型（矩阵/面板要的元数据）。 */
+export interface CustomProviderModel {
+  id: string;
+  context_length?: number | null;
+  max_output_tokens?: number | null;
+  capabilities?: { vision?: boolean; tool_calls?: boolean; reasoning?: boolean };
+  reasoning_efforts?: string[];
+  reasoning_default_effort?: string | null;
+  always_reasoning?: boolean;
+}
+
+/**
+ * 保存一个自定义供应商：渠道配置 + 密钥账号一次写入。
+ *
+ * 不传 `channelId` 是新建（渠道 id 由后端按名称派生）；传了就是更新。
+ * `apiKey` 留空表示不改动已保存的密钥。
+ */
+export function saveCustomProvider(input: {
+  channelId?: string;
+  displayName: string;
+  baseUrl: string;
+  apiKey?: string;
+  protocol?: string;
+  modelsUrl?: string;
+  models: CustomProviderModel[];
+  requireApiKey?: boolean;
+  priority?: number;
+}) {
+  return invoke<{ channel_id: string; routes: number; accounts: number }>(
+    "gateway_save_custom_provider",
+    input,
+  );
+}
+
+/** 删除渠道（连同它的账号）。 */
+export function deleteChannel(channelId: string) {
+  return invoke<{ removed_accounts: number }>("gateway_delete_channel", { channelId });
+}
+
 export function listAccounts() {
   return invoke<GatewayAccount[]>("gateway_list_accounts");
 }
 
+/**
+ * 读取用户选中的凭据文件（.csv / .json / .txt）。
+ *
+ * Tauri 的原生文件对话框只给路径，磁盘读取归后端；后端顺带处理 BOM
+ * （华为云控制台导出的 CSV 是 UTF-8 with BOM）。
+ */
+export function readCredentialFile(path: string) {
+  return invoke<{ text: string; encoding: string; name: string }>(
+    "gateway_read_credential_file",
+    { path },
+  );
+}
 export function loginStart(channelId: string) {
   return invoke<GatewayLoginTicket>("gateway_login_start", { channelId });
 }
@@ -215,8 +315,78 @@ export function loginPoll(channelId: string, loginState: string) {
   return invoke<GatewayLoginResult>("gateway_login_poll", { channelId, loginState });
 }
 
+/**
+ * 完成一次「需要粘贴回调地址」的登录（Trae 这类渠道）。
+ *
+ * 为什么单独一个命令：Trae 强制授权回调为 `http://127.0.0.1:<port>/authorize`，
+ * 网关没有那个本地监听端口，所以用户必须把授权完成后地址栏里的完整 URL 交回来。
+ * 弹窗据 `loginNeedsCallback` 决定走这条路径还是轮询。
+ */
+export function loginComplete(channelId: string, callback: string) {
+  return invoke<GatewayLoginResult>("gateway_login_complete", { channelId, callback });
+}
+
 export function setAccountEnabled(channelId: string, uid: string, enabled: boolean) {
   return invoke<{ ok: boolean }>("gateway_set_account_enabled", { channelId, uid, enabled });
+}
+
+/**
+ * 改账号画像：昵称 / 优先级 / 权重。
+ *
+ * 三个字段都是**可选覆盖**（与后端语义一致）：
+ * · `nickname` 省略 = 不动；空串 = 清空（面板回落到 uid 前 8 位）；
+ * · `priority / weight` 省略或 null = 清掉覆盖、回落渠道值，只有数字才是覆盖。
+ *
+ * 凭据、并发上限、额度、冷却一概不动 —— 编辑账号不该有"顺手把登录态弄丢"的副作用。
+ */
+export function setAccountProfile(
+  channelId: string,
+  uid: string,
+  patch: {
+    nickname?: string;
+    priority?: number | null;
+    weight?: number | null;
+    maxInflight?: number | null;
+  },
+) {
+  return invoke<{
+    ok: boolean;
+    nickname: string;
+    priority: number;
+    weight: number;
+    max_inflight: number;
+  }>("gateway_set_account_profile", {
+    channelId,
+    uid,
+    nickname: patch.nickname,
+    priority: patch.priority ?? null,
+    weight: patch.weight ?? null,
+    maxInflight: patch.maxInflight ?? null,
+  });
+}
+
+/**
+ * 改账号的模型清单：白名单（空 = 不限）+ 账号级模型改名。
+ *
+ * `rename` 是 `对外名 -> 该账号的上游名`：Trae 把 `deepseek-v4.1-flash` 叫
+ * `DeepSeek-V4-Flash-Official`，配一条映射就能让客户端继续用统一的名字，
+ * 出站时自动换成该账号的上游名。
+ */
+export function setAccountModels(
+  channelId: string,
+  uid: string,
+  allow: string[],
+  rename: Record<string, string>,
+) {
+  return invoke<{
+    ok: boolean;
+    allow: string[];
+    rename: Record<string, string>;
+    /** 后端为"本渠道目录里没有这个对外名"自动补的路由覆盖。 */
+    routes_added: string[];
+    /** 因上游名不在渠道目录里而被跳过的条目（带原因）。 */
+    skipped: string[];
+  }>("gateway_set_account_models", { channelId, uid, allow, rename });
 }
 
 export function deleteAccount(channelId: string, uid: string) {
@@ -227,9 +397,17 @@ export function refreshAccount(channelId: string, uid: string) {
   return invoke<{ expires_at_ms: number | null }>("gateway_refresh_account", { channelId, uid });
 }
 
-/** 刷新额度（渠道无关；渠道不支持时返回 null）。 */
+/**
+ * 刷新额度（渠道无关）。
+ *
+ * `supported = false` 表示该渠道**没有额度概念**（CodeArts 按 token 计量、
+ * 只在华为云控制台看），不是"查询失败"—— 面板据此给出不同的提示文案。
+ */
 export function fetchQuota(channelId: string, uid: string) {
-  return invoke<GatewayQuota | null>("gateway_fetch_quota", { channelId, uid });
+  return invoke<{ supported: boolean; quota: GatewayQuota | null }>(
+    "gateway_fetch_quota",
+    { channelId, uid },
+  );
 }
 
 /** 重置账号运行态：清冷却 / 熔断 / 失败计数 / 模型级限流（不动凭据与额度）。 */

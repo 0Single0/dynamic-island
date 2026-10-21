@@ -87,7 +87,7 @@ export default function SettingsPage() {
       </div>
 
       <div className="flex min-h-0 flex-1">
-        <aside className="flex w-52 shrink-0 flex-col overflow-y-auto border-r border-white/8 bg-black/20 p-2.5">
+        <aside className="dark-scroll flex w-52 shrink-0 flex-col overflow-y-auto border-r border-white/8 bg-black/20 p-2.5">
           <nav className="space-y-0.5">
             {sections.map((section) => {
               const Icon = section.icon;
@@ -110,7 +110,7 @@ export default function SettingsPage() {
           {active === "ai-models" ? (
             <ModelSettings />
           ) : (
-            <div className="mx-auto min-h-0 w-full max-w-4xl flex-1 overflow-y-auto">
+            <div className="dark-scroll mx-auto min-h-0 w-full max-w-4xl flex-1 overflow-y-auto">
               <header className="mb-6">
                 <div className="text-[11px] uppercase tracking-[0.18em] text-zinc-600">Settings</div>
                 <h1 className="mt-1 text-xl font-semibold">{activeSection.label}</h1>

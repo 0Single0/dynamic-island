@@ -111,11 +111,17 @@ async fn bind_with_fallback(port: u16, allow_lan: bool) -> Result<tokio::net::Tc
     Err(last_error.unwrap_or_else(|| std::io::Error::other("没有可用端口")))
 }
 
-/// 记录"还没进调度就被拒"的请求。
+/// 记录**没能产出响应**的请求（含"未进入调度"与"调度中途失败"两类）。
 ///
-/// 这类失败（模型名不对、协议字段不支持、鉴权不通过、并发满）以前不留任何痕迹，
-/// 客户端只表现为反复重连，排查时无从下手。现在复用用量表记一行：
-/// 面板的「请求日志」会带红色 `?`，点开就是原因原文。
+/// 这类失败以前不留任何痕迹，客户端只表现为反复重连，排查时无从下手。
+/// 现在复用用量表记一行：面板的「请求日志」会带红色 `?`，点开就是原因原文。
+///
+/// **"未进入调度"这个名字只对一部分情况成立**：
+/// · 鉴权失败、并发满、协议解码失败 —— 确实没进调度；
+/// · 上游 5xx / 换号后仍失败 —— 已经打过上游，只是最终没拿到响应。
+/// 早期两类都标成"未进入调度"，会让人误以为请求根本没发出去
+///（可上游明明已经返回了 `995000 internal server error`）。
+/// 现在按错误类型给前缀，一眼能看出是"本地拒"还是"上游挂了"。
 pub(super) fn record_rejection(
     state: &SharedGateway,
     path: &str,
@@ -125,7 +131,17 @@ pub(super) fn record_rejection(
         .storage
         .record_usage(crate::gateway::storage::UsageRecord {
             ts: now_ms(),
-            model: format!("(未进入调度 {path})"),
+            // 前缀按错误来源区分：本地拒绝 vs 上游/调度失败。
+            model: format!(
+                "({} {path})",
+                match error.kind {
+                    crate::gateway::errors::ErrorKind::Upstream5xx
+                    | crate::gateway::errors::ErrorKind::Network => "上游失败",
+                    crate::gateway::errors::ErrorKind::NoAccount => "无可用账号",
+                    crate::gateway::errors::ErrorKind::RateLimited => "限流或并发",
+                    _ => "请求被拒",
+                }
+            ),
             channel_id: "-".into(),
             account_uid: "-".into(),
             status: "rejected".into(),
@@ -262,6 +278,128 @@ mod tests {
             .await
             .expect("读响应体");
         (status, bytes.to_vec())
+    }
+
+    /// **跨渠道切换**：同一个对外模型名，两个渠道各有一个账号。
+    /// 首选渠道被上游限流后，下一跳必须落到另一个渠道 ——
+    /// 这正是"wb 限额了自动切 trae"的核心诉求。
+    #[tokio::test]
+    async fn a_rate_limited_channel_falls_through_to_the_next_channel() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let mut config = Config::default();
+        config.channels.clear();
+        // 两个渠道提供**同一个**对外模型名（模拟 wb 与 trae 都能跑 ds）。
+        for (id, fail_first, priority) in [("wb", 1u32, 100u32), ("trae", 0u32, 90u32)] {
+            config.channels.push(ChannelConfig {
+                id: id.into(),
+                adapter: "fake".into(),
+                options: json!({ "model": "ds", "fail_first": fail_first }),
+                // wb 优先级更高：先选它，失败后才验证是否**跨档**降级到 trae。
+                priority,
+                ..ChannelConfig::default()
+            });
+            config.accounts.push(AccountConfig {
+                channel_id: id.into(),
+                uid: "u1".into(),
+                max_inflight: Some(1),
+                ..AccountConfig::default()
+            });
+        }
+        let state = GatewayState::initialize_with_secrets(
+            config,
+            dir.path().to_path_buf(),
+            crate::gateway::security::tests_support::memory_store().as_ref(),
+        )
+        .expect("状态初始化");
+        // 关掉亲和：否则首次成功会把后续请求钉在同一账号上，掩盖换渠道行为。
+        let app = router(std::sync::Arc::clone(&state));
+
+        let (status, body) = post(
+            &app,
+            "/v1/chat/completions",
+            json!({
+                "model": "ds",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "换渠道后应当成功");
+        let text = String::from_utf8(body).expect("utf8");
+        assert!(text.contains("ds"), "{text}");
+
+        // 关键断言：wb 因为注入的限流而进入冷却，trae 接住了这次请求。
+        let decisions = state.decisions();
+        let last = decisions.last().expect("至少有一条决策");
+        assert_eq!(last["attempts"], 2, "第一次失败后应当换号重试：{last}");
+        assert_eq!(
+            last["channel"], "trae",
+            "首选渠道限流后必须降级到备用渠道：{last}"
+        );
+    }
+    /// 模型级限额（workbuddy 的 6004 语义）：**只停这个模型**，同账号其他模型照跑。
+    ///
+    /// 这是"wb 限额了要能切走"的另一半：如果限额把整账号拉黑，
+    /// 该账号的其他模型也会一起不可用，切走就没意义了。
+    ///
+    /// 注意：这里直接构造 `AccountModel` 作用域的错误，而不是靠假渠道注入 429 ——
+    /// 通用 429 只有在正文能解析出恢复时刻时才收窄到模型级（保守策略），
+    /// 而 6004 这类"渠道自己知道得更准"的情形在 classify_error 里直接给出作用域。
+    #[test]
+    fn a_model_level_limit_does_not_block_other_models_on_the_same_account() {
+        use crate::gateway::errors::{ErrorKind, ErrorScope, GatewayError};
+
+        let mut account = crate::gateway::core::pool::PoolAccount::new("wb-cn", "u1");
+        // 测试不搭真实凭据：关掉凭据要求，只验证限额的作用域。
+        account.requires_credential = false;
+        let policy = crate::gateway::config::CooldownConfig::default();
+        let now = crate::gateway::timeutil::now_ms();
+
+        // 6004：模型级限流，带恢复时刻。
+        let error = GatewayError::new(
+            ErrorKind::RateLimited,
+            ErrorScope::AccountModel("deepseek-v4.1-flash".into()),
+            429,
+            "该模型被上游限流",
+            true,
+        )
+        .with_reset_at(Some(now + 600_000));
+        account.apply_error(&error, &policy, now);
+
+        assert!(
+            !account.is_ready("deepseek-v4.1-flash", now),
+            "被限流的模型应当暂时不可用"
+        );
+        assert!(
+            account.is_ready("glm-5.3", now),
+            "同账号其他模型必须仍然可用（否则一限额就得整号停摆）"
+        );
+        assert!(
+            account.is_ready("kimi-k2.6", now),
+            "多个无关模型都不该受影响"
+        );
+    }
+
+    /// 账号级 429（上游没说限哪个模型）保守地停整个账号 —— 这是刻意的，
+    /// 因为"不知道限什么"时继续用同账号打其他模型可能一直吃 429。
+    #[test]
+    fn an_account_level_limit_still_stops_the_whole_account() {
+        use crate::gateway::errors::{ErrorKind, ErrorScope, GatewayError};
+
+        let mut account = crate::gateway::core::pool::PoolAccount::new("wb-cn", "u1");
+        account.requires_credential = false;
+        let policy = crate::gateway::config::CooldownConfig::default();
+        let now = crate::gateway::timeutil::now_ms();
+        let error = GatewayError::new(
+            ErrorKind::RateLimited,
+            ErrorScope::Account,
+            429,
+            "账号级限流",
+            true,
+        )
+        .with_reset_at(Some(now + 600_000));
+        account.apply_error(&error, &policy, now);
+
+        assert!(!account.is_ready("glm-5.3", now), "账号级限额要停整个账号");
     }
 
     #[tokio::test]
@@ -418,6 +556,39 @@ mod tests {
             .await
             .expect("路由命中");
         response.status()
+    }
+
+    /// 回归：真实默认配置（带 workbuddy 渠道）下 `/v1/models` 必须正常返回。
+    ///
+    /// 早前的单测全部清掉了 workbuddy（怕真实快照目录污染），唯独这条路径上
+    /// `list_models` → `ensure_matrix` 会走 workbuddy 的目录构建 —— 真实环境里
+    /// 一次对 `/v1/models` 的请求直接被断连（handler panic，hyper 关连接不回包），
+    /// 而测试矩阵里只有 fake 渠道所以测不出来。
+    #[tokio::test]
+    async fn models_endpoint_survives_default_workbuddy_config() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let state = GatewayState::initialize_with_secrets(
+            Config::default(),
+            dir.path().to_path_buf(),
+            crate::gateway::security::tests_support::memory_store().as_ref(),
+        )
+        .expect("状态初始化");
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .expect("请求构造"),
+            )
+            .await
+            .expect("路由命中（handler 若 panic 这里会收到 JoinError）");
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("读响应体");
+        let value: Value = serde_json::from_slice(&bytes).expect("JSON 响应");
+        assert_eq!(value["object"], "list");
+        assert!(value["data"].is_array());
     }
 
     #[tokio::test]

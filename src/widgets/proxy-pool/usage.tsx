@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import {
   Activity,
@@ -16,7 +16,6 @@ import {
   Legend,
   Pie,
   PieChart,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
@@ -248,16 +247,55 @@ function tooltipLabel(ts: number, hours: number): string {
     : `${date.getMonth() + 1}月${date.getDate()}日 ${String(date.getHours()).padStart(2, "0")}:00`;
 }
 
+/**
+ * 容器尺寸测量：替代 recharts 的 ResponsiveContainer。
+ *
+ * ResponsiveContainer 在 overflow 滚动容器里测量回路会失效
+ * （内部 0×0 占位 + ResizeObserver 被滚动打断，SVG 塌缩成 14×14 图钉，
+ * 表现为"一滚动图表高度就变小"）。这里自己量外层容器，把确定性的
+ * 宽高以数值 props 传给图表 —— 图表尺寸只跟容器走，与滚动无关。
+ */
+function useElementSize<T extends HTMLElement>() {
+  const [node, setNode] = useState<T | null>(null);
+  const [size, setSize] = useState({ width: 0, height: 0 });
+  // callback ref：数据晚到时测量 div 才挂载，object ref 不会触发重测，callback ref 会。
+  const ref = useCallback((element: T | null) => setNode(element), []);
+  useEffect(() => {
+    if (!node) return;
+    const read = () => {
+      // contentRect 在部分 webview 里不可靠，直接量 border 盒再扣掉边框。
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      const width = Math.max(0, Math.round(rect.width - parseFloat(style.borderLeftWidth || "0") - parseFloat(style.borderRightWidth || "0")));
+      const height = Math.max(0, Math.round(rect.height - parseFloat(style.borderTopWidth || "0") - parseFloat(style.borderBottomWidth || "0")));
+      setSize((current) => (current.width === width && current.height === height ? current : { width, height }));
+    };
+    // 先同步量一次：RO 的初始回调时机不保证（后台标签会被节流），
+    // 不能只依赖它出首帧。
+    read();
+    const frame = requestAnimationFrame(read);
+    if (typeof ResizeObserver === "undefined") return () => cancelAnimationFrame(frame);
+    const observer = new ResizeObserver(read);
+    observer.observe(node);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [node]);
+  return [ref, size] as const;
+}
+
 /** 趋势图：面积图 + 悬浮显示该时段整列数值。 */
 function TrendChart({ points, hours }: { points: GatewaySeriesPoint[]; hours: number }) {
+  const [chartRef, { width, height }] = useElementSize<HTMLDivElement>();
   if (points.length === 0) {
     return <div className="py-8 text-center text-[10px] text-zinc-600">这段时间还没有请求</div>;
   }
 
   return (
-    <div className="h-[215px] w-full">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={points} margin={{ top: 6, right: 8, bottom: 0, left: -12 }}>
+    <div ref={chartRef} className="h-[215px] w-full">
+      {width > 0 && height > 0 && (
+        <AreaChart width={width} height={height} data={points} margin={{ top: 6, right: 8, bottom: 0, left: -12 }}>
           <defs>
             {SERIES.map((series) => (
               <linearGradient key={series.key} id={`fill-${series.key}`} x1="0" y1="0" x2="0" y2="1">
@@ -307,7 +345,7 @@ function TrendChart({ points, hours }: { points: GatewaySeriesPoint[]; hours: nu
             />
           ))}
         </AreaChart>
-      </ResponsiveContainer>
+      )}
     </div>
   );
 }
@@ -381,27 +419,7 @@ function Donut({
 
   return (
     <div className="flex items-center gap-3">
-      <div className="h-36 w-36 shrink-0">
-        <ResponsiveContainer width="100%" height="100%">
-          <PieChart>
-            <Pie
-              data={data}
-              dataKey="total_tokens"
-              nameKey="key"
-              innerRadius={30}
-              outerRadius={62}
-              paddingAngle={2}
-              stroke="none"
-              isAnimationActive={false}
-            >
-              {data.map((entry) => (
-                <Cell key={entry.key} fill={entry.fill} />
-              ))}
-            </Pie>
-            <Tooltip content={<DonutTooltip total={total} />} />
-          </PieChart>
-        </ResponsiveContainer>
-      </div>
+      <DonutChart data={data} />
 
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         {data.map((row) => (
@@ -420,6 +438,38 @@ function Donut({
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+/** 环形图本体：容器量好尺寸后再渲染（同 TrendChart 的理由，不用 ResponsiveContainer）。 */
+function DonutChart({
+  data,
+}: {
+  data: Array<{ key: string; requests: number; total_tokens: number; cached_tokens: number; share: number; fill: string }>;
+}) {
+  const [chartRef, { width, height }] = useElementSize<HTMLDivElement>();
+  return (
+    <div ref={chartRef} className="h-36 w-36 shrink-0">
+      {width > 0 && height > 0 && (
+        <PieChart width={width} height={height}>
+          <Pie
+            data={data}
+            dataKey="total_tokens"
+            nameKey="key"
+            innerRadius={30}
+            outerRadius={62}
+            paddingAngle={2}
+            stroke="none"
+            isAnimationActive={false}
+          >
+            {data.map((entry) => (
+              <Cell key={entry.key} fill={entry.fill} />
+            ))}
+          </Pie>
+          <Tooltip content={<DonutTooltip total={data.reduce((sum, row) => sum + row.total_tokens, 0)} />} />
+        </PieChart>
+      )}
     </div>
   );
 }

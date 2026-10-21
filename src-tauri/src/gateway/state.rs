@@ -458,6 +458,11 @@ fn build_accounts(
             };
             pooled.enabled = record.enabled;
             pooled.requires_credential = adapter.requires_credential();
+            pooled.static_credential = adapter.static_credential();
+            // 覆盖值原样带进池子：面板"编辑账号"要区分"我设的"和"跟渠道的"，
+            // 只有生效值的话，两者会看起来一模一样（改完再打开就分不清了）。
+            pooled.priority_override = record.priority_override;
+            pooled.weight_override = record.weight_override;
             pooled.priority = record
                 .priority_override
                 .or_else(|| channel.map(|channel| channel.priority))
@@ -468,6 +473,9 @@ fn build_accounts(
                 .unwrap_or(1);
             pooled.set_max_inflight(record.max_inflight.unwrap_or(per_account));
             pooled.proxy_slot = record.proxy_slot.clone();
+            // 账号级模型限制 / 改名：从落库记录带进池子，调度与面板都读这份。
+            pooled.model_allow = record.model_allow.clone();
+            pooled.model_rename = record.model_rename.clone();
             if let Some(credential) = &record.credential {
                 pooled.set_credentials(credential.clone());
             }

@@ -137,6 +137,8 @@ pub fn credential_from_data(data: &Value) -> Credential {
             .get("domain")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // CodeArts 那套 AK/SK 字段只在华为云渠道用得上，这里留空。
+        ..Default::default()
     }
 }
 

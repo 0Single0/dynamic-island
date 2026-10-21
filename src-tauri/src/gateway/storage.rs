@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS accounts (
     credential        TEXT,
     added_at          INTEGER NOT NULL,
     source            TEXT    NOT NULL DEFAULT 'manual',
+    -- JSON 数组：这个账号只服务哪些**对外模型名**（空/NULL = 不限制）。
+    model_allow       TEXT,
+    -- JSON 对象：对外名到该账号上游名的映射（账号级改名）。
+    model_rename      TEXT,
     PRIMARY KEY (channel_id, uid)
 );
 CREATE TABLE IF NOT EXISTS usage (
@@ -75,6 +79,29 @@ CREATE TABLE IF NOT EXISTS affinity (
 CREATE INDEX IF NOT EXISTS affinity_expires ON affinity(expires_at);
 ";
 
+/// 模型白名单 / 改名的落库编码。
+///
+/// 存 JSON 而不是逗号分隔：模型名里可能出现逗号或冒号（中转站命名很随意），
+/// 自造的定界符迟早会被一个奇怪的模型名撑破。
+fn encode_string_list(values: &[String]) -> Option<String> {
+    (!values.is_empty()).then(|| serde_json::to_string(values).unwrap_or_default())
+}
+
+fn encode_string_map(values: &std::collections::BTreeMap<String, String>) -> Option<String> {
+    (!values.is_empty()).then(|| serde_json::to_string(values).unwrap_or_default())
+}
+
+/// 解码失败一律当"没有配置"：一条读不出来的老数据不该让整个账号列表打不开。
+fn decode_string_list(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default()
+}
+
+fn decode_string_map(raw: Option<&str>) -> std::collections::BTreeMap<String, String> {
+    raw.and_then(|text| serde_json::from_str::<std::collections::BTreeMap<String, String>>(text).ok())
+        .unwrap_or_default()
+}
+
 /// 账号落库记录（含解密后的凭据）。
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountRecord {
@@ -89,6 +116,14 @@ pub struct AccountRecord {
     pub added_at: u64,
     pub source: String,
     pub credential: Option<Credential>,
+    /// 这个账号只服务哪些**对外模型名**。空 = 不限制（渠道有什么就用什么）。
+    pub model_allow: Vec<String>,
+    /// 账号级模型改名：`对外名 -> 该账号的上游名`。
+    ///
+    /// 与渠道级 `config.routes[].upstream_model` 的区别是**作用域**：同一渠道的两个账号
+    /// 可以把同一个对外模型映射到不同的上游名（Trae 的 `DeepSeek-V4-Flash-Official`
+    /// 与别处的 `deepseek-v4.1-flash` 就是一例）。
+    pub model_rename: std::collections::BTreeMap<String, String>,
 }
 
 /// 一条请求的用量记录。
@@ -171,6 +206,9 @@ impl Storage {
         for statement in [
             "ALTER TABLE usage ADD COLUMN upstream_model TEXT",
             "ALTER TABLE usage ADD COLUMN error_detail TEXT",
+            // 账号级模型限制 / 改名（老库没有这两列）。
+            "ALTER TABLE accounts ADD COLUMN model_allow TEXT",
+            "ALTER TABLE accounts ADD COLUMN model_rename TEXT",
         ] {
             let _ = conn.execute(statement, []);
         }
@@ -208,7 +246,8 @@ impl Storage {
         let rows = self.with_conn(|conn| {
             let mut statement = conn.prepare(
                 "SELECT channel_id, uid, nickname, enabled, priority_override, weight_override,
-                        max_inflight, proxy_slot, credential, added_at, source
+                        max_inflight, proxy_slot, credential, added_at, source,
+                        model_allow, model_rename
                  FROM accounts ORDER BY channel_id, added_at",
             )?;
             let mapped = statement.query_map([], |row| {
@@ -224,6 +263,8 @@ impl Storage {
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()
@@ -244,6 +285,8 @@ impl Storage {
                     credential,
                     added_at,
                     source,
+                    model_allow,
+                    model_rename,
                 )| AccountRecord {
                     channel_id,
                     uid,
@@ -256,6 +299,8 @@ impl Storage {
                     added_at: added_at as u64,
                     source,
                     credential: credential.and_then(|sealed| self.open_credential(&sealed)),
+                    model_allow: decode_string_list(model_allow.as_deref()),
+                    model_rename: decode_string_map(model_rename.as_deref()),
                 },
             )
             .collect())
@@ -277,8 +322,9 @@ impl Storage {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO accounts (channel_id, uid, nickname, enabled, priority_override,
-                                       weight_override, max_inflight, proxy_slot, credential, added_at, source)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                       weight_override, max_inflight, proxy_slot, credential, added_at, source,
+                                       model_allow, model_rename)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(channel_id, uid) DO UPDATE SET
                     nickname = excluded.nickname,
                     enabled = excluded.enabled,
@@ -286,6 +332,8 @@ impl Storage {
                     weight_override = excluded.weight_override,
                     max_inflight = excluded.max_inflight,
                     proxy_slot = excluded.proxy_slot,
+                    model_allow = excluded.model_allow,
+                    model_rename = excluded.model_rename,
                     credential = COALESCE(excluded.credential, accounts.credential)",
                 params![
                     record.channel_id,
@@ -299,6 +347,8 @@ impl Storage {
                     sealed,
                     record.added_at as i64,
                     record.source,
+                    encode_string_list(&record.model_allow),
+                    encode_string_map(&record.model_rename),
                 ],
             )?;
             Ok(())
@@ -339,6 +389,75 @@ impl Storage {
             )?;
             Ok(())
         })
+    }
+
+    /// 改账号的**可变画像**：昵称 / 优先级 / 权重 / 并发上限。
+    ///
+    /// 刻意不走 `upsert_account`：那条语句要求把整条记录（含凭据）重新给全，
+    /// 少给一个字段就会把凭据一起清掉。这里只 UPDATE 这几列，凭据与运行态一概不碰 ——
+    /// 「编辑账号」不该有"顺手把登录态弄丢"的副作用。
+    ///
+    /// `priority / weight / max_inflight` 为 `None` = 清掉覆盖、回落到渠道/全局默认。
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_account_profile(
+        &self,
+        channel_id: &str,
+        uid: &str,
+        nickname: Option<&str>,
+        priority: Option<u32>,
+        weight: Option<u32>,
+        max_inflight: Option<u32>,
+    ) -> Result<bool, GatewayError> {
+        let changed = self.with_conn(|conn| {
+            let mut sets: Vec<&str> = Vec::new();
+            if nickname.is_some() {
+                sets.push("nickname = ?3");
+            }
+            sets.push("priority_override = ?4");
+            sets.push("weight_override = ?5");
+            sets.push("max_inflight = ?6");
+            let sql = format!(
+                "UPDATE accounts SET {} WHERE channel_id = ?1 AND uid = ?2",
+                sets.join(", ")
+            );
+            conn.execute(
+                &sql,
+                params![
+                    channel_id,
+                    uid,
+                    nickname,
+                    priority.map(|value| value as i64),
+                    weight.map(|value| value as i64),
+                    max_inflight.map(|value| value as i64),
+                ],
+            )
+        })?;
+        Ok(changed > 0)
+    }
+
+    /// 改账号的模型清单：白名单（空 = 不限）+ 账号级改名。
+    ///
+    /// 只碰 `model_allow` / `model_rename` 两列 —— 这两样是"调度画像"，改它们
+    /// 不该影响凭据、额度或冷却。
+    pub fn set_account_models(
+        &self,
+        channel_id: &str,
+        uid: &str,
+        allow: &[String],
+        rename: &std::collections::BTreeMap<String, String>,
+    ) -> Result<bool, GatewayError> {
+        let changed = self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE accounts SET model_allow = ?3, model_rename = ?4 WHERE channel_id = ?1 AND uid = ?2",
+                params![
+                    channel_id,
+                    uid,
+                    encode_string_list(allow),
+                    encode_string_map(rename),
+                ],
+            )
+        })?;
+        Ok(changed > 0)
     }
 
     pub fn set_account_enabled(
@@ -385,6 +504,8 @@ impl Storage {
                 added_at: now,
                 source: "config".into(),
                 credential: None,
+                model_allow: Vec::new(),
+                model_rename: std::collections::BTreeMap::new(),
             })?;
         }
         Ok(config.accounts.len())
@@ -787,6 +908,7 @@ mod tests {
             nickname: Some("昵称".into()),
             enterprise_id: None,
             domain: Some("copilot.tencent.com".into()),
+            ..Default::default()
         };
         storage
             .upsert_account(&AccountRecord {
@@ -801,6 +923,8 @@ mod tests {
                 added_at: 1,
                 source: "oauth".into(),
                 credential: Some(credential.clone()),
+                model_allow: Vec::new(),
+                model_rename: std::collections::BTreeMap::new(),
             })
             .expect("写入账号");
 
@@ -836,6 +960,8 @@ mod tests {
                 access_token: "token-1".into(),
                 ..Credential::default()
             }),
+            model_allow: Vec::new(),
+            model_rename: std::collections::BTreeMap::new(),
         };
         storage.upsert_account(&record).expect("首次写入");
 
@@ -843,6 +969,8 @@ mod tests {
             .upsert_account(&AccountRecord {
                 nickname: "新昵称".into(),
                 credential: None,
+                model_allow: Vec::new(),
+                model_rename: std::collections::BTreeMap::new(),
                 ..record
             })
             .expect("二次写入");
@@ -923,3 +1051,4 @@ mod tests {
         assert_eq!(summary["by_model"][0]["key"], "glm-5.3");
     }
 }
+

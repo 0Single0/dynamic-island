@@ -25,7 +25,15 @@ fn gateway_base_url(gateway: &SharedGateway) -> String {
         .server_status()
         .addr
         .unwrap_or_else(|| format!("http://127.0.0.1:{}", gateway.config().port));
-    format!("{}/v1", origin.trim_end_matches('/'))
+    // 端口取实际监听的，主机**钉死回环**：allow_lan 开着时网关绑 0.0.0.0，
+    // addr 会变成 "http://0.0.0.0:8790" —— 既过不了 agent 的出站安全策略
+    // （只放行 https / http+localhost，0.0.0.0 会被拒成 LocalhostOnlyForHttp），
+    // 作为目标地址也不可连。回环访问绑 0.0.0.0 的服务始终可用。
+    let port = origin.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    match port {
+        Some(port) => format!("http://127.0.0.1:{port}/v1"),
+        None => format!("{origin}/v1"),
+    }
 }
 
 /// 合成的内置供应商记录。`secret_ref` 为空：密钥在解析时直接取网关配置（见 `builtin_credential`）。

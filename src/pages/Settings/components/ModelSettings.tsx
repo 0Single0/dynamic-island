@@ -204,7 +204,7 @@ export function ModelSettings() {
       </header>
 
       <div className="grid min-h-0 flex-1 grid-cols-[200px_minmax(0,1fr)] overflow-hidden rounded-xl border border-white/[0.12] bg-[#1c1c1e]">
-        <aside className="flex min-h-0 flex-col overflow-y-auto border-r border-white/10 p-2">
+        <aside className="dark-scroll flex min-h-0 flex-col overflow-y-auto border-r border-white/10 p-2">
           <div className="px-2 py-1.5 text-xs font-medium text-zinc-500">供应商</div>
           {providers.map((provider) => (
             <button
@@ -227,7 +227,7 @@ export function ModelSettings() {
           </button>
         </aside>
 
-        <section className="min-h-0 overflow-y-auto p-5">
+        <section className="dark-scroll min-h-0 overflow-y-auto p-5">
           <div className="mb-4">
             <h2 className="text-sm font-semibold">{isBuiltinProvider ? "本机反代" : activeProviderId ? "编辑模型供应商" : "添加模型供应商"}</h2>
             <p className="mt-1 text-xs text-zinc-500">{isBuiltinProvider ? "岛内反代号池网关：模型目录实时同步，无需手动配置。" : "配置一个完全自定义的 API 端点和初始模型。"}</p>

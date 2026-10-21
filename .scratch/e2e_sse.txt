@@ -1,0 +1,45 @@
+event: response.created
+data: {"response":{"created_at":1792116252,"id":"resp_8a0a889402964db4b090d2473dddb6d6","model":"glm-5.3-flash","object":"response","output":[],"status":"in_progress"},"type":"response.created"}
+
+event: response.in_progress
+data: {"response":{"created_at":1792116252,"id":"resp_8a0a889402964db4b090d2473dddb6d6","model":"glm-5.3-flash","object":"response","output":[],"status":"in_progress"},"type":"response.in_progress"}
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call_2e1a60872ab148f99898b5bc","id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","name":"files__list","status":"in_progress","type":"function_call"},"output_index":0,"type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"path","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\":\"","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"D","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":":/","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"code","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"/d","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"ynamic-island\"","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"}","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.done
+data: {"arguments":"{\"path\":\"D:/code/dynamic-island\"}","item_id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","output_index":0,"type":"response.function_call_arguments.done"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"path\":\"D:/code/dynamic-island\"}","call_id":"call_2e1a60872ab148f99898b5bc","id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","name":"files__list","status":"completed","type":"function_call"},"output_index":0,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"created_at":1792116252,"id":"resp_8a0a889402964db4b090d2473dddb6d6","model":"glm-5.3-flash","object":"response","output":[{"arguments":"{\"path\":\"D:/code/dynamic-island\"}","call_id":"call_2e1a60872ab148f99898b5bc","id":"fc_resp_8a0a889402964db4b090d2473dddb6d6_0","name":"files__list","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":213,"input_tokens_details":{"cached_tokens":0},"output_tokens":19,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":232}},"type":"response.completed"}
+

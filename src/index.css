@@ -236,6 +236,29 @@ body,
   background: transparent;
 }
 
+/* ===== 独立窗口（设置中心 / 工具窗口）的深色滚动条 =====
+   与 .gw-scroll 同一套视觉：默认滚动条是亮色的，在深色主题里非常突兀。 */
+.dark-scroll {
+  scrollbar-color: rgb(63 63 70) transparent;
+}
+.dark-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.dark-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.dark-scroll::-webkit-scrollbar-thumb {
+  background: rgb(63 63 70);
+  border-radius: 4px;
+}
+.dark-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgb(82 82 91);
+}
+.dark-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
 /* ===== 应用列表：滚动时才出现的滚动条 =====
    静止时不显示任何滚动条，滚动期间滑块淡入，停下由 JS 摘掉 .is-scrolling。
    8px 宽度始终保留在布局里（轨道透明），避免出现滚动条时卡片被横向挤动。 */

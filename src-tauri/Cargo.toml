@@ -52,6 +52,10 @@ scraper = "0.24"
 uuid = { version = "1.27.0", features = ["v4"] }
 axum = "0.8.9"
 sha2 = "0.10"
+# WorkBuddy 指纹清洗：参考实现用正则识别身份声明（变体多，字面量替换不够）。
+regex = "1"
+# 华为云 SDK-HMAC-SHA256 请求签名（CodeArts 渠道每个请求都要签）。
+hmac = "0.12"
 aes-gcm = "0.11.1"
 getrandom = "0.4.3"
 

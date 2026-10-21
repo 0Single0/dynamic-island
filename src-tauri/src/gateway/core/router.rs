@@ -53,12 +53,25 @@ pub fn candidates(
             continue;
         }
         for account in accounts {
-            if account.enabled {
-                set.usable.push(Candidate {
-                    route: route.clone(),
-                    account,
-                });
+            if !account.enabled {
+                continue;
             }
+            // 账号级白名单：这个号不服务该模型就直接跳过（不是"请求有问题"，
+            // 所以不进 rejected_requirements —— 那是给 400 用的）。
+            if !account.model_allow.is_empty()
+                && !account.model_allow.iter().any(|name| name == public_model)
+            {
+                continue;
+            }
+            // 账号级改名：同渠道不同账号可以把同一个对外模型映射到不同上游名。
+            let mut route = route.clone();
+            if let Some(upstream) = account.model_rename.get(public_model) {
+                route.upstream_model = upstream.clone();
+            }
+            set.usable.push(Candidate {
+                route,
+                account,
+            });
         }
     }
     set
@@ -268,6 +281,8 @@ mod tests {
                         vision: false,
                         tool_calls: false,
                         reasoning: true,
+                        declared_tools: true,
+                        declared_vision: true,
                     },
                     ..Default::default()
                 }],
@@ -325,6 +340,8 @@ mod tests {
                     vision: false,
                     tool_calls: true,
                     reasoning: true,
+                    declared_tools: true,
+                    declared_vision: true,
                 },
                 ..Default::default()
             }],
@@ -399,6 +416,149 @@ mod tests {
         assert!(affinity_pick(&candidates, &binding, "glm-5.3").is_none());
     }
 
+
+    /// 账号级白名单：不在名单里的模型不能落到这个号上；空名单 = 不限。
+    #[test]
+    fn account_model_allowlist_filters_candidates() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "wb-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![
+                crate::gateway::channels::UpstreamModel {
+                    id: "glm-5.3".into(),
+                    ..Default::default()
+                },
+                crate::gateway::channels::UpstreamModel {
+                    id: "kimi-k2.6".into(),
+                    ..Default::default()
+                },
+            ],
+        }];
+        let matrix = Matrix::build(&catalogs, &std::collections::HashMap::new(), &[]);
+
+        let mut limited = PoolAccount::new("wb-cn", "u1");
+        limited.requires_credential = false;
+        limited.model_allow = vec!["glm-5.3".into()];
+        let pool = AccountPool::new(vec![Arc::new(limited)], CooldownConfig::default());
+
+        // 名单里有的模型：能选出候选。
+        let allowed = candidates(&matrix, &Requirements::default(), &pool, "glm-5.3");
+        assert_eq!(allowed.usable.len(), 1);
+
+        // 名单里没有的模型：该账号直接不参与，且**不算**请求被拒（那是 400 的语义）。
+        let blocked = candidates(&matrix, &Requirements::default(), &pool, "kimi-k2.6");
+        assert!(blocked.usable.is_empty(), "白名单外的模型不该落到这个号");
+        assert!(
+            blocked.rejected_requirements.is_empty(),
+            "白名单过滤是账号侧限制，不该报成请求问题（否则会误报 400）"
+        );
+    }
+
+    /// 空白名单 = 不限制：该渠道的所有模型都能用。
+    #[test]
+    fn empty_allowlist_means_every_model_is_allowed() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "wb-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![crate::gateway::channels::UpstreamModel {
+                id: "glm-5.3".into(),
+                ..Default::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &std::collections::HashMap::new(), &[]);
+        let mut open = PoolAccount::new("wb-cn", "u1");
+        open.requires_credential = false;
+        let pool = AccountPool::new(vec![Arc::new(open)], CooldownConfig::default());
+        assert_eq!(
+            candidates(&matrix, &Requirements::default(), &pool, "glm-5.3").usable.len(),
+            1
+        );
+    }
+
+    /// 账号级改名：对外名不变，但候选里的上游名要换成该账号映射的值。
+    ///
+    /// 这是 Trae 那种"同模型不同名"渠道能共用一个对外名的关键。
+    #[test]
+    fn account_model_rename_rewrites_the_upstream_name() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "trae-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![crate::gateway::channels::UpstreamModel {
+                id: "DeepSeek-V4-Flash-Official".into(),
+                ..Default::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &std::collections::HashMap::new(), &[]);
+
+        let mut account = PoolAccount::new("trae-cn", "u1");
+        account.requires_credential = false;
+        // 对外统一叫 deepseek-v4.1-flash，落到这个号时换成 Trae 的上游名。
+        account.model_rename.insert(
+            "deepseek-v4.1-flash".into(),
+            "DeepSeek-V4-Flash-Official".into(),
+        );
+        let pool = AccountPool::new(vec![Arc::new(account)], CooldownConfig::default());
+
+        // 矩阵里这个对外名不存在，改名本身不创造候选 —— 所以这里用上游名建矩阵，
+        // 再验证"名字一样时才改写"的行为不误伤。
+        let same = candidates(
+            &matrix,
+            &Requirements::default(),
+            &pool,
+            "DeepSeek-V4-Flash-Official",
+        );
+        assert_eq!(same.usable.len(), 1);
+        assert_eq!(
+            same.usable[0].route.upstream_model, "DeepSeek-V4-Flash-Official",
+            "没有对应改名条目时上游名保持原样"
+        );
+    }
+
+    /// 改名命中时，候选的 upstream_model 必须是映射后的值（出站就发这个）。
+    #[test]
+    fn rename_applies_when_the_public_name_matches() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "trae-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![crate::gateway::channels::UpstreamModel {
+                id: "deepseek-v4.1-flash".into(),
+                ..Default::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &std::collections::HashMap::new(), &[]);
+
+        let mut account = PoolAccount::new("trae-cn", "u1");
+        account.requires_credential = false;
+        account.model_rename.insert(
+            "deepseek-v4.1-flash".into(),
+            "DeepSeek-V4-Flash-Official".into(),
+        );
+        let pool = AccountPool::new(vec![Arc::new(account)], CooldownConfig::default());
+
+        let set = candidates(
+            &matrix,
+            &Requirements::default(),
+            &pool,
+            "deepseek-v4.1-flash",
+        );
+        assert_eq!(set.usable.len(), 1);
+        assert_eq!(
+            set.usable[0].route.upstream_model, "DeepSeek-V4-Flash-Official",
+            "出站必须用该账号映射的上游名"
+        );
+        assert_eq!(
+            set.usable[0].route.public_model, "deepseek-v4.1-flash",
+            "对外名不能被改写"
+        );
+    }
     #[test]
     fn pick_stays_in_the_highest_priority_tier_and_skips_tried() {
         let free = candidate(account("wb-cn", "free", 100, 1), "glm-5.3", "glm-5.3", 100);
