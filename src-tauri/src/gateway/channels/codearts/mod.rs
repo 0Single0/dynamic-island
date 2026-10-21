@@ -100,16 +100,16 @@ impl CodeArtsChannel {
         credentials: &SignCredentials,
         method: &str,
         url: &str,
+        accept: &str,
         extra: &[(String, String)],
         body: &[u8],
     ) -> Vec<(String, String)> {
         let mut headers = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
-            ("Accept".to_string(), "text/event-stream".to_string()),
-            (
-                "x-auth-token".to_string(),
-                account.access_token.clone().unwrap_or_default(),
-            ),
+            // **`Accept` 决定上游把请求路由到哪条链路**：
+            // 目录接口必须 `application/json`；发 `text/event-stream` 会被当成
+            // SSE 请求，回 `TM.00001001 未找到合法可路由api`（真实实测）。
+            ("Accept".to_string(), accept.to_string()),
             (
                 "x-snap-traceid".to_string(),
                 format!("{:x}{:04x}", crate::gateway::timeutil::now_ms(), self.sequence.fetch_add(1, Ordering::Relaxed) & 0xffff),
@@ -118,6 +118,16 @@ impl CodeArtsChannel {
             ("app-id".to_string(), "CodeAgent3.0".to_string()),
             ("is_confidential".to_string(), "false".to_string()),
         ];
+        // `x-auth-token` 只在用 **STS 临时凭据** 时发。
+        // 长期 AK/SK 没有 security token，发空值会被上游判成非法调用。
+        if let Some(token) = account
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            headers.push(("x-auth-token".to_string(), token.to_string()));
+        }
         headers.extend(extra.iter().cloned());
 
         let signed = signer::sign(
@@ -171,7 +181,15 @@ impl ChannelAdapter for CodeArtsChannel {
         if let Some(session) = request.metadata.session_key() {
             extra.push(("Chat-Id".to_string(), session.clone()));
         }
-        let headers = self.signed_headers(account, &credentials, "POST", &url, &extra, &raw);
+        let headers = self.signed_headers(
+            account,
+            &credentials,
+            "POST",
+            &url,
+            "text/event-stream",
+            &extra,
+            &raw,
+        );
         Ok(UpstreamRequest {
             url,
             headers,
@@ -206,6 +224,8 @@ impl ChannelAdapter for CodeArtsChannel {
                 &credentials,
                 "GET",
                 &url,
+                // 目录是普通 JSON 接口：**不能**发 text/event-stream。
+                "application/json",
                 &[("Agent-Type".to_string(), "PromptCenter".to_string())],
                 &[],
             ),
@@ -582,15 +602,78 @@ pub fn parse_builtin_models(payload: &Value) -> Vec<UpstreamModel> {
                 _ => None,
             })
         };
+        // `supports_images` 是这条上游的权威视觉能力位（目录里没有顶层 multimodal）。
+        let vision = raw
+            .get("supports_images")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         models.push(UpstreamModel {
             id: id.to_string(),
+            credits: parse_builtin_credits(raw),
             context_length: number("context_window").filter(|value| *value > 0),
             max_output_tokens: number("max_tokens").filter(|value| *value > 0),
             vendor: Some("codearts".into()),
+            capabilities: crate::gateway::channels::ModelCapabilities {
+                vision,
+                // 未知即乐观放行：目录不声明工具/思考能力时不该在本地拦掉。
+                tool_calls: false,
+                reasoning: false,
+                // 但"没声明"要如实记下来（区别于"声明了不支持"）。
+                declared_vision: raw.get("supports_images").and_then(Value::as_bool).is_some(),
+                declared_tools: false,
+            },
             ..UpstreamModel::default()
         });
     }
     models
+}
+
+/// 从 `credit[]` 里取**倍率**。
+///
+/// 上游给的是分段计价表：
+/// ```json
+/// "credit":[{"ratio":"0.05","ratio_display":"0.7x","input_from":0,"input_to":-1,
+///            "input_price":"8","cache_price":"2","output_price":"28"}]
+/// ```
+/// `ratio_display` 是给用户看的倍率（`0.7x`），`ratio` 是结算系数。
+/// 优先透出 `ratio_display`，没有就用 `ratio` 拼一个 —— 面板只认 `x…` 形式。
+pub fn parse_builtin_credits(raw: &Value) -> Option<String> {
+    let segments = raw.get("credit").and_then(Value::as_array)?;
+    // `input_from: 0 / input_to: -1` 是"全区间"那一段，取它最准。
+    let whole = segments.iter().find(|segment| {
+        segment.get("input_from").and_then(Value::as_i64) == Some(0)
+            && segment.get("input_to").and_then(Value::as_i64) == Some(-1)
+    });
+    let segment = whole.or_else(|| segments.first())?;
+    if let Some(display) = segment
+        .get("ratio_display")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(normalize_rate(display));
+    }
+    segment
+        .get("ratio")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_rate)
+}
+
+/// 把 `0.7x` / `x0.5` / `0.05` 统一成 `x0.70` / `x0.50` / `x0.05`。
+fn normalize_rate(value: &str) -> String {
+    // `x` 可能在前也可能在后（上游同一个字段两种写法都出现过）。
+    let trimmed = value
+        .trim()
+        .trim_start_matches(['x', 'X'])
+        .trim_end_matches(['x', 'X'])
+        .trim();
+    match trimmed.parse::<f64>() {
+        Ok(rate) => format!("x{rate:.2}"),
+        // 解析不了就原样透出，别把上游给的东西吞掉。
+        Err(_) => value.trim().to_string(),
+    }
 }
 
 /// 上游错误分类：先认业务码，再按状态码兜底。
@@ -820,6 +903,112 @@ mod tests {
         assert_eq!(upstream.body["stream"], true);
     }
 
+    /// 真实目录响应（抓包）里的字段：倍率在 `credit[].ratio_display`，
+    /// 视觉能力在 `supports_images`。
+    #[test]
+    fn builtin_models_read_credit_and_vision_from_the_real_shape() {
+        let payload = json!({"count": 2, "builtinModels": [
+            {
+                "model_id": "GLM-5.2", "model_name": "GLM-5.2",
+                "model_category": "文本生成", "supports_images": false,
+                "credit": [{
+                    "input_from": 0, "input_to": -1, "output_from": 0, "output_to": -1,
+                    "ratio": "0.05", "input_price": "8", "cache_price": "2",
+                    "output_price": "28", "ratio_display": "0.7x"
+                }]
+            },
+            {
+                "model_id": "Qwen3-VL-235B", "model_name": "Qwen3-VL-235B",
+                "model_category": "图片理解", "supports_images": true, "credit": []
+            }
+        ]});
+        let models = parse_builtin_models(&payload);
+        assert_eq!(models.len(), 2);
+        // `ratio_display: "0.7x"` → 面板认的 `x0.70`。
+        assert_eq!(models[0].credits.as_deref(), Some("x0.70"));
+        assert!(!models[0].capabilities.vision);
+        assert!(models[0].capabilities.declared_vision, "声明过就要记下来");
+        // 没有 credit 段 → 不编造倍率。
+        assert_eq!(models[1].credits, None);
+        assert!(models[1].capabilities.vision, "supports_images=true");
+    }
+
+    /// 倍率归一化：`0.7x` / `0.05` / `x0.5` 都要变成 `x…` 形式。
+    #[test]
+    fn rate_normalization_matches_the_panel_expectation() {
+        assert_eq!(normalize_rate("0.7x"), "x0.70");
+        assert_eq!(normalize_rate("0.05"), "x0.05");
+        assert_eq!(normalize_rate("x0.5"), "x0.50");
+        assert_eq!(normalize_rate("1.5X"), "x1.50");
+        // 认不出的原样保留，不吞掉上游信息。
+        assert_eq!(normalize_rate("面议"), "面议");
+    }
+
+    /// 目录接口必须用 `Accept: application/json`。
+    ///
+    /// 发 `text/event-stream` 会被上游当成 SSE 路由请求，回
+    /// `TM.00001001 未找到合法可路由api, agentType:PromptCenter, 协议:SSE`
+    /// —— 这个错误看起来像"没开通"，实际只是头写错了。
+    #[test]
+    fn catalog_headers_ask_for_json_not_sse() {
+        let channel = channel();
+        let account = account();
+        let creds = CodeArtsChannel::credentials(&account).expect("credentials");
+        let url = channel.url(BUILTIN_MODELS_PATH);
+        let headers = channel.signed_headers(
+            &account,
+            &creds,
+            "GET",
+            &url,
+            "application/json",
+            &[("Agent-Type".to_string(), "PromptCenter".to_string())],
+            &[],
+        );
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(find("Accept").as_deref(), Some("application/json"));
+        assert_eq!(find("Agent-Type").as_deref(), Some("PromptCenter"));
+        assert!(find("Authorization")
+            .is_some_and(|value| value.starts_with("SDK-HMAC-SHA256 Access=")));
+    }
+
+    /// 长期 AK/SK 没有 STS token 时**不能发空的 `x-auth-token`**。
+    #[test]
+    fn empty_security_token_is_not_sent_as_an_empty_header() {
+        let channel = channel();
+        let mut long_term = account();
+        long_term.access_token = None;
+        let creds = CodeArtsChannel::credentials(&long_term).expect("credentials");
+        let url = channel.url(BUILTIN_MODELS_PATH);
+        let headers = channel.signed_headers(
+            &long_term,
+            &creds,
+            "GET",
+            &url,
+            "application/json",
+            &[],
+            &[],
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-auth-token")),
+            "没有 STS token 就不该发 x-auth-token"
+        );
+
+        // 有 STS token 时必须带上。
+        let creds = CodeArtsChannel::credentials(&account()).expect("credentials");
+        let headers =
+            channel.signed_headers(&account(), &creds, "GET", &url, "application/json", &[], &[]);
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-auth-token") && value == "STS-TOKEN"));
+    }
+
     #[test]
     fn builtin_models_parse_with_limits() {
         let payload = json!({"builtinModels": [
@@ -935,5 +1124,109 @@ mod tests {
         let utc = parse_rfc3339_ms("2026-10-21T03:15:00Z").expect("UTC");
         let plus8 = parse_rfc3339_ms("2026-10-21T11:15:00+08:00").expect("+08:00");
         assert_eq!(utc, plus8, "同一时刻的两种写法要相等");
+    }
+}
+
+#[cfg(test)]
+mod probe_chat {
+    use super::*;
+    use crate::gateway::storage::Storage;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    #[ignore]
+    async fn dump_chat() {
+        let dir = std::path::PathBuf::from(
+            r"C:\Users\issuser\AppData\Roaming\com.issuser.dynamic-island\gateway",
+        );
+        let store = crate::agent::secrets::OsCredentialStore;
+        let storage = Storage::open(&dir, &store).expect("open");
+        let record = storage
+            .list_accounts()
+            .expect("list")
+            .into_iter()
+            .find(|r| r.channel_id == "codearts")
+            .expect("no codearts account");
+        let credential = record.credential.expect("no credential");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()).filter(|t| !t.is_empty()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+            access_key_id: credential.access_key_id.clone(),
+            secret_key: credential.secret_key.clone(),
+            code_verifier: credential.code_verifier.clone(),
+        };
+        let channel = CodeArtsChannel::from_options("codearts", &serde_json::json!({}));
+        let client = reqwest::Client::new();
+
+        // 先看目录解析结果。
+        let models = channel
+            .list_models(&client, &account)
+            .await
+            .expect("list_models")
+            .unwrap_or_default();
+        println!("=== 目录 {} 个 ===", models.len());
+        for m in models.iter().take(10) {
+            println!(
+                "  {:<24} credits={:?} vision={}",
+                m.id, m.credits, m.capabilities.vision
+            );
+        }
+        let Some(first) = models.first() else { panic!("目录为空") };
+        let model = first.id.clone();
+
+        // 再打一次 chat。
+        let request = CanonicalRequest {
+            model: model.clone(),
+            system: Vec::new(),
+            messages: vec![crate::gateway::protocol::cir::Message {
+                role: crate::gateway::protocol::cir::Role::User,
+                content: vec![crate::gateway::protocol::cir::Block::text("只回复两个字：你好")],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            stream: true,
+            reasoning: None,
+            metadata: Default::default(),
+            raw: serde_json::json!({}),
+        };
+        match channel.chat_stream(&account, &request, &client).await {
+            Ok(mut frames) => {
+                let mut text = String::new();
+                let mut seen = 0usize;
+                while let Some(frame) = frames.next().await {
+                    seen += 1;
+                    match frame {
+                        Ok(frame) => {
+                            for event in channel.parse_event(&frame) {
+                                match event {
+                                    CanonicalEvent::Text { text: chunk } => text.push_str(&chunk),
+                                    CanonicalEvent::Error { message } => {
+                                        panic!("上游 error 事件：{message}")
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(error) => panic!("帧失败：{}", error.describe()),
+                    }
+                    if text.chars().count() > 20 || seen > 300 {
+                        break;
+                    }
+                }
+                println!("=== chat 模型 {model} 帧数 {seen} ===");
+                println!("=== 正文 ===\n{text}");
+            }
+            Err(error) => println!("=== chat 失败 ===\n{}", error.describe()),
+        }
     }
 }
