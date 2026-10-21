@@ -140,6 +140,36 @@ fn omo_junior_regex() -> &'static regex::Regex {
     })
 }
 
+/// 首句之外残留的品牌词：`DeepSeek Harness`（含 `deepseek-harness` / `deepseek_harness`
+/// / 连续空白等变体）。
+///
+/// 参考实现 #562 的实测：DSH 0.2.1-rc.2 的 developer 提示里，除了首句
+/// `You are an AI agent powered by DeepSeek Harness.`（身份句正则已能洗）之外，
+/// 还有两句**不带 `powered by` 句式**的品牌表述：
+///
+/// ```text
+/// The runtime context names the DeepSeek Harness implementation checkout.
+/// You are interacting with the user through the DeepSeek Harness Web GUI ...
+/// ```
+///
+/// 这两句匹配不到身份句正则，却照样稳定触发 `11-128`
+/// （A/B：只留其一必拦，全部中性化成 `the runtime` 即 200）。
+///
+/// 作用域与身份句一致：**只在 system / developer 内生效**。user / assistant / tool
+/// 是用户数据，改了会让模型看到与磁盘不一致的内容（#537 因此收窄）。
+fn brand_regex() -> &'static regex::Regex {
+    static CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| {
+        // 连前面的冠词一起吃掉：替换值是 `the runtime`，否则会留下
+        // "names the the runtime implementation checkout" 这种叠词。
+        regex::Regex::new(r"(?i)(?:the[ \t]+)?deepseek[ \t_-]*harness")
+            .expect("品牌词正则是编译期常量，不会失败")
+    })
+}
+
+/// 品牌词的中性替换值：保留"这是个运行时"的语义，去掉品牌归属。
+const BRAND_NEUTRAL: &str = "the runtime";
+
 /// 计费头残片的 KV 串：`cc_xxx=yyy;`。
 fn cc_kv_regex() -> &'static regex::Regex {
     static CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -344,8 +374,13 @@ pub fn sanitize_text_with(text: &str, identity: bool) -> String {
     // ① 身份声明整句换中性写法（最先做：它吃掉整句后，后面的规则少扫一遍）。
     if identity {
         output = rewrite_identity_declarations(&output);
+        // ② 首句之外残留的品牌词（#562）：不带 `powered by` 句式，身份句正则认不出。
+        // 中性化而不是删除 —— 参考实现的 A/B 结论是整段抹掉反而更像异常客户端。
+        output = brand_regex()
+            .replace_all(&output, BRAND_NEUTRAL)
+            .into_owned();
     }
-    // ② OmO 框架指纹：改句式结构而不是删词（删词不解除匹配）。
+    // ③ OmO 框架指纹：改句式结构而不是删词（删词不解除匹配）。
     output = omo_junior_regex()
         .replace_all(&output, "Sisyphus-Junior (focused executor)")
         .into_owned();
@@ -440,6 +475,9 @@ pub fn has_fingerprint_with(text: &str, identity: bool) -> bool {
         // OmO 框架指纹与身份声明：正则匹配（字面量认不出各种变体）。
         || omo_junior_regex().is_match(text)
         || (identity && identity_prefix_regex().is_match(text))
+        // 残留品牌词（#562）：只含 `DeepSeek Harness` 而没有身份句式的文本
+        // 也必须进清洗分支 —— 否则这里的提前 return 会让它原样上行。
+        || (identity && brand_regex().is_match(text))
 }
 
 /// 工具配对自愈：合并相邻 assistant(tool_calls) → 按 call 重排 tool 结果 → 清孤儿。
@@ -755,6 +793,41 @@ mod tests {
         // user 内容原样保留。
         assert_eq!(sanitize_for_role(source, "user"), source);
         assert_eq!(sanitize_for_role(source, "tool"), source);
+    }
+
+    /// #562：首句之外的残留品牌词必须中性化 —— 并且必须被 `has_fingerprint`
+    /// 认出来，否则 `sanitize_text_with` 在开头就 return，整段原样上行（本次的坑）。
+    ///
+    /// 两句取自 DSH 0.2.1-rc.2 的 developer 提示（公开文本，不含对话内容）。
+    #[test]
+    fn residual_brand_words_are_neutralized_in_system_scope() {
+        for source in [
+            "The runtime context names the DeepSeek Harness implementation checkout.",
+            "You are interacting with the user through the DeepSeek Harness Web GUI.",
+        ] {
+            assert!(has_fingerprint(source), "品牌词必须算特征：{source}");
+            let cleaned = sanitize_for_role(source, "system");
+            assert!(
+                !cleaned.to_ascii_lowercase().contains("deepseek"),
+                "品牌词没洗掉：{cleaned}"
+            );
+            assert!(cleaned.contains(BRAND_NEUTRAL), "要中性化而不是删除：{cleaned}");
+            assert!(!has_fingerprint(&cleaned), "洗完不该再算特征：{cleaned}");
+        }
+
+        // 大小写与分隔符变体同样命中（上游按连续子串匹配）。
+        for variant in ["deepseek-harness", "DEEPSEEK_HARNESS", "DeepSeek   Harness"] {
+            let cleaned = sanitize_for_role(variant, "developer");
+            assert!(
+                !cleaned.to_ascii_lowercase().contains("harness"),
+                "{variant} → {cleaned}"
+            );
+        }
+
+        // 作用域：user / tool 是用户数据，原样保留。
+        let user_text = "The runtime context names the DeepSeek Harness implementation checkout.";
+        assert_eq!(sanitize_for_role(user_text, "user"), user_text);
+        assert_eq!(sanitize_for_role(user_text, "tool"), user_text);
     }
 
     /// OmO 框架指纹：必须**改句式结构**才算解除匹配（只删词不行）。
