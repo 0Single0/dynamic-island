@@ -260,6 +260,123 @@ const IDENTITY_REPLACEMENT: &str = "You are a helpful AI assistant.";
 /// 所以这里把 `- ` 结构改成括号式（语义不变，结构已不同）——
 /// 比只做大小写归一化可靠：后者对原样出现的串等于没改。
 const OMO_PHRASE: &str = "sisyphus-junior";
+
+/// 首句之外的残留品牌词（`11-128` 的新样本，参考实现 #562）。
+///
+/// 身份句正则只认 `You are ... powered by / built on ...` 这种**自我介绍句式**；
+/// 品牌词出现在别的句子里时它认不出来，而这类文本同样会被判「非官方渠道」。
+/// DSH 0.2.1-rc.2 的 developer 提示里就有两句：
+/// ```text
+/// The runtime context names the DeepSeek Harness implementation checkout.
+/// You are interacting with the user through the DeepSeek Harness Web GUI ...
+/// ```
+/// 两句单独发都能过，但**长系统提示里带上就稳定 400**（全量中性化后可 200）。
+///
+/// 只补这一条已确证的品牌词：参考实现 #537 明确说过，全量品牌名单的误伤面太大，
+/// 要等「有单独品牌词稳定触发的新样本」再按 system/developer 作用域加。
+const BRAND_NAME: &str = "deepseek";
+const BRAND_TAIL: &str = "harness";
+
+/// 品牌词中性化后的写法：保留「这是运行时」的语义，只去掉品牌归属。
+const BRAND_REPLACEMENT: &str = "the runtime";
+
+/// `text` 是否以 `word` 结尾，且它前面不是 ASCII 字母数字。
+///
+/// 少了这个边界判断，`breathe DeepSeek Harness` 会被误吞成 `breat` + 中性词。
+fn ends_with_whole_word(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    let word = word.as_bytes();
+    if bytes.len() < word.len() {
+        return false;
+    }
+    let split = bytes.len() - word.len();
+    let matches = bytes[split..]
+        .iter()
+        .zip(word)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right));
+    if !matches {
+        return false;
+    }
+    split == 0 || !bytes[split - 1].is_ascii_alphanumeric()
+}
+
+/// 在 `haystack` 里找 `needle` 的第一处 ASCII 大小写不敏感匹配。
+fn find_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&start| {
+        haystack[start..start + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
+}
+
+/// 从 `from` 起找 `deepseek[ \t_-]*harness`，返回 `(品牌名起点, 匹配终点)`。
+///
+/// 分隔符容许空格 / 制表符 / 连字符 / 下划线：上游按**连续子串**匹配，
+/// `deepseek-harness`、`DeepSeek_Harness`、`DeepSeek   Harness` 都要算命中。
+/// 逐字节比较且只做 ASCII 大小写折叠：UTF-8 续字节都 ≥ 0x80，
+/// 不会和 ASCII 撞上，所以中文夹在中间也不会切坏字符边界。
+fn find_brand_word_from(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let name = BRAND_NAME.as_bytes();
+    let tail = BRAND_TAIL.as_bytes();
+    let mut search = from;
+    while let Some(offset) = find_ascii_ignore_case(&bytes[search..], name) {
+        let start = search + offset;
+        let mut probe = start + name.len();
+        while probe < bytes.len() && matches!(bytes[probe], b' ' | b'\t' | b'_' | b'-') {
+            probe += 1;
+        }
+        let end = probe + tail.len();
+        if end <= bytes.len()
+            && bytes[probe..end]
+                .iter()
+                .zip(tail)
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return Some((start, end));
+        }
+        search = start + name.len();
+        if search >= bytes.len() {
+            return None;
+        }
+    }
+    None
+}
+
+/// 把残留品牌词中性化（只处理 system / developer 文本）。
+///
+/// 替换而不是删除：参考实现的 A/B 结论是整段抹掉反而更像异常客户端。
+/// 冠词 `the` 一并吃掉，否则会留下 `names the the runtime implementation checkout`。
+fn neutralize_brand_words(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut search = 0usize;
+    while let Some((found, end)) = find_brand_word_from(text, search) {
+        // 向前吞掉同属这个短语的冠词：`the[ \t]+` 紧邻品牌名才吃。
+        let head = &text[..found];
+        let trimmed = head.trim_end_matches([' ', '\t']);
+        let gap = head.len() - trimmed.len();
+        let start = if gap > 0 && ends_with_whole_word(trimmed, "the") {
+            trimmed.len() - "the".len()
+        } else {
+            found
+        };
+        if start < cursor {
+            search = end;
+            continue;
+        }
+        output.push_str(&text[cursor..start]);
+        output.push_str(BRAND_REPLACEMENT);
+        cursor = end;
+        search = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
 const OMO_TAIL: &str = "focused executor";
 const OMO_REPLACEMENT: &str = "Sisyphus-Junior (focused executor)";
 
@@ -392,8 +509,11 @@ pub fn sanitize_text_with(text: &str, identity: bool) -> String {
     // ① 身份声明整句换中性写法（最先做：它吃掉整句后，后面的规则少扫一遍）。
     if identity {
         output = rewrite_identity_declarations(&output);
+        // ② 首句之外残留的品牌词（#562）：不带 `powered by` 句式，身份句认不出。
+        // 中性化而不是删除 —— 参考实现的 A/B 结论是整段抹掉反而更像异常客户端。
+        output = neutralize_brand_words(&output);
     }
-    // ② OmO 框架指纹：改句式结构而不是删词（删词不解除匹配）。
+    // ③ OmO 框架指纹：改句式结构而不是删词（删词不解除匹配）。
     output = neutralize_omo_fingerprint(&output);
 
     // **计费头残片要整段删**（参考实现的 SANITIZE_HDR_RE + SANITIZE_KV_RE）：
@@ -482,6 +602,9 @@ pub fn has_fingerprint_with(text: &str, identity: bool) -> bool {
         // OmO 指纹与身份声明的变体太多，字面量认不出。
         || !find_all_ignore_case(text, OMO_PHRASE).is_empty()
         || (identity && IDENTITY_MARKERS.iter().any(|marker| !find_all_ignore_case(text, marker).is_empty()))
+        // 残留品牌词（#562）：只含 `DeepSeek Harness` 而没有身份句式的文本
+        // 也必须进清洗分支 —— 否则这里的提前 return 会让它原样上行。
+        || (identity && find_brand_word_from(text, 0).is_some())
 }
 
 /// 工具配对自愈：合并相邻 assistant(tool_calls) → 按 call 重排 tool 结果 → 清孤儿。
@@ -790,6 +913,69 @@ mod tests {
         );
         assert_eq!(sanitize_for_role(source, "user"), source, "user 内容不能改");
         assert_eq!(sanitize_for_role(source, "tool"), source);
+    }
+
+    /// #562：首句之外的残留品牌词必须中性化 —— 并且必须被 `has_fingerprint`
+    /// 认出来，否则 `sanitize_text_with` 在开头就 return，整段原样上行（本次的坑）。
+    ///
+    /// 两句取自 DSH 0.2.1-rc.2 的 developer 提示（公开文本，不含对话内容）。
+    #[test]
+    fn residual_brand_words_are_neutralized_in_system_scope() {
+        for source in [
+            "The runtime context names the DeepSeek Harness implementation checkout.",
+            "You are interacting with the user through the DeepSeek Harness Web GUI.",
+        ] {
+            assert!(has_fingerprint(source), "品牌词必须算特征：{source}");
+            let cleaned = sanitize_for_role(source, "system");
+            assert!(
+                !cleaned.to_lowercase().contains("deepseek"),
+                "品牌词没洗掉：{cleaned}"
+            );
+            assert!(
+                cleaned.contains(BRAND_REPLACEMENT),
+                "要中性化而不是删除：{cleaned}"
+            );
+            assert!(
+                !has_fingerprint(&cleaned),
+                "洗完不该再算特征：{cleaned}"
+            );
+        }
+
+        // 冠词一并吃掉，不能留下 `the the runtime`。
+        let cleaned = sanitize_for_role(
+            "The runtime context names the DeepSeek Harness implementation checkout.",
+            "system",
+        );
+        assert!(
+            !cleaned.contains("the the"),
+            "冠词不能叠：{cleaned}"
+        );
+
+        // 冠词判定必须有词边界：`breathe` 结尾的 `the` 不能被吞掉。
+        let boundary = sanitize_for_role("please breathe DeepSeek Harness", "system");
+        assert!(
+            boundary.contains("breathe the runtime"),
+            "不能吞掉单词内部的 the：{boundary}"
+        );
+
+        // 大小写与分隔符变体同样命中（上游按连续子串匹配）。
+        for variant in ["deepseek-harness", "DEEPSEEK_HARNESS", "DeepSeek   Harness"] {
+            let cleaned = sanitize_for_role(variant, "developer");
+            assert!(
+                !cleaned.to_lowercase().contains("harness"),
+                "{variant} → {cleaned}"
+            );
+        }
+
+        // 作用域：user / tool 是用户数据，原样保留。
+        let user_text = "The runtime context names the DeepSeek Harness implementation checkout.";
+        assert_eq!(sanitize_for_role(user_text, "user"), user_text);
+        assert_eq!(sanitize_for_role(user_text, "tool"), user_text);
+
+        // 只是提到 deepseek 而没有 harness（模型名）时不动 —— 避免误伤。
+        let model_only = "You are a coding agent powered by the deepseek-v4.1-flash model.";
+        let cleaned = sanitize_for_role(model_only, "system");
+        assert_eq!(cleaned, IDENTITY_REPLACEMENT, "这句走身份句替换");
     }
 
     /// OmO 框架指纹：必须**改句式结构**才算解除匹配（只删词不行）。
