@@ -49,3 +49,15 @@ export function clearDraft(key: string) {
 export function getActiveConversation() { load(); return active; }
 export function setActiveConversation(id: string) { load(); active = id; publish(); }
 export function subscribeDrafts(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; }
+
+const modelKey = "agent.selectedModel.v1";
+/** 记住上次使用的模型：重启应用 / 新建会话时恢复，而不是每次都跳回列表第一个。 */
+export function loadSelectedModel(): string {
+  try { return localStorage.getItem(modelKey) || ""; } catch { return ""; }
+}
+export function saveSelectedModel(modelId: string) {
+  try {
+    if (modelId) localStorage.setItem(modelKey, modelId);
+    else localStorage.removeItem(modelKey);
+  } catch { /* 记不住也不影响功能 */ }
+}

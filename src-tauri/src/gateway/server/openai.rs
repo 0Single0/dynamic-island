@@ -124,12 +124,13 @@ pub async fn list_models(
         .into_iter()
         .map(|id| {
             let routes = matrix.routes(&id);
+            // 元数据取信息量最大的一条候选（各候选的上游名/上限可能不同，取排序最优的）。
+            let best = routes.first();
             json!({
                 "id": id,
                 "object": "model",
                 "created": created,
-                "owned_by": routes
-                    .first()
+                "owned_by": best
                     .map(|route| route.channel_id.clone())
                     .unwrap_or_default(),
                 // 额外字段：这条模型能走哪些渠道（客户端会忽略，面板/脚本有用）。
@@ -138,6 +139,22 @@ pub async fn list_models(
                     .map(|route| route.channel_id.clone())
                     .collect::<Vec<_>>(),
                 "free": routes.iter().any(|route| route.is_free()),
+                // 元数据（OpenAI 官方字段之外的扩展，客户端会忽略）：
+                // 没有 /v1/models 端点的供应商（包括我们自己）不带这些时，
+                // 下游的"获取模型"就只能拿到名字，上下文/输出全部显示未知。
+                "context_length": best.and_then(|route| route.limits.context),
+                "max_output_tokens": best.and_then(|route| route.limits.max_output),
+                "capabilities": best
+                    .map(|route| json!({
+                        "vision": route.capabilities.vision,
+                        "tool_calls": route.capabilities.tool_calls,
+                        "reasoning": route.capabilities.reasoning,
+                    }))
+                    .unwrap_or(json!({})),
+                "reasoning_efforts": best.map(|route| route.reasoning_efforts.clone())
+                    .unwrap_or_default(),
+                "reasoning_default_effort": best.and_then(|route| route.reasoning_default_effort.clone()),
+                "always_reasoning": best.map(|route| route.always_reasoning).unwrap_or(false),
             })
         })
         .collect();

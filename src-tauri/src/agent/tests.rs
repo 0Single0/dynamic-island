@@ -665,6 +665,55 @@ async fn responses_and_anthropic_use_actual_transport_and_tool_context() {
     }
 }
 
+/// 回归：上游在 added 里给占位 call_id、done 里才换真 id 时，整条工具链
+/// 必须仍能走通（占位 id 建立的索引会被 done 的换 id 广播修正）。
+#[tokio::test]
+async fn responses_tool_call_survives_call_id_change_at_done() {
+    let adapter = ProviderAdapter::Responses;
+    let first = frame(
+        json!({"type":"response.output_item.added","output_index":0,"item":{"id":"fc_item","type":"function_call","call_id":"call_0","name":"netease_get_current_state","arguments":""}}),
+    ) + &frame(
+        json!({"type":"response.function_call_arguments.delta","item_id":"fc_item","delta":"{}"}),
+    ) + &frame(
+        json!({"type":"response.output_item.done","output_index":0,"item":{"id":"fc_item","type":"function_call","call_id":"call_real","name":"netease_get_current_state","arguments":"{}","status":"completed"}}),
+    ) + &frame(json!({"type":"response.completed"}));
+    let last = frame(json!({"type":"response.output_text.delta","output_index":0,"delta":"好了"}))
+        + &frame(json!({"type":"response.completed"}));
+    let mut server = Server::at("/responses", vec![(200, first), (200, last)], false);
+    let path = temporary_path();
+    let store = AgentStore::open(&path).unwrap();
+    let session = store.create_session("protocol").unwrap();
+    store.create_run("run", &session.id).unwrap();
+    let trace = DurableTrace {
+        store: &store,
+        app: None,
+        session_id: &session.id,
+        run_id: "run",
+    };
+    assert_eq!(
+        run_loop(
+            &trace,
+            &ReadTool,
+            &super::native_trace::ToolProvenance::new(),
+            || false,
+            &reqwest::Client::new(),
+            &adapter,
+            &server.endpoint,
+            "key",
+            request()
+        )
+        .await
+        .unwrap(),
+        "好了"
+    );
+    server.join();
+    // 第二次请求带的 function_call 必须用 done 修正后的真 id。
+    let captured = server.requests.lock().unwrap();
+    assert_eq!(captured[1]["input"][1]["call_id"], "call_real");
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[tokio::test]
 async fn signatures_are_not_replayed_across_models_or_endpoints() {
     let mut server = Server::new(

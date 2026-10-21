@@ -282,7 +282,22 @@ impl StreamDecoder {
                     }) = self.blocks.get_mut(&index)
                     {
                         if let Some(value) = item["call_id"].as_str() {
-                            *id = value.into();
+                            // 上游可能在收尾时才给/换 call_id（added 里是占位）。
+                            // 换 id 时补一个 ToolDelta 把新 id 广播出去，
+                            // 否则执行循环按旧 id 查不到块 → "工具块缺少关联事件"。
+                            if *id != value {
+                                *id = value.into();
+                                events.push(ModelStreamEvent::ToolDelta {
+                                    index,
+                                    id: Some(value.into()),
+                                    name: if name.is_empty() {
+                                        None
+                                    } else {
+                                        Some(name.clone())
+                                    },
+                                    arguments: String::new(),
+                                });
+                            }
                         }
                         if let Some(value) = item["name"].as_str() {
                             *name = value.into();

@@ -99,8 +99,10 @@ pub const SETTINGS_SECTION_EVENT: &str = "agent://settings-section";
 ///
 /// 设置中心是**独立普通窗口**：岛体窗口被钉死成 812×512 的透明无边框矩形
 /// （置顶、不可缩放、任务栏里没有），多栏表单挤进去只能靠压缩字号和行高，
-/// 而且打开设置必然卸载整个岛体。独立窗口有正常尺寸、进任务栏、会被别的窗口
-/// 盖住，岛体也不受影响。
+/// 而且打开设置必然卸载整个岛体。独立窗口有正常尺寸、进任务栏，岛体也不受影响。
+/// 岛体是 always-on-top 的，但它贴在屏幕顶部且透明区域点击穿透，
+/// 与居中的设置窗口互不重叠，因此设置窗口保持普通层级即可 ——
+/// 置顶会挡住其他应用的页面。
 ///
 /// 必须是 `async`：Windows 上同步命令跑在主线程，而 `WebviewWindowBuilder`
 /// 要等主线程消息循环来初始化 WebView2 —— 同步命令会把初始导航堵死在
@@ -124,7 +126,7 @@ pub async fn open_settings_window(app: AppHandle, section: Option<String>) -> Re
         Some(section) => format!("index.html#/settings?section={section}"),
         None => "index.html#/settings".to_owned(),
     };
-    tauri::WebviewWindowBuilder::new(
+    let window = tauri::WebviewWindowBuilder::new(
         &app,
         SETTINGS_WINDOW_LABEL,
         tauri::WebviewUrl::App(url.into()),
@@ -137,6 +139,7 @@ pub async fn open_settings_window(app: AppHandle, section: Option<String>) -> Re
     .center()
     .build()
     .map_err(|error| error.to_string())?;
+    let _ = window.set_focus();
     Ok(())
 }
 

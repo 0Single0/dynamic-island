@@ -121,7 +121,9 @@ impl Matrix {
         for catalog in catalogs {
             for model in &catalog.models {
                 // 即使实时目录里出现了内部模型，快照回落时也不该把它当聊天模型上架。
-                if !is_public_model(&model.id) {
+                // **例外**：用户显式声明的模型（自定义供应商的清单）就是要用的名字 ——
+                // 命名清洗是某个渠道家族的约定，不该把用户填的 `auto` 静默吞掉。
+                if !model.user_declared && !is_public_model(&model.id) {
                     continue;
                 }
                 let source = if catalog.live && !model.from_snapshot {
@@ -224,10 +226,24 @@ impl Matrix {
 
     /// 该候选是否满足请求的硬性要求；不满足时返回可读原因。
     pub fn reject_reason(route: &ModelRoute, requirements: &Requirements) -> Option<String> {
-        if requirements.vision && route.caps_known && !route.capabilities.vision {
+        // 与工具同理：`vision == false` 可能是"明确不支持"，也可能只是"没声明"。
+        if requirements.vision
+            && route.caps_known
+            && route.capabilities.declared_vision
+            && !route.capabilities.vision
+        {
             return Some("该渠道不支持图片输入".to_string());
         }
-        if requirements.tools && route.caps_known && !route.capabilities.tool_calls {
+        // 工具同理，而且这里**必须**看 `declared_tools`：
+        // `tool_calls == false` 既可能是"明确不支持"，也可能只是"目录没提"。
+        // 早先只看 `caps_known`（由 vision/reasoning 推导），于是 Trae 这种
+        // "有 vision、有 reasoning、但目录没写 tool_call"的渠道被判成
+        // 不支持工具调用，带 tools 的请求在本地 400，根本发不出去。
+        if requirements.tools
+            && route.caps_known
+            && route.capabilities.declared_tools
+            && !route.capabilities.tool_calls
+        {
             return Some("该渠道不支持工具调用".to_string());
         }
         if let Some(context) = route.limits.context {
@@ -248,12 +264,15 @@ fn is_public_model(id: &str) -> bool {
     crate::gateway::channels::is_chat_model(id)
 }
 
-/// 实时元数据里是否带了能力字段：没带就不能当成"不支持"。
+/// 实时元数据里是否带了**可信的能力字段**：没带就不能当成"不支持"。
+///
+/// 只看三个能力位，**不把"知道上下文长度"算作证据** —— 大量 OpenAI 兼容端点
+/// （中转站 / 本地推理）只返回 id 与 context_length，不带工具/图片能力位。
+/// 早先这里把 context_length 也算进来，于是这类供应商全部被判成
+/// "已知不支持图片、不支持工具"，带工具的请求在本地就被剔除，
+/// 表现为"接进来了却用不了"。
 fn has_capability_meta(model: &UpstreamModel) -> bool {
-    model.capabilities.vision
-        || model.capabilities.tool_calls
-        || model.capabilities.reasoning
-        || model.context_length.is_some()
+    model.capabilities.vision || model.capabilities.tool_calls || model.capabilities.reasoning
 }
 
 fn apply_overrides(routes: &mut HashMap<String, Vec<ModelRoute>>, overrides: &[RouteOverride]) {
@@ -325,6 +344,8 @@ mod tests {
                 vision: false,
                 tool_calls: true,
                 reasoning: true,
+                declared_tools: true,
+                declared_vision: true,
             },
             ..UpstreamModel::default()
         }
@@ -432,6 +453,81 @@ mod tests {
         assert!(Matrix::reject_reason(&strict, &Requirements::default()).is_none());
     }
 
+    /// **回归**：目录没写 tool_call、但写了 vision/reasoning 的渠道，
+    /// 不能被判成"不支持工具调用"。
+    ///
+    /// 这正是 Trae 的实况：它有 multimodal 与 reasoning，目录里却没有 tool_call 键。
+    /// 早先 `caps_known` 由 vision/reasoning 推导为 true，而 `tool_calls` 缺省回落 false，
+    /// 于是带 tools 的请求在本地就 400 了（`该渠道不支持工具调用`）。
+    #[test]
+    fn undeclared_tool_support_is_not_treated_as_unsupported() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "trae-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "deepseek-v4.1-flash".into(),
+                capabilities: ModelCapabilities {
+                    // 目录只声明了图片与思考，**没提工具**。
+                    vision: true,
+                    tool_calls: false,
+                    reasoning: true,
+                    declared_tools: false,
+                    declared_vision: true,
+                },
+                ..UpstreamModel::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &[]);
+        let route = &matrix.routes("deepseek-v4.1-flash")[0];
+        assert!(route.caps_known, "有 vision/reasoning 就说明能力元数据可信");
+        let requirements = Requirements {
+            vision: false,
+            tools: true,
+            context: 0,
+            max_output: None,
+        };
+        assert!(
+            Matrix::reject_reason(route, &requirements).is_none(),
+            "没声明工具能力 ≠ 不支持工具，必须放行"
+        );
+    }
+
+    /// 反过来：目录**明确**写了不支持工具时，仍然要过滤（别修过头）。
+    #[test]
+    fn explicitly_unsupported_tools_are_still_rejected() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "no-tools".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "m".into(),
+                capabilities: ModelCapabilities {
+                    vision: false,
+                    tool_calls: false,
+                    reasoning: true,
+                    declared_tools: true,
+                    declared_vision: true,
+                },
+                ..UpstreamModel::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &[]);
+        let route = &matrix.routes("m")[0];
+        let requirements = Requirements {
+            vision: false,
+            tools: true,
+            context: 0,
+            max_output: None,
+        };
+        let reason = Matrix::reject_reason(route, &requirements);
+        assert!(
+            reason.as_deref().is_some_and(|text| text.contains("工具")),
+            "明确声明不支持时必须过滤：{reason:?}"
+        );
+    }
     #[test]
     fn unknown_capabilities_do_not_reject_requests() {
         // 快照条目 caps_known=false：不能因为"未知"就拒绝带图片/工具的请求。
@@ -491,6 +587,67 @@ mod tests {
         assert!(matrix.routes("not-in-catalog").is_empty());
     }
 
+    /// 账号改名会自动补一条"对外名 → 本渠道"的路由覆盖。补出来的这条要能
+    /// 真的被请求到，且上游名指向我们映射的那个值（这正是 Trae 的场景）。
+    #[test]
+    fn rename_backed_route_is_requestable_and_points_at_the_upstream_name() {
+        // Trae 目录里只有官方拼写；我们想把对外的 deepseek-v4.1-flash 落到它上面。
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "trae-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "DeepSeek-V4-Flash-Official".into(),
+                ..UpstreamModel::default()
+            }],
+        }];
+        let overrides: Vec<RouteOverride> = serde_json::from_value(json!([{
+            "model": "deepseek-v4.1-flash",
+            "channel_id": "trae-cn",
+            "upstream_model": "DeepSeek-V4-Flash-Official",
+            "enabled": true
+        }]))
+        .expect("覆盖配置");
+
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &overrides);
+        let routes = matrix.routes("deepseek-v4.1-flash");
+        assert_eq!(routes.len(), 1, "补出来的路由必须能被请求到");
+        assert_eq!(routes[0].channel_id, "trae-cn");
+        assert_eq!(
+            routes[0].upstream_model, "DeepSeek-V4-Flash-Official",
+            "出站要用 Trae 的上游名"
+        );
+        assert_eq!(routes[0].source, RouteSource::Override);
+        // 上游原名的路由仍然在（改名不该把原模型下架）。
+        assert_eq!(matrix.routes("DeepSeek-V4-Flash-Official").len(), 1);
+    }
+
+    /// 上游名拼错（不在目录里）时不要凭空造路由 —— 后端用它做校验门。
+    #[test]
+    fn rename_to_a_name_outside_the_catalog_is_guarded_by_the_matrix() {
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "trae-cn".into(),
+            priority: 100,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "DeepSeek-V4-Flash-Official".into(),
+                ..UpstreamModel::default()
+            }],
+        }];
+        // 校验门在命令层（直接问渠道要目录）；这里确认矩阵本身不会替我们"猜"。
+        let overrides: Vec<RouteOverride> = serde_json::from_value(json!([{
+            "model": "deepseek-v4.1-flash",
+            "channel_id": "trae-cn"
+        }]))
+        .expect("覆盖配置");
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &overrides);
+        assert!(
+            matrix.routes("deepseek-v4.1-flash").is_empty(),
+            "没给 upstream_model 的覆盖不能创造候选"
+        );
+    }
     #[test]
     fn internal_models_never_reach_the_matrix() {
         let catalogs = vec![ChannelCatalog {
@@ -502,5 +659,99 @@ mod tests {
         }];
         let matrix = Matrix::build(&catalogs, &HashMap::new(), &[]);
         assert_eq!(matrix.route_count(), 0);
+    }
+
+    #[test]
+    fn user_declared_model_names_survive_the_family_cleanup() {
+        // 自定义供应商里用户填的模型就叫 `auto`：命名清洗是渠道家族的约定，
+        // 不该把用户显式声明的名字静默吞掉（否则"加了模型却一个都没有"）。
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "my-provider".into(),
+            priority: 1,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "auto".into(),
+                user_declared: true,
+                ..UpstreamModel::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &[]);
+        assert_eq!(matrix.route_count(), 1);
+        assert_eq!(matrix.routes("auto").len(), 1);
+    }
+
+    #[test]
+    fn context_length_alone_does_not_prove_capabilities_are_known() {
+        // 只给了上下文长度、没给能力位（大量 OpenAI 兼容端点的实况）：
+        // 必须按"未知"处理并乐观放行，而不是判成"不支持工具/图片"。
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "my-provider".into(),
+            priority: 1,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "gpt-x".into(),
+                context_length: Some(128_000),
+                user_declared: true,
+                ..UpstreamModel::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &[]);
+        let route = &matrix.routes("gpt-x")[0];
+        assert!(!route.caps_known, "只有长度不足以证明能力位可信");
+        assert!(Matrix::reject_reason(
+            route,
+            &Requirements {
+                vision: true,
+                tools: true,
+                context: 1,
+                max_output: None,
+            },
+        )
+        .is_none());
+
+        // 反过来：显式声明了能力位，就按它过滤（用户说了不支持图片就别发图片）。
+        let catalogs = vec![ChannelCatalog {
+            channel_id: "my-provider".into(),
+            priority: 1,
+            weight: 1,
+            live: true,
+            models: vec![UpstreamModel {
+                id: "gpt-x".into(),
+                capabilities: ModelCapabilities {
+                    vision: false,
+                    tool_calls: true,
+                    reasoning: false,
+                    declared_tools: true,
+                    declared_vision: true,
+                },
+                user_declared: true,
+                ..UpstreamModel::default()
+            }],
+        }];
+        let matrix = Matrix::build(&catalogs, &HashMap::new(), &[]);
+        let route = &matrix.routes("gpt-x")[0];
+        assert!(route.caps_known);
+        assert!(Matrix::reject_reason(
+            route,
+            &Requirements {
+                vision: true,
+                tools: false,
+                context: 0,
+                max_output: None,
+            },
+        )
+        .is_some());
+        assert!(Matrix::reject_reason(
+            route,
+            &Requirements {
+                vision: false,
+                tools: true,
+                context: 0,
+                max_output: None,
+            },
+        )
+        .is_none());
     }
 }

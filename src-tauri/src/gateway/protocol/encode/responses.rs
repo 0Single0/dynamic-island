@@ -249,22 +249,42 @@ impl StreamEncoder {
             }
             CanonicalEvent::ToolCall {
                 index,
+                id,
                 name,
                 arguments_delta,
-                ..
             } => {
-                let (item_id, output_index) = match self.tool_items.get(index) {
-                    Some(entry) => entry.clone(),
+                // call_id 必须全流一致：`output_item.added` 里就定下来，
+                // 收尾的 `output_item.done` 与 `response.completed` 复用同一个值。
+                // 之前 added 发 `call_{index}` 占位、done 才换成上游真 id，
+                // 客户端（本仓库 agent 的 StreamDecoder 等）按 added 的 id
+                // 建立索引，done 换 id 后找不到关联事件 → "工具块缺少关联事件"。
+                let (item_id, output_index, call_id) = match self.tool_items.get(index) {
+                    Some(entry) => {
+                        let (item_id, output_index) = entry.clone();
+                        let call_id = self
+                            .state
+                            .tool_calls
+                            .get(index)
+                            .and_then(|call| call.id.clone())
+                            .unwrap_or_else(|| format!("call_{index}"));
+                        (item_id, output_index, call_id)
+                    }
                     None => {
                         let output_index = self.next_index();
                         let item_id = format!("fc_{}_{index}", self.response_id);
+                        let call_id = id
+                            .clone()
+                            .or_else(|| {
+                                self.state.tool_calls.get(index).and_then(|call| call.id.clone())
+                            })
+                            .unwrap_or_else(|| format!("call_{index}"));
                         self.tool_items
                             .insert(*index, (item_id.clone(), output_index));
                         let mut frames = vec![event_frame(
                             "response.output_item.added",
                             &json!({ "type": "response.output_item.added", "output_index": output_index,
                                      "item": { "type": "function_call", "id": item_id,
-                                               "call_id": format!("call_{index}"),
+                                               "call_id": call_id,
                                                "name": name.clone().unwrap_or_default(),
                                                "arguments": "", "status": "in_progress" } }),
                         )];
@@ -536,6 +556,36 @@ mod tests {
         assert!(out.contains("response.function_call_arguments.delta"), "{out}");
         // 两个分片要在最终 item 里拼成一个完整 JSON。
         assert!(out.contains("{\\\"city\\\":\\\"上海\\\"}"), "{out}");
+    }
+
+    /// 回归：call_id 必须全流一致。added 里发占位 `call_0`、done 里才换成
+    /// 上游真 id 的话，客户端按 added 的 id 索引工具块，done 换 id 后
+    /// 找不到关联事件（agent 报"工具块缺少关联事件"）。
+    #[test]
+    fn tool_call_id_is_identical_in_added_and_done() {
+        let mut encoder = StreamEncoder::new("resp_6", "glm-5.3", 0, 0);
+        let mut out = text_of(&encoder.push(&CanonicalEvent::ToolCall {
+            index: 0,
+            id: Some("call_714038bbf06a4438b248c2b6".into()),
+            name: Some("files__list".into()),
+            arguments_delta: Some("{\"path\":\\\"D:\\\\code\\\"}".into()),
+        }));
+        out.push_str(&text_of(&encoder.push(&CanonicalEvent::ToolCall {
+            index: 0,
+            id: None,
+            name: None,
+            arguments_delta: None,
+        })));
+        out.push_str(&text_of(&encoder.finish("tool_calls")));
+
+        assert!(out.contains("\"call_id\":\"call_714038bbf06a4438b248c2b6\""), "{out}");
+        assert!(!out.contains("\"call_id\":\"call_0\""), "占位 id 泄漏进流：{out}");
+        // added 与 done 里的 call_id 必须是同一个值。
+        let added = out.split("response.output_item.done").next().unwrap_or("");
+        assert!(
+            added.contains("call_714038bbf06a4438b248c2b6"),
+            "added 帧没带真实 call_id：{added}"
+        );
     }
 
     #[test]

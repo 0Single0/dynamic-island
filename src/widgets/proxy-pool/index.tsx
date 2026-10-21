@@ -16,6 +16,8 @@ import {
   type ModelChip,
 } from "./shared";
 import { AddAccountDialog } from "./AddAccountDialog";
+import { CustomProviderDialog } from "./CustomProviderDialog";
+import { EditAccountDialog } from "./EditAccountDialog";
 import { accountCell, accountColumns } from "./accounts";
 import { RequestLogView, SettingsView, UsageView } from "./views";
 
@@ -116,12 +118,33 @@ export function ProxyPoolExpanded() {
 
 
 /**
+ * 展示一个上限值，并区分**两种"没有值"**：
+ * · `snapshot` 来源（这次没拉到实时目录）→ 显示 `?`，可点刷新重试；
+ * · `live` / `override` 却没值 → 显示 `—`，是上游确实没提供。
+ *
+ * 以前两者都显示 `?`，用户分不清"该重试"还是"上游就是不给"。
+ */
+function formatLimit(value: number | null, source: ModelChip["source"]): string {
+  if (value !== null && value > 0) return formatTokens(value);
+  return source === "builtin" ? "?" : "—";
+}
+
+function missingHint(model: ModelChip, field: "context" | "output"): string {
+  const has = field === "context" ? model.context_length : model.max_output_tokens;
+  if (has !== null && has > 0) {
+    return field === "context" ? "上游声明的上下文上限" : "上游声明的单次输出上限";
+  }
+  if (model.source === "builtin") {
+    return "这次没拉到实时模型目录（已回落内置快照），点右上角「刷新」重试";
+  }
+  return "上游的模型目录里没有这个字段";
+}
+
+/**
  * 模型卡片：点一下复制模型名；下面两行是**这个模型怎么用**——
  * 倍率、上下文/输出上限、能力徽标（图片/工具/思考）、思考档位与默认档。
- */
-/**
- * 模型卡。`limit` 来自该**账号**的模型级限流（上游按模型限额时只停这个模型）——
- * 标在卡片上，一眼能看出"不是号废了，是这个模型在等"。
+ *
+ * `limit` 来自该**账号**的模型级限流（上游按模型限额时只停这个模型）。
  */
 function ModelCard({ model, limit }: { model: ModelChip; limit?: { until_ms: number } }) {
   const limited = limit !== undefined && limit.until_ms > Date.now();
@@ -160,15 +183,27 @@ function ModelCard({ model, limit }: { model: ModelChip; limit?: { until_ms: num
         )}
         <span
           className={`shrink-0 text-[9px] ${model.free ? "text-emerald-300" : "text-zinc-500"}`}
+          title={
+            model.free
+              ? "上游标记为免费"
+              : model.credits
+                ? `当前账号的实际扣费倍率 ${model.credits}（已含补贴/折扣）`
+                : "上游没有给这个模型返回计费倍率"
+          }
         >
           {model.free ? "免费" : (model.credits ?? "—")}
         </span>
       </span>
 
       <span className="flex flex-wrap items-center gap-1 text-[9px] text-zinc-500">
-        <span>上下文 {model.context_length ? formatTokens(model.context_length) : "?"}</span>
+        {/* `?` = 这次没拉到（可点刷新重试）；`—` = 上游确实没提供这个字段。 */}
+        <span title={missingHint(model, "context")}>
+          上下文 {formatLimit(model.context_length, model.source)}
+        </span>
         <span className="text-zinc-700">·</span>
-        <span>输出 {model.max_output_tokens ? formatTokens(model.max_output_tokens) : "?"}</span>
+        <span title={missingHint(model, "output")}>
+          输出 {formatLimit(model.max_output_tokens, model.source)}
+        </span>
         {badges.map((badge) => (
           <span key={badge} className="rounded bg-white/8 px-1 text-zinc-300">
             {badge}
@@ -297,10 +332,18 @@ function AccountsView({
   accounts: GatewayAccount[];
   onChange: () => void;
 }) {
-  const models = useChannelModels();
+  const { models, publicNames } = useChannelModels();
   // 列宽随账号昵称长度变化，表头与数据行共用这一份（所以永远对齐）。
   const columns = accountColumns(accounts);
   const [adding, setAdding] = useState(false);
+  /**
+   * 「自定义供应商」弹窗：`false` 关闭，`{}` 新建，带 channelId 的是在改已有渠道。
+   * 用 null 之外的独立状态是为了让"新建"和"编辑"共用同一个弹窗。
+   */
+  const [customProvider, setCustomProvider] = useState<
+    | false
+    | { channelId?: string; displayName?: string; options?: unknown; priority?: number }
+  >(false);
   // 额度刷新已移到后端常驻定时任务（gateway/ops.rs）：不依赖面板打开、
   // 也不依赖停在哪个页面 —— 早期放在这里时，用网关跑对话积分变了界面也不刷新。
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -308,9 +351,13 @@ function AccountsView({
   const [taskAccount, setTaskAccount] = useState<string | null>(null);
   /** 展开探针面板的账号 uid。 */
   const [probeAccount, setProbeAccount] = useState<string | null>(null);
+  /** 正在编辑的账号 key（`channel_id/uid`），null = 未开弹窗。 */
+  const [editingAccount, setEditingAccount] = useState<string | null>(null);
 
   const channelName = (id: string) =>
     channels.find((channel) => channel.id === id)?.display_name || id;
+  const channelAdapter = (id: string) =>
+    channels.find((channel) => channel.id === id)?.adapter ?? "";
 
   return (
     <div className="flex h-full flex-col">
@@ -350,6 +397,17 @@ function AccountsView({
         >
           <Play className="h-3.5 w-3.5" />
           全部执行
+        </button>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setCustomProvider({});
+          }}
+          className="flex items-center gap-1 rounded-md bg-violet-400/15 px-2.5 py-1 text-[11px] text-violet-200 hover:bg-violet-400/25"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          自定义供应商
         </button>
         <button
           type="button"
@@ -407,6 +465,7 @@ function AccountsView({
                       {accountCell(account, column.key, {
                         support,
                         channelName: channelName(account.channel_id),
+                        channelAdapter: channelAdapter(account.channel_id),
                         expanded: expanded === account.uid,
                         tasks: taskAccount === account.uid,
                         probe: probeAccount === account.uid,
@@ -416,6 +475,7 @@ function AccountsView({
                           setTaskAccount(taskAccount === account.uid ? null : account.uid),
                         onToggleProbe: () =>
                           setProbeAccount(probeAccount === account.uid ? null : account.uid),
+                        onEdit: () => setEditingAccount(`${account.channel_id}/${account.uid}`),
                         onChange,
                       })}
                     </span>
@@ -457,6 +517,43 @@ function AccountsView({
           onAdded={onChange}
         />
       )}
+
+      {customProvider !== false && (
+        <CustomProviderDialog
+          editing={
+            customProvider.channelId
+              ? {
+                  channelId: customProvider.channelId,
+                  displayName: customProvider.displayName ?? "",
+                  options: customProvider.options,
+                  priority: customProvider.priority ?? 100,
+                }
+              : undefined
+          }
+          onClose={() => setCustomProvider(false)}
+          onSaved={onChange}
+        />
+      )}
+
+      {/* 编辑账号：账号可能被轮询刷新掉（被删/停用），所以按 key 现查，
+          查不到就自动关掉 —— 别让弹窗停在一个已经不存在的东西上。 */}
+      {(() => {
+        if (!editingAccount) return null;
+        const account = accounts.find(
+          (entry) => `${entry.channel_id}/${entry.uid}` === editingAccount,
+        );
+        if (!account) return null;
+        return (
+          <EditAccountDialog
+            account={account}
+            channel={channels.find((entry) => entry.id === account.channel_id)}
+            models={models[account.channel_id] ?? []}
+            publicNames={publicNames}
+            onClose={() => setEditingAccount(null)}
+            onSaved={onChange}
+          />
+        );
+      })()}
     </div>
   );
 }

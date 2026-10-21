@@ -178,6 +178,9 @@ impl ChannelAdapter for FakeChannel {
                     vision: false,
                     tool_calls: true,
                     reasoning: true,
+                    // 假渠道的能力位是写死的，算"已声明"。
+                    declared_tools: true,
+                    declared_vision: true,
                 },
                 reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
                 reasoning_default_effort: Some("high".into()),

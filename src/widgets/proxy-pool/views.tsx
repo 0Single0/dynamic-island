@@ -2,7 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import * as api from "@/api/gateway";
 import type { GatewayChannel, GatewayStatus, GatewayUsageRow } from "@/api/gateway";
 import { toast } from "@/utils/toast";
-import { formatTokens } from "./shared";
+import { errorText, formatTokens } from "./shared";
+import { CustomProviderDialog } from "./CustomProviderDialog";
 
 // 用量视图独立成文件（图多、结构不同），这里只做转发。
 export { UsageView } from "./usage";
@@ -265,6 +266,8 @@ export function SettingsView({
 }) {
   const [paths, setPaths] = useState<{ data_dir: string; database: string } | null>(null);
   const [keyInput, setKeyInput] = useState("");
+  /** 正在编辑的自定义供应商（null = 未开弹窗）。 */
+  const [editing, setEditing] = useState<GatewayChannel | null>(null);
 
   useEffect(() => {
     void api
@@ -278,34 +281,74 @@ export function SettingsView({
       <Panel title="渠道">
         {channels.length === 0 && <div className="text-[10px] text-zinc-600">没有配置渠道</div>}
         <div className="flex flex-col gap-1">
-          {channels.map((channel) => (
-            <div key={channel.id} className="flex items-center gap-2 text-[11px]">
-              <span
-                className={`h-1.5 w-1.5 rounded-full ${
-                  channel.enabled ? "bg-emerald-400" : "bg-zinc-500"
-                }`}
-              />
-              <span className="min-w-0 flex-[1.2] truncate text-zinc-200">
-                {channel.display_name || channel.id}
-              </span>
-              <span className="w-20 shrink-0 text-[10px] text-zinc-500">{channel.adapter}</span>
-              <span className="w-24 shrink-0 text-[10px] text-zinc-500">
-                账号 {channel.accounts} · 可用 {channel.ready}
-              </span>
-              <button
-                type="button"
-                onClick={async (event) => {
-                  event.stopPropagation();
-                  await api.updateChannel({ channelId: channel.id, enabled: !channel.enabled });
-                  toast.success(channel.enabled ? `已停用 ${channel.id}` : `已启用 ${channel.id}`);
-                  onChange();
-                }}
-                className="ml-auto shrink-0 rounded-md bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/16"
-              >
-                {channel.enabled ? "停用" : "启用"}
-              </button>
-            </div>
-          ))}
+          {channels.map((channel) => {
+            // 自定义供应商可以改地址/密钥/模型，也能删掉（连账号）；内置渠道只能启停。
+            const custom = channel.adapter === "custom";
+            return (
+              <div key={channel.id} className="flex items-center gap-2 text-[11px]">
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    channel.enabled ? "bg-emerald-400" : "bg-zinc-500"
+                  }`}
+                />
+                <span className="min-w-0 flex-[1.2] truncate text-zinc-200">
+                  {channel.display_name || channel.id}
+                </span>
+                <span className="w-20 shrink-0 text-[10px] text-zinc-500">
+                  {custom ? "自定义" : channel.adapter}
+                </span>
+                <span className="w-24 shrink-0 text-[10px] text-zinc-500">
+                  账号 {channel.accounts} · 可用 {channel.ready}
+                </span>
+                <span className="ml-auto flex shrink-0 items-center gap-1">
+                  {custom && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setEditing(channel);
+                      }}
+                      className="rounded-md bg-white/10 px-2 py-0.5 text-[10px] text-zinc-200 hover:bg-white/16"
+                    >
+                      编辑
+                    </button>
+                  )}
+                  {custom && (
+                    <button
+                      type="button"
+                      onClick={async (event) => {
+                        event.stopPropagation();
+                        try {
+                          const result = await api.deleteChannel(channel.id);
+                          toast.success(
+                            `已删除 ${channel.display_name || channel.id}（含 ${result.removed_accounts} 个账号）`,
+                          );
+                          onChange();
+                        } catch (reason) {
+                          toast.error(errorText(reason, "删除失败"));
+                        }
+                      }}
+                      className="rounded-md bg-rose-400/15 px-2 py-0.5 text-[10px] text-rose-200 hover:bg-rose-400/25"
+                    >
+                      删除
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={async (event) => {
+                      event.stopPropagation();
+                      await api.updateChannel({ channelId: channel.id, enabled: !channel.enabled });
+                      toast.success(channel.enabled ? `已停用 ${channel.id}` : `已启用 ${channel.id}`);
+                      onChange();
+                    }}
+                    className="rounded-md bg-white/10 px-2 py-0.5 text-[10px] hover:bg-white/16"
+                  >
+                    {channel.enabled ? "停用" : "启用"}
+                  </button>
+                </span>
+              </div>
+            );
+          })}
         </div>
       </Panel>
 
@@ -506,6 +549,19 @@ export function SettingsView({
         <div className="font-mono text-[10px] text-zinc-500">{paths?.data_dir ?? "-"}</div>
         <div className="font-mono text-[10px] text-zinc-500">{paths?.database ?? "-"}</div>
       </Panel>
+
+      {editing && (
+        <CustomProviderDialog
+          editing={{
+            channelId: editing.id,
+            displayName: editing.display_name || editing.id,
+            options: editing.options,
+            priority: editing.priority,
+          }}
+          onClose={() => setEditing(null)}
+          onSaved={onChange}
+        />
+      )}
     </div>
   );
 }

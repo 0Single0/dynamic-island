@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Usage Statistics",
+    "description": "Token consumption per channel and model, cache hit rate, and a daily usage trend read from the durable session log."
+  }
+}

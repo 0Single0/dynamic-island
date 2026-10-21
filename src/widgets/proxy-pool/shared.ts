@@ -17,11 +17,27 @@ export interface ModelChip {
   reasoning_default_effort: string | null;
   reasoning_can_disable: boolean | null;
   always_reasoning: boolean;
+  /**
+   * 这条路由的元数据来源。
+   *
+   * 面板要用它区分两种"没有值"：
+   * · `live` / `override` 却没值 → **上游确实没提供**（显示 "—"）；
+   * · `builtin`（拉取失败回落）没值 → **这次没拉到**（显示 "?"，可点刷新重试）。
+   * 以前两者都显示 "?"，用户根本不知道是"该重试"还是"上游就是不给"。
+   */
+  source: "live" | "builtin" | "override";
 }
 
 /** 渠道 → 可用模型（含倍率）。从矩阵按渠道反向索引："这个渠道能用哪些模型、各自多少倍率"。 */
+/**
+ * 渠道 → 可用模型，外加一份**全局对外模型名**。
+ *
+ * 全局那份是给「账号改名」用的：要把 Trae 的上游名映射成 `deepseek-v4.1-flash`，
+ * 这个名字往往**不在该渠道自己的目录里**（它属于别的渠道），只能从全局清单里选。
+ */
 export function useChannelModels() {
   const [map, setMap] = useState<Record<string, ModelChip[]>>({});
+  const [publicNames, setPublicNames] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     try {
@@ -45,11 +61,13 @@ export function useChannelModels() {
               reasoning_default_effort: route.reasoning_default_effort,
               reasoning_can_disable: route.reasoning_can_disable,
               always_reasoning: route.always_reasoning,
+              source: route.source,
             });
           }
         }
       }
       setMap(next);
+      setPublicNames(data.models.map((entry) => entry.model).sort());
     } catch {
       /* 浏览器预览模式忽略 */
     }
@@ -61,7 +79,7 @@ export function useChannelModels() {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  return map;
+  return { models: map, publicNames };
 }
 
 /**

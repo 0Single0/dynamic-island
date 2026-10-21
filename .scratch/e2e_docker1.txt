@@ -1,0 +1,84 @@
+event: response.created
+data: {"response":{"created_at":1792123177,"id":"resp_a3d2c966246345b19c35e5b9bfba6383","model":"glm-5.3-flash","object":"response","output":[],"status":"in_progress"},"type":"response.created"}
+
+event: response.in_progress
+data: {"response":{"created_at":1792123177,"id":"resp_a3d2c966246345b19c35e5b9bfba6383","model":"glm-5.3-flash","object":"response","output":[],"status":"in_progress"},"type":"response.in_progress"}
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call_42da4192460941bcb1072338","id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","name":"files__search","status":"in_progress","type":"function_call"},"output_index":0,"type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"path","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\":\"","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"D","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":":\\\\","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"work","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"b","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"uddy","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"2","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"api","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"-h","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"ub","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"-main","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\"","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":",\"","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"pattern","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\":\"","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"(?","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"i","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":")^","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"dockerfile\"","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"}","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.done
+data: {"arguments":"{\"path\":\"D:\\\\workbuddy2api-hub-main\",\"pattern\":\"(?i)^dockerfile\"}","item_id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","output_index":0,"type":"response.function_call_arguments.done"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"path\":\"D:\\\\workbuddy2api-hub-main\",\"pattern\":\"(?i)^dockerfile\"}","call_id":"call_42da4192460941bcb1072338","id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","name":"files__search","status":"completed","type":"function_call"},"output_index":0,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"created_at":1792123177,"id":"resp_a3d2c966246345b19c35e5b9bfba6383","model":"glm-5.3-flash","object":"response","output":[{"arguments":"{\"path\":\"D:\\\\workbuddy2api-hub-main\",\"pattern\":\"(?i)^dockerfile\"}","call_id":"call_42da4192460941bcb1072338","id":"fc_resp_a3d2c966246345b19c35e5b9bfba6383_0","name":"files__search","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":491,"input_tokens_details":{"cached_tokens":0},"output_tokens":32,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":523}},"type":"response.completed"}
+

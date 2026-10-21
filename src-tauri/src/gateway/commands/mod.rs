@@ -2,6 +2,15 @@
 //!
 //! 与 HTTP 面共用同一份 `SharedGateway`：面板免鉴权、免 CORS，也不依赖 HTTP 服务是否在跑。
 //! 命令只做参数校验与转发，业务都在 `core` / `state` 里。
+//!
+//! 自定义供应商（渠道增删 + 「获取模型」）单独放 `providers`：那一块是**写配置**的完整流程，
+//! 与这里"读状态"的命令不是一类。
+
+mod providers;
+
+// 必须 glob 重导出：Tauri 的 `#[tauri::command]` 还会生成 `__cmd__*` 辅助项，
+// 逐项 `pub use` 不会把它们带出来，`generate_handler!` 就找不到命令。
+pub use providers::*;
 
 use serde_json::{json, Value};
 use tauri::State;
@@ -146,6 +155,14 @@ pub async fn gateway_list_channels(state: State<'_, SharedGateway>) -> Result<Va
                 "options": entry.map(|entry| entry.options.clone()).unwrap_or(Value::Null),
                 "accounts": accounts.len(),
                 "ready": accounts.iter().filter(|account| account.is_ready("", now)).count(),
+                // 面板据此决定「添加账号」是走轮询还是走**粘贴回调**。
+                // Trae 的授权回调被上游强制成 127.0.0.1:8765，网关没有那个
+                // 监听端口，只能让用户把地址栏整条 URL 交回来。缺了这个字段，
+                // 前端会退化成轮询，于是永远只显示"正在等待授权…"。
+                "login_needs_callback": channel.login_needs_callback(),
+                // 有没有真正的授权页：false = login_url 只是一行填写说明（CodeArts），
+                // 面板不能拿它去 openUrl。
+                "login_has_auth_page": channel.login_has_auth_page(),
             })
         })
         .collect();
@@ -211,6 +228,70 @@ pub async fn gateway_login_start(
     Ok(json!({ "state": ticket.state, "auth_url": ticket.auth_url }))
 }
 
+/// 完成一次「需要粘贴回调地址」的登录（Trae 这类渠道）。
+///
+/// 返回值与 `gateway_login_poll` 的成功分支同形，前端可以复用同一段入库提示。
+#[tauri::command]
+pub async fn gateway_login_complete(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    callback: String,
+) -> Result<Value, String> {
+    if callback.trim().is_empty() {
+        return Err("请粘贴授权完成后浏览器地址栏里的完整 URL".into());
+    }
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    let credential = adapter
+        .login_complete(&state.client, callback.trim())
+        .await
+        .map_err(message)?;
+    let uid = credential
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| "上游没有返回账号标识（JWT sub）".to_string())?;
+    let nickname = credential
+        .nickname
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| uid.chars().take(8).collect());
+    state
+        .storage
+        .upsert_account(&AccountRecord {
+            channel_id: channel_id.clone(),
+            uid: uid.clone(),
+            nickname: nickname.clone(),
+            enabled: true,
+            priority_override: None,
+            weight_override: None,
+            max_inflight: None,
+            proxy_slot: None,
+            added_at: now_ms(),
+            source: "oauth".into(),
+            credential: Some(credential),
+            model_allow: Vec::new(),
+            model_rename: std::collections::BTreeMap::new(),
+        })
+        .map_err(message)?;
+    let count = state.reload_accounts().map_err(message)?;
+    // 新号顺手签一次到、抓一次额度；失败都不影响可用性。
+    if let Some(account) = state.account(&channel_id, &uid) {
+        let snapshot = account.snapshot();
+        let _ = adapter.sign_in(&state.client, &snapshot).await;
+        if let Ok(quota) = adapter.fetch_quota(&state.client, &snapshot).await {
+            account.set_quota(quota);
+        }
+    }
+    let _ = state.ensure_matrix(true).await;
+    Ok(json!({
+        "status": "ok",
+        "account": { "channel_id": channel_id, "uid": uid, "nickname": nickname },
+        "accounts": count,
+    }))
+}
+
 /// 轮询登录结果；成功后落库并进池。
 #[tauri::command]
 pub async fn gateway_login_poll(
@@ -251,6 +332,8 @@ pub async fn gateway_login_poll(
                     added_at: now_ms(),
                     source: "oauth".into(),
                     credential: Some((*credential).clone()),
+                    model_allow: Vec::new(),
+                    model_rename: std::collections::BTreeMap::new(),
                 })
                 .map_err(message)?;
             let count = state.reload_accounts().map_err(message)?;
@@ -313,6 +396,209 @@ pub async fn gateway_set_account_max_inflight(
     Ok(json!({ "ok": true, "max_inflight": account.max_inflight() }))
 }
 
+/// 改账号的**可变画像**：昵称 / 优先级 / 权重（面板「编辑账号」）。
+///
+/// 四个字段都是**可选覆盖**，与后端的 `None` 语义一致：
+/// · `nickname` 省略 = 不动；空串 = 清空（面板回落到 uid 前 8 位）；
+/// · `priority / weight / max_inflight` 省略或 null = 清掉覆盖、回落默认。
+///
+/// 刻意不碰凭据、额度与冷却 —— 「编辑账号」不该有"顺手把登录态弄丢"的副作用。
+#[tauri::command]
+pub async fn gateway_set_account_profile(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    nickname: Option<String>,
+    priority: Option<u32>,
+    weight: Option<u32>,
+    max_inflight: Option<u32>,
+) -> Result<Value, String> {
+    if state.account(&channel_id, &uid).is_none() {
+        return Err(format!("账号 {channel_id}/{uid} 不存在"));
+    }
+    // 昵称清洗：去首尾空白；超长会顶坏面板的固定列宽，截到 40 个字符。
+    // **空串是有意义的**（= 清空，视图回落到 uid 前 8 位），所以不能把它折成 None：
+    // None 在这里表示"别动昵称"。
+    let nickname = nickname.map(|value| value.trim().chars().take(40).collect::<String>());
+    let changed = state
+        .storage
+        .set_account_profile(
+            &channel_id,
+            &uid,
+            nickname.as_deref(),
+            priority,
+            weight,
+            max_inflight,
+        )
+        .map_err(message)?;
+    state.reload_accounts().map_err(message)?;
+    // 回带**生效值**，面板据此刷新那一行（而不是让前端自己再猜一次回落规则）。
+    let account = state.account(&channel_id, &uid);
+    Ok(json!({
+        "ok": changed,
+        "nickname": account.as_ref().map(|account| account.nickname.clone()).unwrap_or_default(),
+        "priority": account.as_ref().map(|account| account.priority).unwrap_or_default(),
+        "weight": account.as_ref().map(|account| account.weight).unwrap_or_default(),
+        "max_inflight": account.as_ref().map(|account| account.max_inflight()).unwrap_or_default(),
+    }))
+}
+
+/// 改账号的模型清单：白名单（空 = 不限）+ 账号级模型改名。
+///
+/// 白名单语义是"这个号**只**服务这些对外模型名"，空列表 = 该渠道有什么就能跑什么。
+/// 改名解决的是同名不同姓：Trae 把 `deepseek-v4.1-flash` 叫 `DeepSeek-V4-Flash-Official`，
+/// 配上 `{ "deepseek-v4.1-flash": "DeepSeek-V4-Flash-Official" }` 之后，
+/// 对外仍然是统一的 `deepseek-v4.1-flash`，出站自动换成该账号的上游名。
+///
+/// 两样都只影响调度，不改凭据、额度和冷却。
+#[tauri::command]
+pub async fn gateway_set_account_models(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    allow: Vec<String>,
+    rename: std::collections::BTreeMap<String, String>,
+) -> Result<Value, String> {
+    if state.account(&channel_id, &uid).is_none() {
+        return Err(format!("账号 {channel_id}/{uid} 不存在"));
+    }
+    // 清掉空白项：面板里删到只剩空格时，别让它变成一条匹配不上的白名单。
+    let allow: Vec<String> = allow
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    // 改名两边都去空白；映射到空名的条目等于让请求不带模型名，直接丢掉。
+    let rename: std::collections::BTreeMap<String, String> = rename
+        .into_iter()
+        .map(|(from, to)| (from.trim().to_string(), to.trim().to_string()))
+        .filter(|(from, to)| !from.is_empty() && !to.is_empty())
+        .collect();
+    let changed = state
+        .storage
+        .set_account_models(&channel_id, &uid, &allow, &rename)
+        .map_err(message)?;
+
+    // 自动补路由：账号把某渠道的模型改名成"本渠道目录里没有的对外名"时，
+    // 矩阵里根本没有这条路由 —— 不改配置的话，客户端请求那个对外名会 400
+    //（`没有渠道提供模型 X`）。所以替用户把这条路由覆盖写上。
+    //
+    // 只补"缺失"的，且只在 `upstream_model` 指向本渠道真实目录里的模型时才补：
+    // 编一条指向不存在模型的路由，比不补更糟（请求一定打空）。
+    // 直接问渠道要目录，**不看矩阵**：矩阵里已经有我们刚写进去的改名路由，
+    // 拿它当"目录"会自我验证 —— 一个拼错的上游名也能通过校验。
+    // `None` = 这次没拿到目录（网络/凭据/上游改版），**不等于**目录为空。
+    // 这个区别很关键：拿不到目录时如果当成"没有模型"，所有改名都会被判成
+    // "不在该渠道目录里"而静默丢弃 —— 用户看到的就是"保存了但没生效"。
+    let catalog_names: Option<std::collections::HashSet<String>> = match state.channel(&channel_id) {
+        Some(adapter) => {
+            let account = state
+                .first_account_for(&channel_id)
+                .unwrap_or_else(|| crate::gateway::channels::AccountSnapshot {
+                    channel_id: channel_id.clone(),
+                    ..Default::default()
+                });
+            match adapter.list_models(&state.client, &account).await {
+                Ok(Some(models)) => Some(models.into_iter().map(|model| model.id).collect()),
+                _ => None,
+            }
+        }
+        None => None,
+    };
+
+    let mut added: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+
+    // 先清掉**这个渠道下、当前改名表里已不存在的**路由覆盖。
+    //
+    // 为什么必须清：改名的副作用是往 `config.routes` 里补一条覆盖。
+    // 如果用户后来删掉改名（或改成了别的名字），那条覆盖会留在矩阵里，
+    // 把该渠道的上游模型名**永久改写**成旧值 —— 表现为"目录里明明有
+    // `DeepSeek-V4-Flash-Official`，下拉里却没有它"。
+    //
+    // 只清"名字形如对外模型名"且本渠道当前目录里没有的条目，避免误伤
+    // 用户手工在 config.json 里写的路由覆盖。
+    state
+        .edit_config(|config| {
+            config.routes.retain(|entry| {
+                if entry.channel_id != channel_id {
+                    return true;
+                }
+                // 仍在改名表里：保留（下面会更新它的 upstream_model）。
+                if rename.contains_key(&entry.model) {
+                    return true;
+                }
+                // 目录里本来就有这个名字：说明是正常的同名路由，不动。
+                if catalog_names
+                    .as_ref()
+                    .is_some_and(|names| names.contains(&entry.model))
+                {
+                    return true;
+                }
+                removed.push(entry.model.clone());
+                false
+            });
+        })
+        .map_err(message)?;
+    if !rename.is_empty() {
+        state
+            .edit_config(|config| {
+                for (public_name, upstream) in &rename {
+                    // 注意这里校验的是 **upstream**（右边，本渠道真实目录名），
+                    // 而不是 `public_name` —— 对外名本来就是"本渠道没有的名字"，
+                    // 它不可能出现在目录里。早先校验错了方向，导致所有跨渠道改名
+                    // 都被判成"不在该渠道目录里"、路由永远补不上。
+                    // 只有**确实拿到了目录**时才校验上游名。
+                    // 没拿到目录时信任用户的输入：他已经从下拉里选了本渠道的
+                    // 真实模型名（下拉候选就来自目录），再拦一次只会让功能看起来坏掉。
+                    if let Some(names) = &catalog_names {
+                        if !names.contains(upstream) {
+                            skipped.push(format!(
+                                "{public_name}：{upstream} 不在该渠道目录里（改名未生效）"
+                            ));
+                            continue;
+                        }
+                    }
+                    let existing = config
+                        .routes
+                        .iter_mut()
+                        .find(|entry| entry.model == *public_name && entry.channel_id == channel_id);
+                    match existing {
+                        Some(entry) => {
+                            // 已有覆盖：把上游名对齐到账号这边的映射。
+                            entry.upstream_model = Some(upstream.clone());
+                        }
+                        None => {
+                            config.routes.push(RouteOverride {
+                                model: public_name.clone(),
+                                channel_id: channel_id.clone(),
+                                upstream_model: Some(upstream.clone()),
+                                priority: None,
+                                weight: None,
+                                enabled: Some(true),
+                            });
+                            added.push(public_name.clone());
+                        }
+                    }
+                }
+            })
+            .map_err(message)?;
+        // 配置变了 → 矩阵按需重建，新的对外名立刻可请求。
+        let _ = state.ensure_matrix(true).await;
+    }
+
+    state.reload_accounts().map_err(message)?;
+    Ok(json!({
+        "ok": changed,
+        "allow": allow,
+        "rename": rename,
+        // 新增的路由与因目录缺模型而跳过的条目：面板据此提示，别让用户以为全都生效了。
+        "routes_added": added,
+        "skipped": skipped,
+    }))
+}
+
 #[tauri::command]
 pub async fn gateway_delete_account(
     state: State<'_, SharedGateway>,
@@ -338,7 +624,8 @@ pub async fn gateway_refresh_account(
     let account = state
         .account(&channel_id, &uid)
         .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
-    let credential = refresh::refresh(&state, &account).await.map_err(message)?;
+    // 面板上的"刷新凭据"是**明确动作**：必须真的换一个，不能被"未到期"短路。
+    let credential = refresh::refresh(&state, &account, true).await.map_err(message)?;
     Ok(json!({
         "expires_at_ms": credential.expires_at_ms,
         "has_refresh_token": credential.refresh_token.is_some(),
@@ -356,12 +643,29 @@ pub async fn gateway_fetch_quota(
         .account(&channel_id, &uid)
         .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
     let adapter = state.channel(&channel_id).ok_or_else(|| "渠道不存在".to_string())?;
-    let snapshot = adapter
-        .fetch_quota(&state.client, &account.snapshot())
-        .await
-        .map_err(message)?;
+    let snapshot = match adapter.fetch_quota(&state.client, &account.snapshot()).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            // 额度接口明确说"凭据不被接受"时，账号其实已经不可用了 ——
+            // 只把错误弹给用户、却让状态灯继续显示"可用"，会出现
+            // 「状态可用 + 额度报 1001」这种自相矛盾的画面，也没法解释
+            // 为什么点刷新没用。这里把惩罚状态落到账号上（与调度路径一致），
+            // 面板的状态与原因就会如实变红。
+            if error.kind == crate::gateway::errors::ErrorKind::AuthExpired {
+                let policy = state.pool.policy();
+                account.apply_error(&error, &policy, now_ms());
+            }
+            return Err(message(error));
+        }
+    };
     account.set_quota(snapshot.clone());
-    serde_json::to_value(snapshot).map_err(|error| error.to_string())
+    // `null` 的语义必须让面板能读懂：这个渠道**没有额度概念**（CodeArts 按 token
+    // 计量、只在控制台看），不是"查询失败"。早先两者都显示成 `—`，
+    // 用户完全分不清是没实现还是坏了。
+    Ok(json!({
+        "supported": snapshot.is_some(),
+        "quota": snapshot,
+    }))
 }
 
 /// 单账号真实探针：发一条最小请求验证这个账号到底能不能用。
@@ -409,6 +713,30 @@ pub async fn gateway_probe_models(
         })
         .collect();
     Ok(json!(models))
+}
+
+/// 诊断：用某个账号的真实凭据打一次上游，原样返回响应。
+///
+/// `target` 由渠道自己解释（Trae：`models` / `detail` / `credits`）。
+/// 存在的理由：面板把缺失字段显示成 `—`/`?` 时，只有原始 JSON 能说清
+/// 到底是"上游没给"、"字段名不同"还是"接口失败了"。
+#[tauri::command]
+pub async fn gateway_diagnose_channel(
+    state: State<'_, SharedGateway>,
+    channel_id: String,
+    uid: String,
+    target: String,
+) -> Result<Value, String> {
+    let account = state
+        .account(&channel_id, &uid)
+        .ok_or_else(|| format!("账号 {channel_id}/{uid} 不存在"))?;
+    let adapter = state
+        .channel(&channel_id)
+        .ok_or_else(|| format!("渠道 {channel_id} 不存在"))?;
+    adapter
+        .diagnose(&state.client, &account.snapshot(), &target)
+        .await
+        .map_err(message)
 }
 
 /// 渠道任务清单（面板「任务」表格）。渠道没有任务体系时返回 null。
@@ -629,6 +957,8 @@ pub async fn gateway_add_account(
             added_at: now_ms(),
             source: "manual".into(),
             credential: None,
+            model_allow: Vec::new(),
+            model_rename: std::collections::BTreeMap::new(),
         })
         .map_err(message)?;
     state.reload_accounts().map_err(message)?;

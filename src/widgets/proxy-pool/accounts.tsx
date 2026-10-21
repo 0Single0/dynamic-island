@@ -1,4 +1,4 @@
-import { Coins, Power, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { Coins, Pencil, Power, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 
 import * as api from "@/api/gateway";
@@ -44,8 +44,8 @@ export interface AccountColumnSpec {
  *
  * 现在按权重分：所有列按比例分享可用宽度，**窗口多宽表格就多宽，永不溢出**。
  * 窄了每列都窄一点（文字截断），宽了每列都宽一点。
- * 唯一的硬宽度是操作列：5 个 32px 图标 = 168px，`shrink-0` 钉死 ——
- * 否则窗口一窄图标先被 flex 压扁，那是这个表最早也最反复的毛病。
+ * 唯一的硬宽度是操作列：6 个 32px 图标 = 192px（编辑 + 重置/凭据/额度/启停/删除），
+ * `shrink-0` 钉死 —— 否则窗口一窄图标先被 flex 压扁，那是这个表最早也最反复的毛病。
  */
 export function accountColumns(
   accounts: ReadonlyArray<{ nickname: string; uid: string }>,
@@ -73,8 +73,8 @@ export function accountColumns(
     { key: "models", label: "可用模型", className: "flex-[0.88] min-w-0" },
     { key: "tasks", label: "任务", className: "flex-[0.92] min-w-0" },
     { key: "probe", label: "测试", className: "flex-[0.92] min-w-0" },
-    // 5 个图标（重置/凭据/额度/启停/删除）各 32px + 间隙 = 168px，定宽、不参与伸缩。
-    { key: "ops", label: "操作", className: "w-[10.5rem] shrink-0" },
+    // 5 个图标（重置/凭据/额度/启停/删除）+ 编辑 = 192px，定宽、不参与伸缩。
+    { key: "ops", label: "操作", className: "w-[12.5rem] shrink-0" },
   ];
 }
 
@@ -165,12 +165,16 @@ function credentialDays(expiresAtMs: number): string {
 interface AccountCellContext {
   support: ModelChip[];
   channelName: string;
+  /** 渠道适配器类型：自定义供应商的密钥是静态的，操作与内置渠道不同。 */
+  channelAdapter: string;
   expanded: boolean;
   tasks: boolean;
   probe: boolean;
   onToggleModels: () => void;
   onToggleTasks: () => void;
   onToggleProbe: () => void;
+  /** 打开「编辑账号」弹窗（昵称 / 优先级 / 权重）。 */
+  onEdit: () => void;
   onChange: () => void;
 }
 
@@ -199,16 +203,26 @@ export function accountCell(
   switch (key) {
     case "account":
       return (
-        <span className="flex w-full items-center justify-center gap-1.5">
+        // 整格可点：昵称是这一行里最像"可编辑"的地方，点它开编辑弹窗；
+        // 悬停给虚线底边（与"请求中"列改上限的交互一致），别让人靠猜。
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            context.onEdit();
+          }}
+          title={`${account.uid}\n点击编辑昵称 / 优先级 / 权重`}
+          className="flex w-full min-w-0 items-center justify-center gap-1.5 rounded px-1 hover:bg-white/8"
+        >
           <span
             className={`h-1.5 w-1.5 shrink-0 rounded-full ${
               account.ready ? "bg-emerald-400" : account.enabled ? "bg-amber-400" : "bg-zinc-500"
             }`}
           />
-          <span className="truncate text-[11px] text-zinc-100" title={account.uid}>
+          <span className="truncate border-b border-dashed border-white/20 text-[11px] text-zinc-100">
             {account.nickname || account.uid.slice(0, 8)}
           </span>
-        </span>
+        </button>
       );
     case "channel":
       return (
@@ -331,6 +345,10 @@ export function accountCell(
       );
     }
     case "tasks":
+      // 自定义供应商没有"成长任务/签到"体系（那是内置渠道的运营能力）。
+      if (context.channelAdapter === "custom") {
+        return <span className="text-[10px] text-zinc-600">—</span>;
+      }
       return (
         <button
           type="button"
@@ -361,6 +379,8 @@ export function accountCell(
     case "ops":
       return (
         <>
+          {/* 编辑放第一个：它是"改这个号"的入口，其余都是瞬时动作。 */}
+          <IconButton icon={Pencil} label="编辑账号（昵称 / 优先级 / 权重）" onClick={context.onEdit} />
           <IconButton
             icon={RotateCcw}
             label="重置状态（清冷却/熔断）"
@@ -372,28 +392,42 @@ export function accountCell(
               )
             }
           />
-          <IconButton
-            icon={RefreshCw}
-            label="刷新凭据"
-            onClick={() =>
-              apply(
-                () => api.refreshAccount(account.channel_id, account.uid),
-                "凭据已刷新",
-                "刷新失败",
-              )
-            }
-          />
-          <IconButton
-            icon={Coins}
-            label="刷新额度"
-            onClick={() =>
-              apply(
-                () => api.fetchQuota(account.channel_id, account.uid),
-                "额度已刷新",
-                "额度查询失败",
-              )
-            }
-          />
+          {/* 自定义供应商的密钥是静态的：没有刷新端点，也没有额度口径，
+              这两个按钮按下去只会报错 —— 直接不显示。 */}
+          {context.channelAdapter !== "custom" && (
+            <IconButton
+              icon={RefreshCw}
+              label="刷新凭据"
+              onClick={() =>
+                apply(
+                  () => api.refreshAccount(account.channel_id, account.uid),
+                  "凭据已刷新",
+                  "刷新失败",
+                )
+              }
+            />
+          )}
+          {context.channelAdapter !== "custom" && (
+            <IconButton
+              icon={Coins}
+              label="刷新额度"
+              onClick={async () => {
+                // 这个渠道**没有额度概念**时要说清楚，别让用户以为查询坏了：
+                // CodeArts 按 token 计量，额度只在华为云控制台看。
+                try {
+                  const result = await api.fetchQuota(account.channel_id, account.uid);
+                  if (result.supported) {
+                    toast.success("额度已刷新");
+                  } else {
+                    toast.info("该渠道没有额度接口：用量请在服务商控制台查看");
+                  }
+                  context.onChange();
+                } catch (reason) {
+                  toast.error(errorText(reason, "额度查询失败"));
+                }
+              }}
+            />
+          )}
           <IconButton
             icon={Power}
             label={account.enabled ? "停用账号" : "启用账号"}
@@ -434,7 +468,11 @@ export function accountCell(
 function QuotaCell({ quota }: { quota: GatewayAccount["quota"] }) {
   if (!quota) {
     return (
-      <span className="block text-[10px] text-zinc-600" title="还没有额度数据：点左侧金币按钮刷新">
+      <span
+        className="block text-[10px] text-zinc-600"
+        title={"该渠道没有额度接口（或还没取到）：点左侧金币按钮刷新。\n" +
+          "按 token 计量的渠道（如 CodeArts）的用量只能在服务商控制台看。"}
+      >
         —
       </span>
     );

@@ -80,35 +80,22 @@ pub fn validate_filename(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 文本判定按**内容**而不是扩展名（对齐 dsh：扩展名白名单会把 Dockerfile、
+/// Makefile、.gitignore 这类无后缀/非常见后缀的文本全拒掉）：
+/// 读取时先看二进制签名（NUL 字节采样）+ 严格 UTF-8 解码，二者都过即文本。
+/// 扩展名只用于写入前的快速预检（写入路径已有完整的 NUL/UTF-8 校验兜底）。
 fn is_text_path(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase()
-            .as_str(),
-        "txt"
-            | "md"
-            | "markdown"
-            | "json"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "rs"
-            | "ts"
-            | "tsx"
-            | "js"
-            | "jsx"
-            | "css"
-            | "html"
-            | "xml"
-            | "csv"
-            | "log"
-            | "py"
-            | "gitignore"
-            | "env"
-            | "ini"
-            | "conf"
+    let extension = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    // 有扩展名且命中已知二进制类型 → 直接判非文本，免读文件。
+    !matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp" | "pdf" | "zip" | "gz" | "tar"
+            | "7z" | "rar" | "exe" | "dll" | "so" | "dylib" | "woff" | "woff2" | "ttf" | "otf"
+            | "mp3" | "mp4" | "avi" | "mov" | "sqlite" | "db" | "bin" | "class" | "jar"
     )
 }
 
@@ -442,6 +429,31 @@ mod tests {
         assert!(create_path(Path::new("\\\\server\\share\\a.txt"), "hi", false).is_err());
         // 相对路径被拒绝。
         assert!(create_path(Path::new("rel.txt"), "hi", false).is_err());
+    }
+
+    /// 回归：无后缀/非常见后缀的文本文件（Dockerfile、Makefile、.gitignore）
+    /// 必须能读。文本判定按内容（NUL 采样 + UTF-8），不看扩展名白名单。
+    #[test]
+    fn reads_extensionless_text_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let dockerfile = dir.path().join("Dockerfile");
+        fs::write(&dockerfile, "FROM node:20
+WORKDIR /app
+").unwrap();
+        let read = read_path(&dockerfile).unwrap();
+        assert_eq!(read["content"], "FROM node:20
+WORKDIR /app
+");
+        // 其他常见无后缀文件。
+        fs::write(dir.path().join("Makefile"), "all:
+	echo hi
+").unwrap();
+        assert!(read_path(&dir.path().join("Makefile")).is_ok());
+        fs::write(dir.path().join(".gitignore"), "target
+").unwrap();
+        assert!(read_path(&dir.path().join(".gitignore")).is_ok());
+        // 已知二进制扩展名直接拒绝，不读内容。
+        assert!(read_path(&dir.path().join("logo.png")).is_err());
     }
 
     #[test]

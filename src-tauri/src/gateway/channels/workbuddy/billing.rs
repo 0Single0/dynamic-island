@@ -358,6 +358,7 @@ mod probe {
             access_token: Some(credential.access_token.clone()),
             refresh_token: credential.refresh_token.clone(),
             enterprise_id: credential.enterprise_id.clone(),
+            ..Default::default()
         };
         let hosts = super::super::identity::hosts(
             super::super::identity::Realm::Cn,

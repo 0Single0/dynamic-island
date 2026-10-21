@@ -67,6 +67,8 @@ pub struct PoolAccount {
     pub enabled: bool,
     /// 该渠道是否必须有凭据才可用（假渠道不需要）。
     pub requires_credential: bool,
+    /// 凭据是静态密钥（自定义供应商）还是会过期的令牌。静态凭据不参与刷新。
+    pub static_credential: bool,
     credentials: RwLock<Credential>,
     /// 额度快照：渠道无关，面板按 label/unit 展示（渠道自行翻译口径）。
     quota: RwLock<Option<QuotaSnapshot>>,
@@ -74,9 +76,24 @@ pub struct PoolAccount {
     pub priority: u32,
     /// 同档内的容量份额。
     pub weight: u32,
+    /// 账号级覆盖值（`None` = 跟随渠道）。上面两个是**生效值**，这两个是来源，
+    /// 面板编辑账号时要能区分"我自己设的 100"和"跟着渠道的 100"。
+    pub priority_override: Option<u32>,
+    pub weight_override: Option<u32>,
     /// 并发上限（面板可调）。原子：PoolAccount 常在 Arc 后面共享，&self 也要能改。
     max_inflight: AtomicU32,
     pub proxy_slot: Option<String>,
+    /// 这个账号只服务哪些**对外模型名**。空 = 不限制。
+    ///
+    /// 用途：同一渠道里有的号跑不了某些模型（没开通 / 单独计费），或想让某个号专跑某几个模型。
+    /// 过滤发生在候选展开（`router::candidates`），被挡下的模型根本不会被选到。
+    pub model_allow: Vec<String>,
+    /// 账号级模型改名：`对外名 -> 该账号的上游名`。
+    ///
+    /// 与渠道级 `config.routes[].upstream_model` 的区别是**作用域**：同一渠道的两个账号
+    /// 可以把同一个对外模型映射到不同的上游名。Trae 把 `deepseek-v4.1-flash` 叫
+    /// `DeepSeek-V4-Flash-Official`，配一条改名就能让客户端继续用统一的名字。
+    pub model_rename: std::collections::BTreeMap<String, String>,
     pub runtime: AccountRuntime,
 }
 
@@ -87,12 +104,17 @@ impl PoolAccount {
             nickname: String::new(),
             enabled: true,
             requires_credential: true,
+            static_credential: false,
             credentials: RwLock::new(Credential::default()),
             quota: RwLock::new(None),
             priority: 100,
             weight: 1,
+            priority_override: None,
+            weight_override: None,
             max_inflight: AtomicU32::new(1),
             proxy_slot: None,
+            model_allow: Vec::new(),
+            model_rename: std::collections::BTreeMap::new(),
             runtime: AccountRuntime::default(),
         }
     }
@@ -106,6 +128,9 @@ impl PoolAccount {
                 .then(|| credentials.access_token.clone()),
             refresh_token: credentials.refresh_token.clone(),
             enterprise_id: credentials.enterprise_id.clone(),
+            access_key_id: credentials.access_key_id.clone(),
+            secret_key: credentials.secret_key.clone(),
+            code_verifier: credentials.code_verifier.clone(),
         }
     }
 
@@ -141,7 +166,8 @@ impl PoolAccount {
         if !self.enabled {
             return false;
         }
-        if self.requires_credential && self.credentials().access_token.is_empty() {
+        // 用 `is_present()` 而不是只看 access_token：CodeArts 的长期 AK/SK 没有 token。
+        if self.requires_credential && !self.credentials().is_present() {
             return false;
         }
         let blocked = self.runtime.cooldown_until.load(Ordering::SeqCst)
@@ -364,7 +390,7 @@ impl PoolAccount {
         if !self.enabled {
             reasons.push("已停用：不会参与调度".to_string());
         }
-        if self.requires_credential && self.credentials().access_token.is_empty() {
+        if self.requires_credential && !self.credentials().is_present() {
             reasons.push("没有凭据：该渠道需要先完成登录".to_string());
         }
         if let Some(until) = self.runtime_balance_after(now) {
@@ -506,7 +532,14 @@ pub struct AccountView {
     pub max_inflight: u32,
     pub priority: u32,
     pub weight: u32,
+    /// 账号级覆盖值（`None` = 跟随渠道）。编辑弹窗据此决定输入框留空还是填数。
+    pub priority_override: Option<u32>,
+    pub weight_override: Option<u32>,
     pub proxy_slot: Option<String>,
+    /// 这个账号只服务哪些对外模型名（空 = 不限）。面板"编辑账号"回填用。
+    pub model_allow: Vec<String>,
+    /// 账号级模型改名（对外名 -> 上游名）。
+    pub model_rename: std::collections::BTreeMap<String, String>,
     /// 额度快照（渠道自行决定口径；没有额度概念的渠道是 None）。
     pub quota: Option<QuotaSnapshot>,
 }
@@ -520,7 +553,8 @@ impl PoolAccount {
             nickname: self.nickname.clone(),
             enabled: self.enabled,
             ready: self.is_ready("", now),
-            has_credential: !credentials.access_token.is_empty(),
+            // 同 `is_present()`：CodeArts 的 AK/SK 没有 token，面板也该显示"有凭据"。
+            has_credential: credentials.is_present(),
             credential_expires_at_ms: credentials.expires_at_ms,
             cooldown_until_ms: self.cooldown_until_ms(),
             blocked_reasons: self.blocked_reasons("", now),
@@ -541,7 +575,11 @@ impl PoolAccount {
             max_inflight: self.max_inflight(),
             priority: self.priority,
             weight: self.weight,
+            priority_override: self.priority_override,
+            weight_override: self.weight_override,
             proxy_slot: self.proxy_slot.clone(),
+            model_allow: self.model_allow.clone(),
+            model_rename: self.model_rename.clone(),
             quota: self.quota(),
         }
     }
@@ -560,6 +598,38 @@ mod tests {
         Arc::new(account)
     }
 
+    /// CodeArts 的长期 AK/SK **没有 access_token**，但它明明是有效凭据。
+    ///
+    /// 早先 `is_ready` 只看 `access_token.is_empty()`，于是导入 `credentials.csv`
+    /// 之后账号立刻被判成"没有凭据 / 需要先登录"——这就是"刚导入就受限"的成因。
+    #[test]
+    fn ak_sk_only_credentials_count_as_present() {
+        let mut account = PoolAccount::new("codearts", "u1");
+        account.requires_credential = true;
+        account.set_credentials(Credential {
+            // 长期 AK/SK：没有 token。
+            access_token: String::new(),
+            access_key_id: Some("AK1".into()),
+            secret_key: Some("SK1".into()),
+            ..Credential::default()
+        });
+        assert!(account.credentials().is_present(), "AK/SK 是有效的凭据形态");
+        assert!(account.is_ready("snap-chat", now_ms()), "不该被判成没登录");
+        assert!(
+            account.blocked_reasons("snap-chat", now_ms()).is_empty(),
+            "不该报「需要先登录」"
+        );
+    }
+
+    /// 真正的空凭据仍然要判成不可用（别把上一条的修复做成"永远就绪"）。
+    #[test]
+    fn a_completely_empty_credential_is_still_not_ready() {
+        let mut account = PoolAccount::new("codearts", "u2");
+        account.requires_credential = true;
+        assert!(!account.credentials().is_present());
+        assert!(!account.is_ready("snap-chat", now_ms()));
+        assert!(!account.blocked_reasons("snap-chat", now_ms()).is_empty());
+    }
     #[test]
     fn missing_credential_blocks_only_channels_that_need_one() {
         let mut needs = PoolAccount::new("wb-cn", "u1");
@@ -577,6 +647,25 @@ mod tests {
             account
         };
         assert!(open.is_ready("fake-model", now_ms()), "假渠道不需要凭据");
+    }
+
+    #[test]
+    fn static_credential_without_expiry_stays_ready() {
+        // 自定义供应商的密钥没有过期时间。若它参与"临期刷新"判断，
+        // 每次请求都会尝试刷新并失败 → 账号被当成不可用（等于接进来也用不了）。
+        let mut account = PoolAccount::new("my-provider", "default");
+        account.static_credential = true;
+        account.set_credentials(Credential {
+            access_token: "sk-1".into(),
+            expires_at_ms: None,
+            ..Credential::default()
+        });
+        assert!(account.is_ready("gpt-x", now_ms()));
+        // 保险丝本身仍在：它标记的是"永不过期"，不是"绕过可用性判断"。
+        assert!(
+            account.credentials().is_expiring(now_ms(), 120_000),
+            "无过期时间的凭据确实会被判临期 —— 所以必须靠 static 标记跳过刷新"
+        );
     }
 
     #[test]

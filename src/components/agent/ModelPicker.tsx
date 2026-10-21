@@ -59,7 +59,11 @@ export function ModelPicker({ providers, models, value, onChange, onManage, plac
           bounds.top = Math.max(bounds.top, box.top + 4); bounds.bottom = Math.min(bounds.bottom, box.bottom - 4);
         }
       }
-      const height = Math.min(264, menuRef.current ? menuRef.current.scrollHeight : 240);
+      // 内容高度取两个内层滚动列的 scrollHeight：外层容器被 maxHeight 裁剪后
+      // 自身 scrollHeight 会返回裁剪后的高度，直接读会形成“越滚越矮”的反馈循环。
+      const columns = menuRef.current ? Array.from(menuRef.current.children) as HTMLElement[] : [];
+      const content = columns.length ? Math.max(...columns.map((column) => column.scrollHeight)) + 12 : 240;
+      const height = Math.min(264, content);
       setPosition(selectPosition(rect, bounds, height, 360));
     };
     place();

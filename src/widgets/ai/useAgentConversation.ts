@@ -5,7 +5,7 @@ import { documentToPlainText, documentToPluginIds, deleteSession as deleteStored
 import { emptyTrace, reduceTrace, type TraceState } from "@/agent/trace";
 import { toast } from "@/utils/toast";
 import { legacyEntries } from "./legacy";
-import { clearDraft, getActiveConversation, NEW_CONVERSATION, promoteDraft, setActiveConversation, setDraft } from "@/agent/drafts";
+import { clearDraft, getActiveConversation, loadSelectedModel, NEW_CONVERSATION, promoteDraft, saveSelectedModel, setActiveConversation, setDraft } from "@/agent/drafts";
 
 function asProviderError(value: unknown): ProviderError {
   if (typeof value === "object" && value !== null && "message" in value) return value as ProviderError;
@@ -19,7 +19,7 @@ export function useAgentConversation() {
   const [isLoading, setIsLoading] = useState(true);
   const [models, setModels] = useState<ModelRecord[]>([]);
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
-  const [selectedModelId, setSelectedModelId] = useState("");
+  const [selectedModelId, _setSelectedModelId] = useState(() => loadSelectedModel());
   const [isSending, setIsSending] = useState(false);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const state = useRef(trace);
@@ -35,6 +35,11 @@ export function useAgentConversation() {
   const invokedRun = useRef<string | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const followTailRef = useRef(true);
+
+  const setSelectedModelId = useCallback((modelId: string) => {
+    saveSelectedModel(modelId);
+    _setSelectedModelId(modelId);
+  }, []);
 
   const apply = useCallback((events: ExecutionEvent[]) => {
     state.current = reduceTrace(state.current, events);
@@ -113,7 +118,9 @@ export function useAgentConversation() {
       if (disposed) return;
       setSessions(storedSessions); setModels(modelRecords.filter(m => m.enabled));
       setProviders(providerRecords);
-      setSelectedModelId(modelRecords.find(m => m.enabled)?.id || "");
+      // 恢复上次用的模型；它已被删/停用时才回落到列表第一个。
+      const remembered = loadSelectedModel();
+      setSelectedModelId(modelRecords.some(m => m.enabled && m.id === remembered) ? remembered : modelRecords.find(m => m.enabled)?.id || "");
       const active = getActiveConversation();
       const session = storedSessions.find(s => s.id === active);
       if (session) await loadSession(session);
@@ -155,7 +162,10 @@ export function useAgentConversation() {
           setModels(enabled);
           setProviders(providerRecords);
           // 被删掉/停用的模型不能继续留在选择里，否则发送时才报错。
-          setSelectedModelId((current) => (enabled.some((model) => model.id === current) ? current : enabled[0]?.id ?? ""));
+          const current = loadSelectedModel();
+          if (!enabled.some((model) => model.id === current)) {
+            setSelectedModelId(enabled[0]?.id ?? "");
+          }
         })
         .catch(() => undefined);
     }).then((unlisten) => {

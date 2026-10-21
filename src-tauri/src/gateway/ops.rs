@@ -57,7 +57,7 @@ async fn run_daily_actions(
         if !account.enabled {
             continue;
         }
-        if account.requires_credential && account.credentials().access_token.is_empty() {
+        if account.requires_credential && !account.credentials().is_present() {
             continue;
         }
         if account.cooldown_until_ms() > crate::gateway::timeutil::now_ms() {
@@ -118,7 +118,7 @@ async fn refresh_stale_quotas(state: &SharedGateway) {
             continue;
         }
         // 没凭据（还没登录）或正在冷却的账号不打扰上游。
-        if account.requires_credential && account.credentials().access_token.is_empty() {
+        if account.requires_credential && !account.credentials().is_present() {
             continue;
         }
         if account.cooldown_until_ms() > now {

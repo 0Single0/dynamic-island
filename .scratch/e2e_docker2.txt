@@ -1,0 +1,120 @@
+event: response.created
+data: {"response":{"created_at":1792123196,"id":"resp_0e131e0ceff446acabf31cf5f91d0a56","model":"glm-5.3-flash","object":"response","output":[],"status":"in_progress"},"type":"response.created"}
+
+event: response.in_progress
+data: {"response":{"created_at":1792123196,"id":"resp_0e131e0ceff446acabf31cf5f91d0a56","model":"glm-5.3-flash","object":"response","output":[],"status":"in_progress"},"type":"response.in_progress"}
+
+event: response.output_item.added
+data: {"item":{"id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","summary":[],"type":"reasoning"},"output_index":0,"type":"response.output_item.added"}
+
+event: response.reasoning_summary_part.added
+data: {"item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"part":{"text":"","type":"summary_text"},"summary_index":0,"type":"response.reasoning_summary_part.added"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":"Search","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" found","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" none","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":".","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" Maybe","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" docker","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":"file","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" in","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" sub","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":"directory","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":".","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" List","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":" first","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.reasoning_summary_text.delta
+data: {"delta":".","item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"type":"response.reasoning_summary_text.delta"}
+
+event: response.output_item.added
+data: {"item":{"arguments":"","call_id":"call_a124a9d90e7d4492939a7c0b","id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","name":"files__list","status":"in_progress","type":"function_call"},"output_index":1,"type":"response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"{\"","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"path","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\":\"","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"D","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":":\\\\","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"work","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"b","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"uddy","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"2","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"api","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"-h","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"ub","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"-main","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"\"","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.delta
+data: {"delta":"}","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.delta"}
+
+event: response.reasoning_summary_text.done
+data: {"item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"summary_index":0,"text":"Search found none. Maybe dockerfile in subdirectory. List first.","type":"response.reasoning_summary_text.done"}
+
+event: response.reasoning_summary_part.done
+data: {"item_id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":0,"part":{"text":"Search found none. Maybe dockerfile in subdirectory. List first.","type":"summary_text"},"summary_index":0,"type":"response.reasoning_summary_part.done"}
+
+event: response.output_item.done
+data: {"item":{"id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56_0","summary":[{"text":"Search found none. Maybe dockerfile in subdirectory. List first.","type":"summary_text"}],"type":"reasoning"},"output_index":0,"type":"response.output_item.done"}
+
+event: response.function_call_arguments.done
+data: {"arguments":"{\"path\":\"D:\\\\workbuddy2api-hub-main\"}","item_id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","output_index":1,"type":"response.function_call_arguments.done"}
+
+event: response.output_item.done
+data: {"item":{"arguments":"{\"path\":\"D:\\\\workbuddy2api-hub-main\"}","call_id":"call_a124a9d90e7d4492939a7c0b","id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","name":"files__list","status":"completed","type":"function_call"},"output_index":1,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"created_at":1792123196,"id":"resp_0e131e0ceff446acabf31cf5f91d0a56","model":"glm-5.3-flash","object":"response","output":[{"id":"rs_resp_0e131e0ceff446acabf31cf5f91d0a56","summary":[{"text":"Search found none. Maybe dockerfile in subdirectory. List first.","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"path\":\"D:\\\\workbuddy2api-hub-main\"}","call_id":"call_a124a9d90e7d4492939a7c0b","id":"fc_resp_0e131e0ceff446acabf31cf5f91d0a56_0","name":"files__list","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":555,"input_tokens_details":{"cached_tokens":0},"output_tokens":36,"output_tokens_details":{"reasoning_tokens":14},"total_tokens":591}},"type":"response.completed"}
+

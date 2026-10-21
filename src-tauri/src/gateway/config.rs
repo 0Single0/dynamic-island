@@ -39,10 +39,13 @@ pub struct Config {
     pub catalog_ttl_seconds: u64,
 }
 
-/// 开箱即用的渠道：两个 workbuddy（国内/国际），默认启用。
+/// 开箱即用的渠道：两个 workbuddy（国内/国际）+ 一个 Trae CN，默认启用。
 ///
 /// 没有渠道的网关是"面板打开也没得可点"——所以默认配置必须带上它们，
 /// 用户只需要点登录、走一次授权就有账号了。
+///
+/// Trae 默认开启但初始**没有账号**：它的登录要粘贴一次回调地址，
+/// 面板里点一下就好；放进默认配置是为了让「添加账号」弹窗一打开就列得出来。
 pub fn default_channels() -> Vec<ChannelConfig> {
     vec![
         ChannelConfig {
@@ -63,7 +66,54 @@ pub fn default_channels() -> Vec<ChannelConfig> {
             weight: 5,
             options: serde_json::json!({ "realm": "intl", "outbound_identity": "workbuddy" }),
         },
+        ChannelConfig {
+            id: "trae-cn".into(),
+            adapter: "trae".into(),
+            display_name: "Trae 国内版".into(),
+            enabled: true,
+            priority: 100,
+            weight: 5,
+            // base_url 指到主机即可：适配器会补上 `/api/remote/v1`。
+            // 企业版换成自己的网关主机；留空则是内置默认地址。
+            options: serde_json::json!({ "base_url": "https://trae-api-cn.mchost.guru" }),
+        },        ChannelConfig {
+            id: "codearts".into(),
+            adapter: "codearts".into(),
+            display_name: "华为 CodeArts".into(),
+            enabled: true,
+            priority: 100,
+            weight: 5,
+            // 华为云码道的模型网关（商业版 snap-access 域）。
+            options: serde_json::json!({
+                "base_url": "https://snap-access.cn-north-4.myhuaweicloud.com"
+            }),
+        },
     ]
+}
+
+/// 老配置里没有 Trae 渠道时补一条（已有则不动，包括被用户停用的）。
+///
+/// 为什么不放在 `load_or_create` 的"channels 为空"分支：那分支只在全新配置时
+/// 命中，已经在用的用户列表非空 —— 不补的话他们永远看不到这个渠道。
+pub fn ensure_trae_channel(channels: &mut Vec<ChannelConfig>) -> bool {
+    ensure_builtin_channel(channels, "trae")
+}
+
+/// 老配置里没有某个内置渠道时补一条（按适配器类型判断，幂等）。
+pub fn ensure_builtin_channel(channels: &mut Vec<ChannelConfig>, adapter: &str) -> bool {
+    if channels.iter().any(|channel| channel.adapter == adapter) {
+        return false;
+    }
+    match default_channels()
+        .into_iter()
+        .find(|channel| channel.adapter == adapter)
+    {
+        Some(template) => {
+            channels.push(template);
+            true
+        }
+        None => false,
+    }
 }
 
 impl Default for Config {
@@ -273,6 +323,16 @@ impl Config {
             let _ = config.save(dir);
             eprintln!("[gateway] 已移除链路自测用的假渠道");
         }
+        // 老配置补上 Trae 渠道：否则升级上来的用户永远看不到它。
+        if ensure_trae_channel(&mut config.channels) {
+            let _ = config.save(dir);
+            eprintln!("[gateway] 已为老配置补上 Trae 渠道（trae-cn）");
+        }
+        // 同理补上 CodeArts（华为云码道）。
+        if ensure_builtin_channel(&mut config.channels, "codearts") {
+            let _ = config.save(dir);
+            eprintln!("[gateway] 已为老配置补上 CodeArts 渠道（codearts）");
+        }
         Ok(config)
     }
 
@@ -331,5 +391,100 @@ mod tests {
         assert_eq!(config.concurrency.global, 32);
         assert_eq!(config.cooldowns.auth_secs, 60);
         assert!(config.enabled);
+    }
+
+    #[test]
+    fn default_channels_ship_workbuddy_and_trae() {
+        let channels = default_channels();
+        let adapters: Vec<&str> = channels.iter().map(|c| c.adapter.as_str()).collect();
+        assert!(adapters.contains(&"workbuddy"));
+        assert!(adapters.contains(&"trae"));
+        // Trae 渠道要带上基址，否则适配器只能用内置默认值。
+        let trae = channels
+            .iter()
+            .find(|c| c.adapter == "trae")
+            .expect("默认配置必须带 Trae");
+        assert!(trae.options.get("base_url").and_then(|v| v.as_str()).is_some());
+        assert!(trae.enabled, "默认启用：不然弹窗里看不到它");
+
+        // CodeArts 同理：要在默认配置里，且带基址。
+        assert!(adapters.contains(&"codearts"), "默认配置必须带 CodeArts");
+        let codearts = channels
+            .iter()
+            .find(|c| c.adapter == "codearts")
+            .expect("CodeArts 渠道");
+        assert!(codearts
+            .options
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .is_some_and(|url| url.contains("myhuaweicloud.com")));
+        assert!(codearts.enabled);
+    }
+
+    /// 升级路径要把 CodeArts 也补上，且幂等。
+    #[test]
+    fn legacy_config_gains_the_codearts_channel_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut legacy = Config::default();
+        legacy
+            .channels
+            .retain(|channel| channel.adapter != "codearts");
+        legacy.save(dir.path()).expect("写入老配置");
+
+        let loaded = Config::load_or_create(dir.path()).expect("读取升级");
+        assert_eq!(
+            loaded
+                .channels
+                .iter()
+                .filter(|c| c.adapter == "codearts")
+                .count(),
+            1,
+            "老配置必须补上 CodeArts，且只补一次"
+        );
+    }
+
+    /// 升级路径：老用户的配置里只有 workbuddy，必须自动补上 Trae。
+    #[test]
+    fn legacy_config_gains_the_trae_channel_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut legacy = Config::default();
+        legacy
+            .channels
+            .retain(|channel| channel.adapter != "trae");
+        legacy.save(dir.path()).expect("写入老配置");
+
+        let loaded = Config::load_or_create(dir.path()).expect("读取升级");
+        assert!(
+            loaded.channels.iter().any(|c| c.adapter == "trae"),
+            "老配置必须补上 Trae 渠道"
+        );
+
+        // 幂等：再读一次不会变成两条。
+        let again = Config::load_or_create(dir.path()).expect("再次读取");
+        assert_eq!(
+            again
+                .channels
+                .iter()
+                .filter(|c| c.adapter == "trae")
+                .count(),
+            1,
+            "补渠道必须幂等"
+        );
+    }
+
+    /// 用户主动停用的 Trae 渠道不能被"补"回来。
+    #[test]
+    fn disabled_trae_channel_is_not_reinserted() {
+        let mut channels = default_channels();
+        for channel in channels.iter_mut() {
+            if channel.adapter == "trae" {
+                channel.enabled = false;
+            }
+        }
+        assert!(!ensure_trae_channel(&mut channels), "已有 trae 渠道时不该动它");
+        assert_eq!(
+            channels.iter().filter(|c| c.adapter == "trae").count(),
+            1
+        );
     }
 }
