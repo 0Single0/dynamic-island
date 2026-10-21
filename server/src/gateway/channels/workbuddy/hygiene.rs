@@ -124,14 +124,43 @@ fn build_messages(request: &CanonicalRequest) -> Vec<Value> {
 
     let system: Vec<&str> = request.system.iter().filter_map(Block::as_text).collect();
     if !system.is_empty() {
+        // system 是"客户端自我声明"，允许做身份改写（user 内容不允许）。
         messages.push(json!({
             "role": "system",
-            "content": sanitize_text(&system.join("\n")),
+            "content": sanitize_text_with(&system.join("\n"), true),
         }));
     }
 
     for message in &request.messages {
         messages.push(build_message(message));
+    }
+
+    // **保证请求一定以 system 开头**。
+    //
+    // 官方客户端总会带一条 system；"没有 system 消息"本身就是一个渠道特征。
+    // system 清洗后变空（整段都是指纹）时也走这里补一条中性的，
+    // 避免发出一条 `content: ""` 的怪 system。
+    let needs_prompt = match messages.first() {
+        None => true,
+        Some(first) => {
+            first.get("role").and_then(Value::as_str) != Some("system")
+                || first
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_none_or(|text| text.trim().is_empty())
+        }
+    };
+    if needs_prompt {
+        // 已经有空的 system 就替换，没有才插入 —— 不能留两条 system。
+        match messages.first().map(|first| first.get("role").and_then(Value::as_str)) {
+            Some(Some("system")) => {
+                messages[0] = json!({ "role": "system", "content": DEFAULT_SYSTEM_PROMPT });
+            }
+            _ => messages.insert(
+                0,
+                json!({ "role": "system", "content": DEFAULT_SYSTEM_PROMPT }),
+            ),
+        }
     }
     messages
 }
@@ -195,13 +224,178 @@ fn content_value(blocks: &[Block]) -> Value {
     Value::Array(parts)
 }
 
+/// 注入的最小中性 system 提示词。
+///
+/// 上游的渠道校验会看"请求长什么样"：**没有 system 消息**本身就是一个特征
+/// （官方客户端总会带一条）。所以空手起手的请求先补一条中性的，
+/// 内容刻意不含任何品牌、模型名或工具声明。
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+
+/// 身份声明句式的品牌归属词。
+///
+/// 上游 WAF 把「客户端自我介绍 + 品牌」当成非官方渠道（`11-128`）：
+/// ```text
+/// You are an AI agent powered by DeepSeek Harness.
+/// You are a coding agent powered by the deepseek-v4.1-flash model.
+/// You are an AI assistant built on DeepSeek.
+/// ```
+/// 大小写不敏感、连续子串匹配；单独的品帬词或改语序后放行。
+/// 所以要把**整句**换掉，只删品牌词仍会被判异常。
+const IDENTITY_MARKERS: [&str; 2] = ["agent powered by", "assistant built on"];
+
+/// `You are ` 与品牌归属词之间允许的修饰词组合。
+///
+/// 对应参考实现正则里的 `an?(?:\s+AI)?(?:\s+coding)?`：`a`/`an` 必选，
+/// `AI` 与 `coding` 各自可选 —— 所以只有这 8 种合法形态。
+const IDENTITY_MODIFIERS: [&str; 8] = [
+    "a", "an", "a ai", "an ai", "a coding", "an coding", "a ai coding", "an ai coding",
+];
+
+/// 命中身份声明时用来替换的中性句（不含任何品牌）。
+const IDENTITY_REPLACEMENT: &str = "You are a helpful AI assistant.";
+
+/// OmO 框架的身份指纹：`Sisyphus-Junior - Focused executor`。
+///
+/// 参考实现确认：上游**按连续子串**匹配，且"改掉句式结构后就不再命中"。
+/// 所以这里把 `- ` 结构改成括号式（语义不变，结构已不同）——
+/// 比只做大小写归一化可靠：后者对原样出现的串等于没改。
+const OMO_PHRASE: &str = "sisyphus-junior";
+const OMO_TAIL: &str = "focused executor";
+const OMO_REPLACEMENT: &str = "Sisyphus-Junior (focused executor)";
+
+/// 找 `haystack` 里 `needle` 的所有（大小写不敏感）出现位置。
+fn find_all_ignore_case(haystack: &str, needle: &str) -> Vec<usize> {
+    let lower = haystack.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut positions = Vec::new();
+    let mut from = 0;
+    while let Some(index) = lower[from..].find(&needle) {
+        let absolute = from + index;
+        positions.push(absolute);
+        from = absolute + needle.len();
+        if from >= lower.len() {
+            break;
+        }
+    }
+    positions
+}
+
+/// 把身份声明整句换成中性句（只处理 system / developer 文本）。
+fn rewrite_identity_declarations(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    for marker in IDENTITY_MARKERS {
+        for marker_start in find_all_ignore_case(text, marker) {
+            if marker_start < cursor {
+                continue;
+            }
+            // 向前找 `You are `：最多回看 32 字节（修饰词组合最长也就这么多）。
+            let search_from = marker_start.saturating_sub(32);
+            let window = &lower[search_from..marker_start];
+            let Some(relative) = window.rfind("you are ") else {
+                continue;
+            };
+            let prefix_start = search_from + relative;
+            if prefix_start < cursor {
+                continue;
+            }
+            // 校验中间那段是不是合法修饰词组合。
+            let between = &lower[prefix_start + "you are ".len()..marker_start];
+            let normalized = between.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !IDENTITY_MODIFIERS.contains(&normalized.as_str()) {
+                continue;
+            }
+            // 找句尾：句号后跟空白/串尾，或换行（`v4.1` 里的点不算句尾）。
+            let end = identity_sentence_end(text, marker_start + marker.len());
+            output.push_str(&text[cursor..prefix_start]);
+            output.push_str(IDENTITY_REPLACEMENT);
+            cursor = end;
+        }
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+/// 从 `from` 开始找一句的结尾，返回**不含**结尾的字节偏移。
+///
+/// 与参考实现 `(?:\.(?=\s|$)|(?=\n|$))` 等价：
+/// · 句号后面是空白或串尾 → 句子结束（句号属于这句话，一并替换掉）；
+/// · 换行 → 句子结束（换行保留）；
+/// · 都没有 → 到串尾。
+fn identity_sentence_end(text: &str, from: usize) -> usize {
+    let mut chars = text[from..].char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if ch == '\n' {
+            return from + index;
+        }
+        if ch == '.' {
+            let ends_here = match chars.peek() {
+                None => true,
+                Some((_, next)) => next.is_whitespace(),
+            };
+            if ends_here {
+                return from + index + ch.len_utf8();
+            }
+        }
+    }
+    text.len()
+}
+
+/// OmO 指纹改结构（大小写不敏感）。
+fn neutralize_omo_fingerprint(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for start in find_all_ignore_case(text, OMO_PHRASE) {
+        if start < cursor {
+            continue;
+        }
+        let after_phrase = start + OMO_PHRASE.len();
+        // 允许 `-`/`–`/`—` 任何一种连字符，两侧可有空白。
+        let rest = &text[after_phrase..];
+        let trimmed = rest.trim_start();
+        let dash_len = rest.len() - trimmed.len();
+        let mut chars = trimmed.chars();
+        let Some(dash) = chars.next() else { continue };
+        if !matches!(dash, '-' | '–' | '—') {
+            continue;
+        }
+        let after_dash = &trimmed[dash.len_utf8()..];
+        let tail_trimmed = after_dash.trim_start();
+        if !tail_trimmed.to_lowercase().starts_with(OMO_TAIL) {
+            continue;
+        }
+        let end = after_phrase + dash_len + dash.len_utf8() + (after_dash.len() - tail_trimmed.len()) + OMO_TAIL.len();
+        output.push_str(&text[cursor..start]);
+        output.push_str(OMO_REPLACEMENT);
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
 /// 把会被判「未授权渠道」的特征串改写成等价写法，并抹平 `\r\n` 残片。
-pub fn sanitize_text(text: &str) -> String {
+///
+/// `identity` 控制是否处理**身份声明句式**：
+/// · `true` —— system / developer 角色。这类文本是"客户端自我声明"，
+///   改写它不影响模型行为，却能去掉 WAF 最大的一个指纹；
+/// · `false` —— user / assistant / tool 角色。这些是**用户数据**，
+///   改写会让模型看到与磁盘不一致的内容（参考实现 #537 因此明确收窄）。
+pub fn sanitize_text_with(text: &str, identity: bool) -> String {
     // 绝大多数请求没有任何特征串：先判断，省掉下面这一串无谓的拷贝与扫描。
-    if !has_fingerprint(text) {
+    if !has_fingerprint_with(text, identity) {
         return text.to_string();
     }
     let mut output = text.to_string();
+
+    // ① 身份声明整句换中性写法（最先做：它吃掉整句后，后面的规则少扫一遍）。
+    if identity {
+        output = rewrite_identity_declarations(&output);
+    }
+    // ② OmO 框架指纹：改句式结构而不是删词（删词不解除匹配）。
+    output = neutralize_omo_fingerprint(&output);
+
     // **计费头残片要整段删**（参考实现的 SANITIZE_HDR_RE + SANITIZE_KV_RE）：
     // Claude Code 的 system 里有被塞进来的 HTTP 头结构 ——
     //   x-anthropic-billing-header: cc_version=2.1.296.32d; cc_...=...; ...
@@ -255,11 +449,29 @@ pub fn sanitize_text(text: &str) -> String {
         }
     }
     // `\r\n` 残片会被上游当成"伪造头"的特征。
-    output.replace("\r\n", "\n")
+    output = output.replace("\r\n", "\n");
+    // 首尾空白也带着"拼接进来的头部"形状，一并去掉。
+    output.trim().to_string()
+}
+
+/// 兼容入口：按「非身份文本」处理（user / tool 内容）。
+pub fn sanitize_text(text: &str) -> String {
+    sanitize_text_with(text, false)
+}
+
+/// 按角色决定要不要做身份改写：只有 system / developer 是"客户端自我声明"。
+pub fn sanitize_for_role(text: &str, role: &str) -> String {
+    let identity = matches!(role, "system" | "developer");
+    sanitize_text_with(text, identity)
 }
 
 /// 是否含需要处理的特征（给调用方做"要不要改写"的判断，避免无谓的字符串拷贝）。
 pub fn has_fingerprint(text: &str) -> bool {
+    has_fingerprint_with(text, true)
+}
+
+/// `identity` = 是否把身份声明句式也算作特征（只对 system / developer 为 true）。
+pub fn has_fingerprint_with(text: &str, identity: bool) -> bool {
     FINGERPRINT_REWRITES
         .iter()
         .any(|(from, _)| !from.is_empty() && text.contains(from))
@@ -267,6 +479,9 @@ pub fn has_fingerprint(text: &str) -> bool {
         // 计费头残片：cc_* KV（WAF 指纹，见 sanitize_text 里的注释）。
         || text.contains("cc_")
         || text.contains("\r\n")
+        // OmO 指纹与身份声明的变体太多，字面量认不出。
+        || !find_all_ignore_case(text, OMO_PHRASE).is_empty()
+        || (identity && IDENTITY_MARKERS.iter().any(|marker| !find_all_ignore_case(text, marker).is_empty()))
 }
 
 /// 工具配对自愈：合并相邻 assistant(tool_calls) → 按 call 重排 tool 结果 → 清孤儿。
@@ -461,7 +676,10 @@ fn force_stream(body: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::channels::workbuddy::identity;
+    use crate::gateway::channels::AccountSnapshot;
     use crate::gateway::protocol::cir::{CanonicalRequest, ToolCall, ToolSpec};
+    use crate::gateway::transport::{self, UpstreamRequest};
     use serde_json::json;
 
     fn request() -> CanonicalRequest {
@@ -492,6 +710,135 @@ mod tests {
         }
     }
 
+    /// 只带 user 消息（`role, text` 列表）的最小请求。
+    fn request_with(messages: &[(&str, &str)]) -> CanonicalRequest {
+        let mut request = request();
+        request.system.clear();
+        request.messages = messages
+            .iter()
+            .map(|(role, text)| Message {
+                role: match *role {
+                    "assistant" => Role::Assistant,
+                    "tool" => Role::Tool,
+                    _ => Role::User,
+                },
+                content: vec![Block::text(*text)],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            })
+            .collect();
+        request
+    }
+
+    /// 身份声明句式（`You are an AI agent powered by X`）—— 这是触发
+    /// `11-128 Illegal API invocation from an unapproved channel` 的主要指纹。
+    #[test]
+    fn identity_declarations_are_replaced_with_a_neutral_sentence() {
+        for source in [
+            "You are an AI agent powered by DeepSeek Harness.",
+            "You are a coding agent powered by the deepseek-v4.1-flash model.",
+            "You are an AI assistant built on DeepSeek.",
+        ] {
+            let cleaned = sanitize_text_with(source, true);
+            assert_eq!(
+                cleaned, "You are a helpful AI assistant.",
+                "整句要换成中性句：{source}"
+            );
+        }
+    }
+
+    /// 大小写不敏感；修饰词可有可无，但只删品牌词不算修好。
+    #[test]
+    fn identity_matching_is_case_insensitive_and_covers_modifier_variants() {
+        for source in [
+            "you are an ai agent powered by deepseek harness.",
+            "You are an agent powered by Foo.",
+            "You are a coding assistant built on Bar.",
+            "You are an AI coding agent powered by Baz Copilot.",
+        ] {
+            assert_eq!(
+                sanitize_text_with(source, true),
+                "You are a helpful AI assistant.",
+                "变体也要命中：{source}"
+            );
+        }
+    }
+
+    /// 句子里的 `v4.1` 那种点不能被当成句尾（否则会截断出半句话）。
+    #[test]
+    fn identity_rewrite_stops_at_the_real_sentence_end() {
+        let cleaned = sanitize_text_with(
+            "You are a coding agent powered by the deepseek-v4.1-flash model. 后续指令保持原样。",
+            true,
+        );
+        assert_eq!(cleaned, "You are a helpful AI assistant. 后续指令保持原样。");
+    }
+
+    /// 身份改写**只对 system / developer 生效**：user / tool 是用户数据。
+    #[test]
+    fn identity_rewrite_is_limited_to_system_roles() {
+        let source = "You are an AI agent powered by DeepSeek Harness.";
+        assert_eq!(
+            sanitize_for_role(source, "system"),
+            "You are a helpful AI assistant."
+        );
+        assert_eq!(
+            sanitize_for_role(source, "developer"),
+            "You are a helpful AI assistant."
+        );
+        assert_eq!(sanitize_for_role(source, "user"), source, "user 内容不能改");
+        assert_eq!(sanitize_for_role(source, "tool"), source);
+    }
+
+    /// OmO 框架指纹：必须**改句式结构**才算解除匹配（只删词不行）。
+    #[test]
+    fn omo_junior_fingerprint_loses_its_structure() {
+        let cleaned = sanitize_text("agent=Sisyphus-Junior - Focused executor; mode=hard");
+        assert!(
+            !cleaned.contains("Sisyphus-Junior - Focused executor"),
+            "{cleaned}"
+        );
+        assert!(cleaned.contains("focused executor"), "语义要保留：{cleaned}");
+
+        // 大小写与不同连字符的变体同样命中。
+        let variant = sanitize_text("x sisyphus-junior – focused executor y");
+        assert!(
+            !variant.to_lowercase().contains("focused executor")
+                || !variant.contains("–"),
+            "变体也要改结构：{variant}"
+        );
+    }
+
+    /// 请求必须**以 system 开头**：缺了就补一条中性提示词。
+    #[test]
+    fn body_always_starts_with_a_system_message() {
+        let request = request_with(&[("user", "你好")]);
+        let body = build_chat_body("glm-5.3", &request);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(body["messages"][1]["content"], "你好");
+    }
+
+    /// 整段 system 都是指纹、清洗后变空时，也要补回中性提示词（不能发空 system）。
+    #[test]
+    fn empty_system_after_sanitizing_falls_back_to_the_neutral_prompt() {
+        let mut request = request_with(&[("user", "hi")]);
+        request.system = vec![Block::text("x-anthropic-billing-hdr")];
+        let body = build_chat_body("glm-5.3", &request);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], DEFAULT_SYSTEM_PROMPT);
+        let systems = body["messages"]
+            .as_array()
+            .expect("数组")
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .count();
+        assert_eq!(systems, 1, "只能有一条 system");
+    }
+
+
     fn assistant_with_call(id: &str, name: &str) -> Message {
         Message {
             role: Role::Assistant,
@@ -515,6 +862,84 @@ mod tests {
             tool_call_id: Some(id.into()),
             name: None,
             reasoning: None,
+        }
+    }
+
+    /// 真实上游回归闸门：走**完整出站管线**（报文卫生 + 会话身份头），
+    /// 确认一次真实对话能拿到模型回复，而不是 `11-128`。
+    ///
+    /// 凭据从环境变量取，不进仓库：
+    /// ```text
+    /// PROBE_WB_TOKEN=<Cloud-IDE-JWT> \
+    ///   cargo test probe_real_chat_passes -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn probe_real_chat_passes() {
+        let Ok(token) = std::env::var("PROBE_WB_TOKEN") else {
+            println!("未设置 PROBE_WB_TOKEN，跳过");
+            return;
+        };
+        let uid = std::env::var("PROBE_WB_UID").unwrap_or_else(|_| "probe-uid".into());
+        let account = AccountSnapshot {
+            channel_id: "wb-cn".into(),
+            uid,
+            access_token: Some(token),
+            refresh_token: None,
+            enterprise_id: None,
+            ..Default::default()
+        };
+
+        // 用**真实管线**构建请求：清洗 + 会话身份头都在里面。
+        let mut request = request_with(&[("user", "用一句话回答：1+1 等于几？")]);
+        request.model = "glm-5.3".into();
+        request.system = vec![Block::text(
+            "You are an AI agent powered by DeepSeek Harness.",
+        )];
+        request.max_tokens = Some(64);
+        request.stream = true;
+
+        let body = build_chat_body(&request.model, &request);
+        // 清洗后 system 不该再含身份声明。
+        let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+        println!("=== 清洗后 system ===\n{system}");
+        assert!(
+            !system.to_lowercase().contains("powered by"),
+            "身份声明没被清掉：{system}"
+        );
+
+        let hosts = identity::hosts(identity::Realm::Cn, identity::Outbound::Desktop);
+        let headers = identity::with_conversation_identity(
+            identity::chat_headers(
+                &account.channel_id,
+                identity::Realm::Cn,
+                identity::Outbound::Desktop,
+                &hosts,
+                &account,
+                1,
+            ),
+            &account.channel_id,
+            &account.uid,
+            Some("probe-session"),
+        );
+        let upstream = UpstreamRequest {
+            url: hosts.chat_url("/v2/chat/completions"),
+            headers,
+            body,
+        };
+        match transport::send(&upstream, &reqwest::Client::new()).await {
+            Ok(response) => {
+                let text = response.text().await.unwrap_or_default();
+                if text.contains("11-128") || text.contains("unapproved") {
+                    panic!("仍被渠道校验拦截：{}", text.chars().take(400).collect::<String>());
+                }
+                println!("=== 放行 ===\n{}", text.chars().take(700).collect::<String>());
+            }
+            Err(failure) => panic!(
+                "上游拒绝：status={} {}",
+                failure.status,
+                failure.body.chars().take(400).collect::<String>()
+            ),
         }
     }
 

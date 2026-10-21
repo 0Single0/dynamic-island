@@ -154,6 +154,110 @@ fn billing_user_agent(domain: &str) -> String {
     }
 }
 
+/// 会话身份头（官方桌面端的 `X-Conversation-*` 家族）。
+///
+/// **缺这一族会直接 `11-128 Illegal API invocation from an unapproved channel`**
+/// —— 参考实现在 `wb_identity.py` 里明确记了这个成因（"conversation id missing"）。
+/// 官方客户端每一轮对话都带齐这几个 id，缺任何一个都像"非官方调用"。
+///
+/// | 头 | 生命周期 | 形态 |
+/// |---|---|---|
+/// | `X-Conversation-ID` | 整个会话恒定 | 带连字符的 UUID |
+/// | `X-Conversation-Request-ID` | 一轮 user send | 32 位无连字符 hex |
+/// | `X-Root-Request-ID` | 同上一轮（两者等值） | 同上 |
+/// | `X-Conversation-Message-ID` | 每个请求 | 同上 |
+/// | `X-Request-ID` | 同 Message-ID | 同上 |
+///
+/// 上游**不拿这些 id 存历史**（实测换 id 回答不变），所以稳定派生只为"像官方"，
+/// 不承担语义职责。
+pub fn conversation_headers(
+    channel_id: &str,
+    uid: &str,
+    session_key: Option<&str>,
+) -> Vec<(String, String)> {
+    // 会话 id：有会话键就按 (渠道, uid, 会话键) 稳定派生，没有就每次新生成。
+    let conversation_id = match session_key.filter(|key| !key.trim().is_empty()) {
+        Some(key) => stable_uuid(channel_id, uid, key),
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let turn_request_id = message_id();
+    let message = message_id();
+    let span = message_id()[..16].to_string();
+    let mut headers = vec![
+        ("X-Conversation-ID".to_string(), conversation_id),
+        (
+            "X-Conversation-Request-ID".to_string(),
+            turn_request_id.clone(),
+        ),
+        ("X-Root-Request-ID".to_string(), turn_request_id),
+        ("X-Conversation-Message-ID".to_string(), message.clone()),
+        ("X-Request-ID".to_string(), message.clone()),
+        // 官方主对话固定是 main；子代理才用别的值。
+        ("X-Agent-Type".to_string(), "main".to_string()),
+        // 允许私有数据：官方桌面端默认发。
+        ("X-Private-Data".to_string(), "true".to_string()),
+    ];
+    // 链路追踪头：官方每条 chat 请求都带，缺了同样像非官方调用。
+    headers.extend([
+        ("X-Trace-ID".to_string(), message.clone()),
+        (
+            "traceparent".to_string(),
+            format!("00-{message}-{span}-01"),
+        ),
+        ("b3".to_string(), format!("{message}-{span}-1")),
+        ("X-B3-TraceId".to_string(), message),
+        ("X-B3-SpanId".to_string(), span),
+    ]);
+    headers
+}
+
+/// 32 位无连字符的小写 hex（官方 `X-Request-ID` 的形态）。
+fn message_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 由 (渠道, uid, 会话键) 稳定派生的 UUID（带连字符、v4 版本位）。
+fn stable_uuid(channel_id: &str, uid: &str, session_key: &str) -> String {
+    let seed = security::derive_id(channel_id, uid, &format!("conversation:{session_key}"));
+    let mut hex: String = seed.chars().take(32).collect();
+    while hex.len() < 32 {
+        hex.push('0');
+    }
+    let mut chars: Vec<char> = hex.chars().collect();
+    // 版本位（第 13 个 hex）固定 4，变体位（第 17 个）固定 a —— 与参考实现一致。
+    chars[12] = '4';
+    chars[16] = 'a';
+    let text: String = chars.into_iter().collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &text[0..8],
+        &text[8..12],
+        &text[12..16],
+        &text[16..20],
+        &text[20..32]
+    )
+}
+
+/// 把会话身份头并进已有的头组，**并替换**掉旧的 `X-Request-ID`。
+///
+/// 必须替换而不是追加：`reqwest` 的 `.header()` 是追加语义，
+/// 同时发两个 `X-Request-ID` 比不发更像异常客户端。
+pub fn with_conversation_identity(
+    mut headers: Vec<(String, String)>,
+    channel_id: &str,
+    uid: &str,
+    session_key: Option<&str>,
+) -> Vec<(String, String)> {
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("x-request-id")
+            && !name.eq_ignore_ascii_case("x-conversation-id")
+            && !name.eq_ignore_ascii_case("x-agent-type")
+            && !name.eq_ignore_ascii_case("x-private-data")
+    });
+    headers.extend(conversation_headers(channel_id, uid, session_key));
+    headers
+}
+
 /// 对话与配置请求的头组：鉴权 + 设备指纹 + 出站身份。
 pub fn chat_headers(
     channel_id: &str,
@@ -195,12 +299,17 @@ pub fn chat_headers(
 
     match outbound {
         Outbound::Desktop => {
+            // 与官方桌面端抓包逐项对齐：`X-Product` 是 **SaaS**（不是产品名），
+            // 且必须带 `X-Agent-Intent: craft` —— 少这个上游会判成"非官方调用"。
             headers.extend([
+                ("X-Agent-Intent".into(), "craft".into()),
                 ("X-Agent-Purpose".into(), "conversation".into()),
+                ("X-Agent-Type".into(), "main".into()),
                 ("X-IDE-Name".into(), "WorkBuddy".into()),
                 ("X-IDE-Type".into(), "WorkBuddy".into()),
                 ("X-IDE-Version".into(), "5.5.6".into()),
-                ("X-Product".into(), "WorkBuddy".into()),
+                ("X-Product".into(), "SaaS".into()),
+                ("X-Private-Data".into(), "true".into()),
             ]);
         }
         Outbound::Cli => {
@@ -309,6 +418,138 @@ mod tests {
         assert!(cli
             .iter()
             .any(|(key, value)| key == "X-IDE-Type" && value == "CLI"));
+    }
+
+    /// `X-Conversation-*` 族是**防止 11-128 的必需项**：缺了上游直接判
+    /// "conversation id missing"。这里锁住"一个都不能少"。
+    #[test]
+    fn conversation_identity_sends_the_whole_family() {
+        let headers = conversation_headers("wb-cn", "uid-1", Some("sess-1"));
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        for required in [
+            "X-Conversation-ID",
+            "X-Conversation-Request-ID",
+            "X-Root-Request-ID",
+            "X-Conversation-Message-ID",
+            "X-Request-ID",
+            "X-Trace-ID",
+            "traceparent",
+            "b3",
+            "X-B3-TraceId",
+            "X-B3-SpanId",
+        ] {
+            assert!(find(required).is_some(), "缺少必需头 {required}");
+        }
+        assert_eq!(find("X-Agent-Type").as_deref(), Some("main"));
+        assert_eq!(find("X-Private-Data").as_deref(), Some("true"));
+        // 一轮内 Request-ID 与 Root-Request-ID 等值，Message-ID 独立。
+        assert_eq!(
+            find("X-Conversation-Request-ID"),
+            find("X-Root-Request-ID"),
+            "同一轮的 turn id 要一致"
+        );
+        assert_eq!(find("X-Request-ID"), find("X-Conversation-Message-ID"));
+    }
+
+    /// 形态要对：Conversation-ID 带连字符，其余 32 位无连字符 hex。
+    #[test]
+    fn conversation_ids_have_the_official_shape() {
+        let headers = conversation_headers("wb-cn", "uid-1", Some("sess-1"));
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        let conversation = find("X-Conversation-ID");
+        assert_eq!(conversation.len(), 36, "UUID 带连字符应 36 位：{conversation}");
+        assert_eq!(conversation.matches('-').count(), 4);
+        for name in ["X-Request-ID", "X-Conversation-Message-ID"] {
+            let value = find(name);
+            assert_eq!(value.len(), 32, "{name} 应 32 位：{value}");
+            assert!(
+                value.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "{name} 应为 hex：{value}"
+            );
+        }
+    }
+
+    /// 同一会话必须复用同一个 Conversation-ID（多轮对话不该每次都换）。
+    #[test]
+    fn conversation_id_is_stable_within_a_session() {
+        let pick = |headers: &Vec<(String, String)>| {
+            headers
+                .iter()
+                .find(|(key, _)| key == "X-Conversation-ID")
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        let first = conversation_headers("wb-cn", "uid-1", Some("sess-1"));
+        let second = conversation_headers("wb-cn", "uid-1", Some("sess-1"));
+        assert_eq!(pick(&first), pick(&second), "同会话必须稳定");
+
+        let other_session = conversation_headers("wb-cn", "uid-1", Some("sess-2"));
+        assert_ne!(pick(&first), pick(&other_session), "换会话要换 id");
+
+        let other_account = conversation_headers("wb-cn", "uid-2", Some("sess-1"));
+        assert_ne!(
+            pick(&first),
+            pick(&other_account),
+            "换账号要换 id（否则成了跨账号关联键）"
+        );
+    }
+
+    /// 并入时要把旧的 `X-Request-ID` 换掉，不能同时发两个。
+    #[test]
+    fn merging_replaces_the_legacy_request_id() {
+        let base = vec![
+            ("X-Request-ID".to_string(), "legacy-000001".to_string()),
+            ("Authorization".to_string(), "Bearer t".to_string()),
+        ];
+        let merged = with_conversation_identity(base, "wb-cn", "uid-1", Some("sess-1"));
+        let request_ids: Vec<&String> = merged
+            .iter()
+            .filter(|(name, _)| name == "X-Request-ID")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(request_ids.len(), 1, "只能有一个 X-Request-ID");
+        assert_ne!(request_ids[0], "legacy-000001", "旧值必须被替换");
+        assert!(merged
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value == "Bearer t"));
+    }
+
+    /// 桌面端身份的关键取值：`X-Product` 必须是 SaaS，且带 `X-Agent-Intent`。
+    #[test]
+    fn desktop_identity_matches_the_official_client() {
+        let headers = chat_headers(
+            "wb-cn",
+            Realm::Cn,
+            Outbound::Desktop,
+            &hosts(Realm::Cn, Outbound::Desktop),
+            &account(),
+            1,
+        );
+        let find = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(find("X-Product").as_deref(), Some("SaaS"));
+        assert_eq!(find("X-Agent-Intent").as_deref(), Some("craft"));
+        assert_eq!(find("X-Agent-Type").as_deref(), Some("main"));
+        assert_eq!(find("X-Private-Data").as_deref(), Some("true"));
+        assert_eq!(
+            find("User-Agent").as_deref(),
+            Some("WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1")
+        );
     }
 
     #[test]

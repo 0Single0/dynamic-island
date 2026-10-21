@@ -90,16 +90,26 @@ impl ChannelAdapter for WorkbuddyChannel {
     ) -> Result<UpstreamRequest, GatewayError> {
         let body = hygiene::build_chat_body(&request.model, request);
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let headers = identity::chat_headers(
+            &self.id,
+            self.realm,
+            self.outbound,
+            &self.hosts,
+            account,
+            sequence,
+        );
+        // **必须补上 X-Conversation-* 族**：缺了上游直接 11-128
+        // （"Illegal API invocation from an unapproved channel"）。
+        // 会话键取自调用方给的 session，保证多轮复用同一个 Conversation-ID。
+        let headers = identity::with_conversation_identity(
+            headers,
+            &self.id,
+            &account.uid,
+            request.metadata.session_key().as_deref(),
+        );
         Ok(UpstreamRequest {
             url: self.hosts.chat_url(catalog::CHAT_PATH),
-            headers: identity::chat_headers(
-                &self.id,
-                self.realm,
-                self.outbound,
-                &self.hosts,
-                account,
-                sequence,
-            ),
+            headers,
             body,
         })
     }
