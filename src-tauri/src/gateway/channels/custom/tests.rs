@@ -9,7 +9,7 @@ use super::encode::{
     build_anthropic_body, build_openai_body, build_responses_body, normalize_tool_choice,
     normalize_tool_choice_anthropic,
 };
-use super::{AccountSnapshot, CustomChannel, UpstreamProtocol};
+use super::{body_shape, AccountSnapshot, CustomChannel, UpstreamProtocol};
 
 fn request() -> CanonicalRequest {
     CanonicalRequest {
@@ -454,4 +454,74 @@ fn responses_protocol_routes_to_the_responses_endpoint() {
     );
     assert_eq!(full.chat_url(), "https://api.example.com/v1/responses");
     let _ = UpstreamProtocol::parse("responses");
+}
+
+/// 华为系上游把错误塞进 200 SSE 流里；必须识别，并附带**出站报文结构**。
+///
+/// 上游只说 `The request param is invalid`，不说哪个字段 ——
+/// 报文又是从客户端原始 body 派生的（Responses 专有字段会被带出），
+/// 所以错误里要能直接看到"我们发了哪些键"。
+#[test]
+fn embedded_stream_error_reports_the_outgoing_shape() {
+    let channel = CustomChannel::from_options(
+        "华为",
+        &json!({"base_url": "https://api.modelarts-maas.com/v2", "protocol": "openai-chat"}),
+    );
+    // 先"发"一个带跨协议字段的报文，让渠道记住形状。
+    let mut body = build_openai_body(&request());
+    body["reasoning"] = json!({"effort": "medium"});
+    body["include"] = json!(["reasoning.encrypted_content"]);
+    if let Ok(mut slot) = channel.last_shape.lock() {
+        *slot = Some(body_shape(&body));
+    }
+
+    let events = channel.parse_event(
+        r#"{"text":"[DONE]","error_code":"InferHub.001001005.400","error_msg":"The request param is invalid, Please check it"}"#,
+    );
+    let message = events
+        .iter()
+        .find_map(|event| match event {
+            CanonicalEvent::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("必须转成 Error 事件：{events:?}"));
+    assert!(message.contains("InferHub.001001005.400"), "{message}");
+    assert!(message.contains("出站报文结构"), "{message}");
+    // 跨协议字段要被点名，这是排障的关键信息。
+    assert!(message.contains("跨协议字段"), "{message}");
+    assert!(message.contains("reasoning"), "{message}");
+    assert!(message.contains("include"), "{message}");
+
+    // 正常帧不能被误判。
+    assert!(channel
+        .parse_event(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+        .iter()
+        .all(|event| !matches!(event, CanonicalEvent::Error { .. })));
+    // `error_code: "0"` 是正常结束。
+    assert!(channel
+        .parse_event(r#"{"error_code":"0","text":"[DONE]"}"#)
+        .iter()
+        .all(|event| !matches!(event, CanonicalEvent::Error { .. })));
+}
+
+/// 形状摘要不能泄露正文。
+#[test]
+fn body_shape_never_leaks_message_text() {
+    let body = json!({
+        "model": "deepseek-v4.1-flash",
+        "stream": true,
+        "messages": [
+            {"role": "system", "content": "机密提示词"},
+            {"role": "user", "content": "我的身份证号是 123456"}
+        ],
+        "tools": [{"type":"function","function":{"name":"get_weather"}}]
+    });
+    let shape = body_shape(&body);
+    assert!(!shape.contains("机密提示词"), "{shape}");
+    assert!(!shape.contains("123456"), "{shape}");
+    // 但结构信息要在。
+    assert!(shape.contains("keys="), "{shape}");
+    assert!(shape.contains("messages=2"), "{shape}");
+    assert!(shape.contains("system,user"), "{shape}");
+    assert!(shape.contains("get_weather"), "{shape}");
 }

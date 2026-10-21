@@ -118,6 +118,12 @@ pub struct CustomChannel {
     require_api_key: bool,
     /// 单调序号：给 X-Request-ID 用，避免同账号高并发下撞 ID。
     sequence: AtomicU64,
+    /// 最近一次出站报文的**结构摘要**（不含正文）。
+    ///
+    /// 上游报"参数非法"时，只回一句 `The request param is invalid`，
+    /// 不说哪个字段。把形状记下来，错误里就能直接指出"我们发了哪些键"，
+    /// 不用再靠猜或翻日志。刻意只存结构：正文是用户数据。
+    last_shape: std::sync::Mutex<Option<String>>,
 }
 
 impl CustomChannel {
@@ -144,6 +150,7 @@ impl CustomChannel {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             sequence: AtomicU64::new(0),
+            last_shape: std::sync::Mutex::new(None),
         }
     }
 
@@ -174,6 +181,122 @@ impl CustomChannel {
     fn model_meta(&self, id: &str) -> Option<&UpstreamModel> {
         self.models.iter().find(|model| model.id == id)
     }
+
+    /// 识别藏在 200 SSE 流里的业务错误；命中时把**出站报文结构**一并带进消息。
+    ///
+    /// 上游只说 `The request param is invalid`，不说是哪个字段 —— 而这条链路
+    /// 的报文是从客户端的原始 body 派生来的（Responses / Anthropic 专有字段
+    /// 会被一并带出）。把顶层键与关键取值列出来，才能一眼看出问题。
+    fn embedded_error(&self, frame: &str) -> Option<String> {
+        let value: Value = serde_json::from_str(frame).ok()?;
+        let code = value
+            .get("error_code")
+            .or_else(|| value.get("errorCode"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|code| !code.is_empty() && *code != "0")?;
+        let message = value
+            .get("error_msg")
+            .or_else(|| value.get("errorMsg"))
+            .or_else(|| value.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let shape = self
+            .last_shape
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "（无记录）".into());
+        Some(format!("{code} {message}｜出站报文结构：{shape}"))
+    }
+}
+
+/// JSON 值的类型名（`Value::type_name` 在本版本不可用）。
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// 出站报文的**结构摘要**：顶层键 + 几个容易踩雷的取值，不含任何正文。
+///
+/// 用来回答"上游说参数非法，到底哪一项"。`tools`/`messages` 只报数量与角色，
+/// 不把用户内容写进错误消息或日志。
+fn body_shape(body: &Value) -> String {
+    let Some(map) = body.as_object() else {
+        return format!("（非对象：{}）", value_kind(body));
+    };
+    let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    let mut parts = vec![format!(
+        "keys=[{}]",
+        keys.join(",")
+    )];
+    if let Some(messages) = map.get("messages").and_then(Value::as_array) {
+        let roles: Vec<&str> = messages
+            .iter()
+            .filter_map(|message| message.get("role").and_then(Value::as_str))
+            .collect();
+        let tool_calls = messages
+            .iter()
+            .filter(|message| message.get("tool_calls").is_some())
+            .count();
+        parts.push(format!("messages={} 角色=[{}]", messages.len(), roles.join(",")));
+        if tool_calls > 0 {
+            parts.push(format!("带 tool_calls 的消息={tool_calls}"));
+        }
+    }
+    if let Some(tools) = map.get("tools").and_then(Value::as_array) {
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .or_else(|| tool.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        parts.push(format!("tools={} [{}]", tools.len(), names.join(",")));
+    }
+    if let Some(choice) = map.get("tool_choice") {
+        let shown = match choice {
+            Value::String(text) => format!("\"{text}\""),
+            other => format!("对象({})", value_kind(other)),
+        };
+        parts.push(format!("tool_choice={shown}"));
+    }
+    for key in ["max_tokens", "max_output_tokens", "reasoning_effort", "temperature", "n"] {
+        if let Some(value) = map.get(key) {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    // 这些是**别的协议**专有的键，出现在 chat 报文里通常就是"参数非法"的来源。
+    let foreign: Vec<&str> = [
+        "reasoning",
+        "text",
+        "include",
+        "store",
+        "truncation",
+        "prompt_cache_key",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "thinking",
+        "top_k",
+        "stop_sequences",
+    ]
+    .into_iter()
+    .filter(|key| map.contains_key(*key))
+    .collect();
+    if !foreign.is_empty() {
+        parts.push(format!("⚠ 跨协议字段=[{}]", foreign.join(",")));
+    }
+    parts.join(" ")
 }
 
 #[async_trait]
@@ -221,6 +344,10 @@ impl ChannelAdapter for CustomChannel {
                 build_anthropic_body(request, max_output)
             }
         };
+        // 记下出站报文的**结构**（不含正文），上游报"参数非法"时能直接指出是谁的问题。
+        if let Ok(mut slot) = self.last_shape.lock() {
+            *slot = Some(body_shape(&body));
+        }
         Ok(UpstreamRequest {
             url: self.chat_url(),
             headers,
@@ -229,6 +356,14 @@ impl ChannelAdapter for CustomChannel {
     }
 
     fn parse_event(&self, frame: &str) -> Vec<CanonicalEvent> {
+        // 上游会把业务错误塞进 HTTP 200 的流里（华为系 CodeArts / ModelArts 都这样）：
+        // `{"text":"[DONE]","error_code":"InferHub.001001005.400",
+        //   "error_msg":"The request param is invalid"}`。
+        // 不识别的话这一帧没有 choices，会被当成"空内容"静默吞掉，
+        // 最后记成「完成 / 输出 0」——真正的失败就丢了。
+        if let Some(error) = self.embedded_error(frame) {
+            return vec![CanonicalEvent::Error { message: error }];
+        }
         match self.protocol {
             UpstreamProtocol::OpenAi => openai_compat::parse_openai_chunk(frame),
             UpstreamProtocol::Responses => parse_responses_event(frame),
