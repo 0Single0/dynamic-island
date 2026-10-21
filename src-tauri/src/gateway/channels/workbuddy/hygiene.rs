@@ -816,6 +816,20 @@ mod tests {
             assert!(!has_fingerprint(&cleaned), "洗完不该再算特征：{cleaned}");
         }
 
+        // 冠词一并吃掉，不能留下 `the the runtime`。
+        let cleaned = sanitize_for_role(
+            "The runtime context names the DeepSeek Harness implementation checkout.",
+            "system",
+        );
+        assert!(!cleaned.contains("the the"), "冠词不能叠：{cleaned}");
+
+        // 冠词判定必须有词边界：`breathe` 结尾的 `the` 不能被吞掉。
+        let boundary = sanitize_for_role("please breathe DeepSeek Harness", "system");
+        assert!(
+            boundary.contains("breathe the runtime"),
+            "不能吞掉单词内部的 the：{boundary}"
+        );
+
         // 大小写与分隔符变体同样命中（上游按连续子串匹配）。
         for variant in ["deepseek-harness", "DEEPSEEK_HARNESS", "DeepSeek   Harness"] {
             let cleaned = sanitize_for_role(variant, "developer");
