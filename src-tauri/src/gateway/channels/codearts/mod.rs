@@ -69,6 +69,19 @@ impl CodeArtsChannel {
         format!("{}{path}", self.base_url)
     }
 
+    /// 稳定的上游会话 id（`Chat-Id` / `Session-Id`）。
+    ///
+    /// 上游按会话计并发，超过 3 个就 `TM.00001041`。所以必须：
+    /// · 同一轮对话 → 同一个 id（多轮复用，也保住 prompt cache 亲和）；
+    /// · 客户端没给会话键 → 回落到该账号的固定 id（绝不能每请求新生成）。
+    fn session_id(&self, account: &AccountSnapshot, session_key: Option<&str>) -> String {
+        let key = session_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .unwrap_or("shared");
+        crate::gateway::security::derive_id(&self.id, &account.uid, &format!("chat:{key}"))
+    }
+
     /// 从账号凭据里取出签名材料。缺 AK/SK 时**直接报错**，
     /// 而不是发一个注定 401 的请求（那样只会让账号进冷却，更难排查）。
     fn credentials(account: &AccountSnapshot) -> Result<SignCredentials, GatewayError> {
@@ -173,14 +186,22 @@ impl ChannelAdapter for CodeArtsChannel {
         let raw = serde_json::to_vec(&body)
             .map_err(|error| GatewayError::internal(format!("请求体序列化失败：{error}")))?;
         let url = self.url(CHAT_PATH);
-        let mut extra = vec![
+        // 会话标识**必须稳定**。
+        //
+        // 上游按会话计并发，**超过 3 个会话**就回
+        // `TM.00001041 并发会话数已达上限(3个),请关闭部分会话后重试`。
+        // 之前只在客户端给了 session_key 时才发 Chat-Id，没给就每请求一个新会话，
+        // 连发几个就把账号打满 —— 表现是"用几下就不能用了"。
+        //
+        // 这里按 (账号, 会话键) 稳定派生：同一轮对话恒定落在同一会话上；
+        // 客户端完全没给会话键时退回到该账号的固定会话（所有请求共用），
+        // 宁可牺牲跨对话的缓存亲和，也不要打满并发上限。
+        let session = self.session_id(account, request.metadata.session_key().as_deref());
+        let extra = vec![
             ("tool_stream".to_string(), "true".to_string()),
+            ("Chat-Id".to_string(), session.clone()),
+            ("Session-Id".to_string(), session),
         ];
-        // 会话粘性：把会话键作为 chat_id，保证多轮落在同一上游会话
-        // （上游按它做 prompt cache 亲和）。
-        if let Some(session) = request.metadata.session_key() {
-            extra.push(("Chat-Id".to_string(), session.clone()));
-        }
         let headers = self.signed_headers(
             account,
             &credentials,
@@ -197,8 +218,19 @@ impl ChannelAdapter for CodeArtsChannel {
         })
     }
 
-    /// 上游是标准 OpenAI SSE：直接复用通用解析。
+    /// 上游是标准 OpenAI SSE；但**错误会被塞进 HTTP 200 的流里**，先拦一层。
     fn parse_event(&self, frame: &str) -> Vec<CanonicalEvent> {
+        // ```json
+        // {"text":"[DONE]","error_code":"TM.00001041",
+        //  "error_msg":"并发会话数已达上限(3个),请关闭部分会话后重试。"}
+        // ```
+        // 这种帧没有 `choices`，通用解析器返回空 —— 于是整条流"正常结束"，
+        // 用量被记成「完成 / 输出 0」，真正的失败被吞掉（截图里的 0 输出行）。
+        if let Some(error) = embedded_stream_error(frame) {
+            return vec![CanonicalEvent::Error {
+                message: error.describe(),
+            }];
+        }
         openai_compat::parse_openai_chunk(frame)
     }
 
@@ -683,6 +715,33 @@ fn normalize_rate(value: &str) -> String {
 /// · `002002009` / `not registered` / `4004.200` / `benefit not found` ——
 ///   该账号用不了这个模型，是**模型级**问题，不该冷却整个账号；
 /// · `InferHub.001001005` / `request param is invalid` —— 请求参数错，重试无用。
+/// 识别**藏在 200 SSE 流里**的业务错误。
+///
+/// 上游在限流/未开通时不会改 HTTP 状态码，而是在流里发一帧：
+/// ```json
+/// {"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)…"}
+/// ```
+/// 参考实现专门有个 `preflightSSE` + `embeddedSSEError` 处理这件事；
+/// 不做的话错误帧会被当成"没有内容的正常帧"，最后记成完成 + 0 token。
+pub fn embedded_stream_error(frame: &str) -> Option<GatewayError> {
+    let value: Value = serde_json::from_str(frame).ok()?;
+    let code = value
+        .get("error_code")
+        .or_else(|| value.get("errorCode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|code| !code.is_empty() && *code != "0")?;
+    let message = value
+        .get("error_msg")
+        .or_else(|| value.get("errorMsg"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // 走与 HTTP 错误相同的分类，保证同一个码落到同一个语义。
+    Some(refine(200, &format!("{code} {message}"), "").with_upstream(frame.to_string()))
+}
+
 pub fn refine(status: u16, body: &str, upstream_model: &str) -> GatewayError {
     let lowered = body.to_ascii_lowercase();
     if lowered.contains("tm.00001041")
@@ -1009,6 +1068,54 @@ mod tests {
             .any(|(name, value)| name.eq_ignore_ascii_case("x-auth-token") && value == "STS-TOKEN"));
     }
 
+    /// 会话 id 必须稳定：上游按会话计并发，超过 3 个就 `TM.00001041`。
+    ///
+    /// 关键回归点是**客户端不给会话键时也不能每请求新生成** ——
+    /// 之前正是这样，连发几个请求就把 3 个会话配额用光。
+    #[test]
+    fn session_id_is_stable_even_without_a_client_session() {
+        let channel = channel();
+        let account = account();
+        // 没给会话键：两次独立生成必须相同（回落成该账号的固定会话）。
+        let first = channel.session_id(&account, None);
+        let second = channel.session_id(&account, None);
+        assert_eq!(first, second, "无会话键时必须稳定，否则会打满并发上限");
+
+        // 空串/空白也算"没给"。
+        assert_eq!(first, channel.session_id(&account, Some("   ")));
+
+        // 给了会话键：同键稳定、异键不同。
+        let a1 = channel.session_id(&account, Some("sess-a"));
+        let a2 = channel.session_id(&account, Some("sess-a"));
+        let b = channel.session_id(&account, Some("sess-b"));
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        assert_ne!(a1, first);
+
+        // 换账号必须换会话（否则多账号共用同一个上游会话，并发反而更紧）。
+        let mut other = account.clone();
+        other.uid = "uid-2".into();
+        assert_ne!(first, channel.session_id(&other, None));
+    }
+
+    /// 请求必须带上稳定的 `Chat-Id` 与 `Session-Id`。
+    #[test]
+    fn chat_request_always_carries_a_session_id() {
+        let upstream = channel()
+            .build_chat_request(&account(), &request())
+            .expect("应当能构建报文");
+        let find = |name: &str| {
+            upstream
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        let chat_id = find("Chat-Id").expect("必须带 Chat-Id");
+        assert_eq!(find("Session-Id").as_deref(), Some(chat_id.as_str()));
+        assert!(!chat_id.is_empty());
+    }
+
     #[test]
     fn builtin_models_parse_with_limits() {
         let payload = json!({"builtinModels": [
@@ -1024,6 +1131,38 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, Some(8_192));
         // `context_window: 0` 视为"未知"，不是"上限 0"。
         assert_eq!(models[1].context_length, None);
+    }
+
+    /// 上游把业务错误塞进 200 SSE 流里时必须被识别出来。
+    ///
+    /// 不识别的话，这一帧没有 `choices`，通用解析器返回空 → 整条流"正常结束"
+    /// → 用量记成「完成 / 输出 0」，把真正的失败吞掉。
+    #[test]
+    fn embedded_stream_errors_are_surfaced_not_swallowed() {
+        let channel = channel();
+        let frame = r#"{"text":"[DONE]","error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个),请关闭部分会话后重试。"}"#;
+        let events = channel.parse_event(frame);
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                CanonicalEvent::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("错误帧必须转成 Error 事件：{events:?}"));
+        assert!(error.contains("TM.00001041"), "{error}");
+        assert!(error.contains("并发会话"), "{error}");
+        // 语义要落到 RateLimited（可换号重试）。
+        let classified = embedded_stream_error(frame).expect("应当识别");
+        assert_eq!(classified.kind, ErrorKind::RateLimited);
+        assert!(classified.retryable);
+
+        // 正常帧不能被误判成错误。
+        assert!(embedded_stream_error(
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#
+        )
+        .is_none());
+        // `error_code: "0"` 是正常结束标记。
+        assert!(embedded_stream_error(r#"{"error_code":"0","text":"[DONE]"}"#).is_none());
     }
 
     #[test]
@@ -1230,3 +1369,5 @@ mod probe_chat {
         }
     }
 }
+
+
