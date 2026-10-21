@@ -90,3 +90,6 @@ src-tauri/
 ## Change Checklist
 
 完成改动前确认：页面是目录入口形式、widget 已注册、HTTP 走 request 层、toast 走包装层、无文件超 1,000 行。运行 `pnpm typecheck`、`pnpm build`（或 `cargo check`）验证。
+
+## commit
+每完成一个任务后，提交一次git

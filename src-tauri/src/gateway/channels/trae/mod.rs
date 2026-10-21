@@ -42,7 +42,17 @@ pub struct TraeChannel {
     hosts: identity::Hosts,
     /// 单调序号：给日志/追踪用，避免同账号高并发下撞序号。
     sequence: AtomicU64,
+    /// 原始模型条目缓存：`uid → (抓取时刻, config_name → 对象)`。
+    ///
+    /// 会话报文必须回传 `custom_model`，而每个请求都拉一次目录太浪费
+    /// （目录接口几百 KB）。按账号缓存，TTL 内复用。
+    model_objects: std::sync::Mutex<
+        std::collections::HashMap<String, (u64, catalog::DetailMap)>,
+    >,
 }
+
+/// `custom_model` 缓存的保鲜期：与矩阵目录的 TTL 对齐（5 分钟）。
+const MODEL_OBJECTS_TTL_MS: u64 = 300_000;
 
 impl TraeChannel {
     pub fn from_options(id: &str, options: &Value) -> Self {
@@ -50,7 +60,39 @@ impl TraeChannel {
             id: id.to_string(),
             hosts: identity::Hosts::from_options(options),
             sequence: AtomicU64::new(0),
+            model_objects: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// 取某个账号的原始模型条目（带缓存）。
+    ///
+    /// 拿不到时返回空 map —— 调用方会退回"只发 model_name"的老行为，
+    /// 那条路径上游可能报 995000，所以失败要如实打日志。
+    async fn model_objects_for(
+        &self,
+        client: &reqwest::Client,
+        account: &AccountSnapshot,
+    ) -> catalog::DetailMap {
+        let now = crate::gateway::timeutil::now_ms();
+        if let Ok(cache) = self.model_objects.lock() {
+            if let Some((fetched_at, map)) = cache.get(&account.uid) {
+                if now.saturating_sub(*fetched_at) < MODEL_OBJECTS_TTL_MS && !map.is_empty() {
+                    return map.clone();
+                }
+            }
+        }
+        let map = catalog::fetch_model_objects(client, &self.hosts, account).await;
+        if map.is_empty() {
+            eprintln!(
+                "[trae] 模型条目拉取失败（账号 {}）：会话将只发 model_name，可能被上游拒为 995000",
+                account.uid
+            );
+            return map;
+        }
+        if let Ok(mut cache) = self.model_objects.lock() {
+            cache.insert(account.uid.clone(), (now, map.clone()));
+        }
+        map
     }
 
     /// 把路由/别名改写后的模型名换成上游真实拼写。
@@ -143,7 +185,18 @@ impl TraeChannel {
         request: &CanonicalRequest,
     ) -> Result<(String, String), GatewayError> {
         let model = self.upstream_model(&request.model);
-        let body = encode::build_session_body(&model, request, account);
+        // **必须带上目录里的原始模型对象**：只发 model_name 时上游会
+        // 静默换模型或直接回 995000（HTTP 200 里套一层业务错误）。
+        let objects = self.model_objects_for(client, account).await;
+        let custom_model = objects
+            .get(&model)
+            .or_else(|| objects.get(&model.to_ascii_lowercase()));
+        let body = encode::build_session_body_with_model(
+            &model,
+            request,
+            account,
+            custom_model,
+        );
         self.sequence.fetch_add(1, Ordering::Relaxed);
         let payload = transport::post_json(
             client,
@@ -228,7 +281,9 @@ impl ChannelAdapter for TraeChannel {
         }
 
         let decoder = std::sync::Arc::new(decode::Decoder::default());
-        let frames = transport::frame_stream(response, EVENTS_IDLE_TIMEOUT);
+        // **必须用保留整帧的版本**：Trae 的事件类型只在 `event:` 行里，
+        // 剥掉之后 plan_item（正文）与 heartbeat（心跳）的 payload 无法区分。
+        let frames = transport::frame_stream_full(response, EVENTS_IDLE_TIMEOUT);
         let decoder_for_stream = std::sync::Arc::clone(&decoder);
 
         // 把**上游帧**翻译成 CIR 事件再重新装帧：下游编码器吃的是
@@ -600,6 +655,121 @@ mod tests {
         assert!(matches!(&back[2], CanonicalEvent::Finish { reason } if reason == "stop"));
         // 非法帧返回空而不是 panic。
         assert!(frames_to_events("not json").is_empty());
+    }
+
+    /// 真实上游探针：用库里 trae-cn 账号对指定模型发一次真实会话，
+    /// 验证不再回 `995000`。
+    ///
+    /// ```text
+    /// cargo test --lib probe_trae_chat -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn probe_trae_chat() {
+        use crate::agent::secrets::OsCredentialStore;
+        use crate::gateway::storage::Storage;
+
+        let model = std::env::var("PROBE_TRAE_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4.1-flash".into());
+        let appdata = std::env::var("APPDATA").expect("APPDATA");
+        let dir = std::path::Path::new(&appdata)
+            .join("com.issuser.dynamic-island")
+            .join("gateway");
+        let store = OsCredentialStore;
+        let storage = Storage::open(&dir, &store).expect("库");
+        let record = storage
+            .list_accounts()
+            .expect("账号")
+            .into_iter()
+            .find(|record| record.channel_id == "trae-cn")
+            .expect("没有 trae-cn 账号");
+        let credential = record.credential.expect("没有凭据");
+        let account = AccountSnapshot {
+            channel_id: record.channel_id.clone(),
+            uid: record.uid.clone(),
+            access_token: Some(credential.access_token.clone()),
+            refresh_token: credential.refresh_token.clone(),
+            enterprise_id: credential.enterprise_id.clone(),
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let channel = channel();
+
+        // 先确认目录里拿得到这个模型的原始对象。
+        let objects = channel.model_objects_for(&client, &account).await;
+        println!("目录条目数：{}", objects.len());
+        let Some(object) = objects.get(&model).or_else(|| objects.get(&model.to_ascii_lowercase()))
+        else {
+            panic!("目录里没有模型 {model}");
+        };
+        println!(
+            "=== custom_model 全文 ===\n{}",
+            serde_json::to_string_pretty(object).unwrap_or_default()
+        );
+
+        let request = CanonicalRequest {
+            model: model.clone(),
+            system: Vec::new(),
+            messages: vec![crate::gateway::protocol::cir::Message {
+                role: crate::gateway::protocol::cir::Role::User,
+                content: vec![crate::gateway::protocol::cir::Block::text("只回复两个字：你好")],
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+            }],
+            tools: Vec::new(),
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            stream: true,
+            reasoning: None,
+            metadata: Default::default(),
+            raw: serde_json::json!({}),
+        };
+
+        // 走**真实链路** `chat_stream`：建会话 → 读事件流 → 解码成 CIR。
+        use futures_util::StreamExt;
+        match channel.chat_stream(&account, &request, &client).await {
+            Ok(mut frames) => {
+                let mut text = String::new();
+                let mut reasoning = String::new();
+                let mut sent_frames = 0usize;
+                while let Some(frame) = frames.next().await {
+                    sent_frames += 1;
+                    match frame {
+                        Ok(frame) => {
+                            for event in channel.parse_event(&frame) {
+                                match event {
+                                    CanonicalEvent::Text { text: chunk } => text.push_str(&chunk),
+                                    CanonicalEvent::Reasoning { text: chunk } => {
+                                        reasoning.push_str(&chunk)
+                                    }
+                                    CanonicalEvent::Error { message } => {
+                                        panic!("上游事件流报错：{message}")
+                                    }
+                                    CanonicalEvent::Finish { .. } => {}
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Err(error) => panic!("帧流失败：{}", error.describe()),
+                    }
+                    if text.chars().count() > 40 || sent_frames > 2000 {
+                        break;
+                    }
+                }
+                println!("=== 中间帧 {sent_frames} 个 ===");
+                println!(
+                    "=== 思考（前 120 字）===\n{}",
+                    reasoning.chars().take(120).collect::<String>()
+                );
+                println!("=== 正文 ===\n{text}");
+                assert!(!text.trim().is_empty(), "模型没有输出任何正文");
+            }
+            Err(error) => panic!("chat_stream 失败：{}", error.describe()),
+        }
     }
 
     /// 端到端：上游 SSE（累计快照）→ 中间帧 → CIR 事件，正文不重复。

@@ -69,7 +69,16 @@ fn tool_calls_text(message: &Message) -> String {
     lines.join("\n")
 }
 
-/// 历史消息 → Trae 的 `query` 文本（带角色标记）。
+/// 历史消息 → Trae 的 `query`。
+///
+/// **`query` 必须是 JSON 字符串数组**，不是纯文本：
+/// ```json
+/// [{"type":"text","data":{"content":"你是助手\n\n你好"}}]
+/// ```
+/// 之前直接发纯文本，上游会因为解析不出 parts 结构回
+/// `{"code":995000,"message":"internal server error"}`（HTTP 200 里套业务错误，
+/// 看起来像上游挂了）。角色标记（`[System]` / `[Assistant]` / 工具结果）
+/// 都拼在同一个 text part 的 content 里，与参考实现一致。
 pub fn flatten_query(request: &CanonicalRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -113,7 +122,11 @@ pub fn flatten_query(request: &CanonicalRequest) -> String {
             }
         }
     }
-    clip_history(parts).join("\n\n")
+    let text = clip_history(parts).join("\n\n");
+    // 上游只认 parts 数组；空历史也要给一个空 text part，
+    // 不能发空字符串或 `[]`（那同样会被判为非法请求）。
+    serde_json::json!([{ "type": "text", "data": { "content": text } }])
+        .to_string()
 }
 
 /// 超长历史裁剪：从**最早**的非系统消息开始丢，保证最近几轮完整。
@@ -130,22 +143,58 @@ fn clip_history(mut parts: Vec<String>) -> Vec<String> {
 }
 
 /// 建会话的请求体。
+///
+/// `custom_model` 是 **Agent 目录里的原始模型对象**（`catalog::fetch_model_objects`）。
+/// 必须原样回传：上游靠它绑定模型、拿上下文与思考档位配置。
+/// 只给 `model_name` 时上游会静默换模型，或直接回 `995000 internal server error`。
 pub fn build_session_body(
     model: &str,
     request: &CanonicalRequest,
     account: &crate::gateway::channels::AccountSnapshot,
 ) -> Value {
-    let (mode, strategy) = resolve_mode(model);
-    let upstream_model = identity::normalize_model(model);
+    build_session_body_with_model(model, request, account, None)
+}
+
+/// 同上，但带上上游目录里的 `custom_model` 原始对象。
+pub fn build_session_body_with_model(
+    model: &str,
+    request: &CanonicalRequest,
+    account: &crate::gateway::channels::AccountSnapshot,
+    custom_model: Option<&Value>,
+) -> Value {
+    let (mode, mut strategy) = resolve_mode(model);
+    let mut upstream_model = identity::normalize_model(model);
+    let mut effort_applied: Option<String> = None;
+    let mut tuned_model: Option<Value> = None;
+
+    // 有原始对象时：模型名取对象里的精确拼写，并把思考强度写回对象。
+    if let Some(object) = custom_model {
+        if let Some(bound) = bound_model_name(&upstream_model, object) {
+            upstream_model = bound;
+        }
+        let (tuned, effort) = apply_reasoning_effort(object, request);
+        tuned_model = Some(tuned);
+        effort_applied = effort;
+    }
+    // `auto` 保持交给上游选择；有对象时按 object 里的策略走 manual。
+    if custom_model.is_some() && strategy == "auto" {
+        strategy = "auto";
+    }
+
+    let agent_type = if mode == "work" {
+        "solo_work_remote"
+    } else {
+        "solo_agent_remote"
+    };
     let initial_message = json!({
         "chat_session_id": "",
         "content": [],
         "query": flatten_query(request),
         "model_name": upstream_model,
-        "agent_type": if mode == "work" { "solo_work_remote" } else { "solo_agent_remote" },
+        "agent_type": agent_type,
         // agent_id 与 agent_type 同值：只给 agent_type 时上游会静默回落到默认档
         // （常见是 Kimi/Work），模型绑定就丢了。
-        "agent_id": if mode == "work" { "solo_work_remote" } else { "solo_agent_remote" },
+        "agent_id": agent_type,
         "model_selection_strategy": strategy,
         "common_params": identity::common_params(account, mode, ""),
     });
@@ -158,6 +207,32 @@ pub fn build_session_body(
         "origin": "web",
     });
     if let Some(initial) = body.get_mut("initial_message").and_then(Value::as_object_mut) {
+        // **把原始模型对象整体带上**：这是上游绑定模型的依据。
+        if let Some(object) = tuned_model {
+            initial.insert(
+                "model_config_source".into(),
+                json!(object.get("config_source").and_then(Value::as_u64).unwrap_or(1)),
+            );
+            initial.insert(
+                "model_is_preset".into(),
+                json!(object
+                    .get("is_preset")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)),
+            );
+            initial.insert(
+                "model_provider".into(),
+                json!(object
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")),
+            );
+            initial.insert("custom_model".into(), object);
+        }
+        if let Some(effort) = effort_applied {
+            // 记进报文便于排障（上游以 custom_model 里的值为准）。
+            initial.insert("reasoning_effort_applied".into(), json!(effort));
+        }
         // 输出上限：客户端常发一个远大于上游硬顶的值（131072 之类），
         // 直接透传会被上游判成参数错误。钳到 Agent 档的真实上限。
         // 注意：**只在客户端给了值时才写**——不给就交给上游默认，
@@ -174,6 +249,126 @@ pub fn build_session_body(
         }
     }
     body
+}
+
+/// 从目录对象里取**精确的 config id**，并拒绝静默回退到别的模型族。
+///
+/// 上游按 `config_name` 大小写敏感匹配；对象里可能同时有 `name`（显示名）
+/// 与 `config_name`（线上 id），必须优先用后者。
+fn bound_model_name(requested: &str, object: &Value) -> Option<String> {
+    let candidates: Vec<String> = ["config_name", "model_name", "name"]
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let family = model_family(requested);
+    // 优先挑与请求同族的那个（`glm-5.3` 的 display name 与 config name 同族）。
+    candidates
+        .iter()
+        .find(|candidate| !family.is_empty() && model_family(candidate) == family)
+        .or_else(|| candidates.first())
+        .cloned()
+}
+
+/// 模型族：`deepseek-v4.1-flash` → `deepseek`，`glm-5.3` → `glm`。
+///
+/// 只取第一个非版本号片段，用来判断"对象里的名字和请求的是不是同一个模型"。
+fn model_family(model: &str) -> String {
+    let lowered = model.trim().to_ascii_lowercase();
+    lowered
+        .split(|ch: char| ch == '-' || ch == '_' || ch == '/' || ch == '.')
+        .find(|segment| {
+            !segment.is_empty()
+                && !segment.starts_with(|ch: char| ch.is_ascii_digit())
+                && *segment != "official"
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 把请求里的思考强度映射到 Trae 的原生档位，写进 `custom_model` 副本。
+///
+/// Trae 的档位是 `light` / `high` / `extra_high`；调用方用的是
+/// OpenAI 的 `low`/`medium`/`high` 或 Anthropic 的 budget_tokens。
+/// 模型声明的可选档位在 `reasoning_effort_config.options` 里，超出的要钳制，
+/// 否则上游会因为"不支持的档位"报错。
+fn apply_reasoning_effort(object: &Value, request: &CanonicalRequest) -> (Value, Option<String>) {
+    let mut tuned = object.clone();
+    let Some(requested) = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_deref())
+    else {
+        return (tuned, None);
+    };
+    // 显式关闭思考时，不改对象（由客户端的 none 语义处理）。
+    if requested.eq_ignore_ascii_case("none") {
+        return (tuned, None);
+    }
+    let supported: Vec<String> = object
+        .get("reasoning_effort_config")
+        .and_then(|config| config.get("options"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(level) = clamp_effort(requested, &supported) else {
+        return (tuned, None);
+    };
+    if let Some(map) = tuned.as_object_mut() {
+        // 参考实现：对象里已带 `reasoning_effort_level` 就改它，否则写 `reasoning_effort`，
+        // 两个都写会让上游行为不确定。
+        if map.contains_key("reasoning_effort_level") {
+            map.insert("reasoning_effort_level".into(), json!(level));
+            map.remove("reasoning_effort");
+        } else {
+            map.insert("reasoning_effort".into(), json!(level));
+            map.remove("reasoning_effort_level");
+        }
+    }
+    (tuned, Some(level))
+}
+
+/// 把调用方的档位名映射到 Trae 的 `light`/`high`/`extra_high`，并按模型能力钳制。
+fn clamp_effort(requested: &str, supported: &[String]) -> Option<String> {
+    const ORDER: [&str; 3] = ["light", "high", "extra_high"];
+    let level = match requested.trim().to_ascii_lowercase().as_str() {
+        "none" | "minimal" | "min" | "low" | "light" => "light",
+        "medium" | "mid" | "normal" | "default" | "high" => "high",
+        "xhigh" | "x-high" | "extra_high" | "extra-high" | "very_high" | "max" | "maximum"
+        | "ultra" => "extra_high",
+        // 认不出的档位名不猜：交给上游默认。
+        _ => return None,
+    };
+    if supported.is_empty() {
+        // 模型没声明档位：按请求原样发（上游会自己决定认不认）。
+        return Some(level.to_string());
+    }
+    // 钳到模型支持的最高档：`high` 请求 + 只有 `light` 可选 → 用 `light`。
+    let requested_index = ORDER.iter().position(|entry| *entry == level)?;
+    let best = supported
+        .iter()
+        .filter_map(|entry| ORDER.iter().position(|known| known == entry))
+        .filter(|index| *index <= requested_index)
+        .max()
+        .or_else(|| {
+            supported
+                .iter()
+                .filter_map(|entry| ORDER.iter().position(|known| known == entry))
+                .min()
+        })?;
+    Some(ORDER[best].to_string())
 }
 
 /// 建会话响应 → `(session_id, message_id)`。
@@ -306,14 +501,36 @@ mod tests {
     #[test]
     fn query_carries_roles_tools_and_results() {
         let query = flatten_query(&request());
-        assert!(query.starts_with("[System]\n你是助手"), "{query}");
-        assert!(query.contains("[Assistant]\n我查一下"), "{query}");
-        assert!(query.contains("[Tool Calls]"), "工具调用要写进历史：{query}");
+        // `query` 是 **JSON parts 数组**，不是纯文本：上游按 parts 解析历史。
+        let parsed: serde_json::Value = serde_json::from_str(&query)
+            .unwrap_or_else(|error| panic!("query 必须是 JSON：{error}，实际 {query}"));
+        assert!(parsed.is_array(), "query 必须是数组：{query}");
+        assert_eq!(parsed[0]["type"], "text");
+        assert_eq!(parsed[0]["data"]["data"], serde_json::Value::Null, "不应多套一层");
+        let text = parsed[0]["data"]["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("content 必须是字符串：{query}"));
+
+        assert!(text.starts_with("[System]\n你是助手"), "{text}");
+        assert!(text.contains("[Assistant]\n我查一下"), "{text}");
+        assert!(text.contains("[Tool Calls]"), "工具调用要写进历史：{text}");
         assert!(
-            query.contains("[Client Tool Result: call_1 read_file status=succeeded]"),
-            "{query}"
+            text.contains("[Client Tool Result: call_1 read_file status=succeeded]"),
+            "{text}"
         );
-        assert!(query.contains("文件内容"), "{query}");
+        assert!(text.contains("文件内容"), "{text}");
+    }
+
+    /// 空历史也要给出合法的 parts（不能是空串或 `[]`）。
+    #[test]
+    fn empty_history_still_produces_a_valid_parts_array() {
+        let mut request = request();
+        request.system.clear();
+        request.messages.clear();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&flatten_query(&request)).expect("必须是 JSON");
+        assert_eq!(parsed.as_array().map(Vec::len), Some(1));
+        assert_eq!(parsed[0]["data"]["content"], "");
     }
 
     #[test]

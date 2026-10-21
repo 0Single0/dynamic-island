@@ -118,6 +118,86 @@ pub async fn fetch(
 /// detail 接口返回的一条：`config_name → 原始对象`。
 pub type DetailMap = std::collections::HashMap<String, Value>;
 
+/// 拉取**原始模型条目**索引：`config_name`（含小写别名）→ 上游给的那一整段 JSON。
+///
+/// 为什么需要它：会话报文的 `custom_model` 必须**原样回传目录里的那段对象**。
+/// 只给 `model_name` 时上游会静默换成默认模型，或者直接回
+/// `{"code":995000,"message":"internal server error"}` —— HTTP 200 里套一个
+/// 业务错误，看上去像上游挂了，其实是请求形状不完整。
+///
+/// 失败返回空 map（调用方当作"拿不到条目"，退回只发 model_name 的老行为）。
+pub async fn fetch_model_objects(
+    client: &reqwest::Client,
+    hosts: &Hosts,
+    account: &AccountSnapshot,
+) -> DetailMap {
+    if account.access_token.as_deref().unwrap_or_default().is_empty() {
+        return DetailMap::new();
+    }
+    match transport::get_json(
+        client,
+        &hosts.models_url(),
+        &identity::base_headers(account, "application/json"),
+    )
+    .await
+    {
+        Ok(payload) => parse_model_objects(&payload),
+        Err(_) => DetailMap::new(),
+    }
+}
+
+/// 从 `/models` 响应里建立原始条目索引。
+///
+/// 与 [`parse_catalog`] 的差别：那个产出归一化的 [`UpstreamModel`]（面板用），
+/// 这个保留**原样 JSON**（会话报文用）。两者都按 Agent → Work → Design 的
+/// tier 顺序取第一次出现的条目，保证同名模型用的是能力最全的那份配置。
+pub fn parse_model_objects(payload: &Value) -> DetailMap {
+    let groups: &[Value] = payload
+        .get("data")
+        .and_then(|data| data.get("list"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    let mut map = DetailMap::new();
+    for tier in TIER_ORDER {
+        for group in groups {
+            let tier_name = group
+                .get("function")
+                .or_else(|| group.get("agent_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if tier_name != tier {
+                continue;
+            }
+            for raw in group
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = raw
+                    .get("config_name")
+                    .or_else(|| raw.get("configName"))
+                    .or_else(|| raw.get("name"))
+                    .or_else(|| raw.get("model_name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                // 两种拼写各放一份：下游可能按小写名请求，而上游要精确拼写。
+                map.entry(id.to_string()).or_insert_with(|| raw.clone());
+                map.entry(id.to_ascii_lowercase())
+                    .or_insert_with(|| raw.clone());
+            }
+        }
+    }
+    map
+}
+
 /// 拉 `get_detail_param` 的原生目录（元数据来源：输出上限 / 思考档位）。
 ///
 /// 失败返回空 map 而不是 Err：这是**增强**步骤，拿不到就只是少了输出/档位，
