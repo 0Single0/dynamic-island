@@ -162,7 +162,8 @@ fn brand_regex() -> &'static regex::Regex {
     CELL.get_or_init(|| {
         // 连前面的冠词一起吃掉：替换值是 `the runtime`，否则会留下
         // "names the the runtime implementation checkout" 这种叠词。
-        regex::Regex::new(r"(?i)(?:the[ \t]+)?deepseek[ \t_-]*harness")
+        // `the` 前面必须是词首：否则 `breathe DeepSeek Harness` 会被吞成 `breat`。
+        regex::Regex::new(r"(?i)(?:\bthe[ \t]+)?deepseek[ \t_-]*harness")
             .expect("品牌词正则是编译期常量，不会失败")
     })
 }
